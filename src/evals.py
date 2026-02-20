@@ -46,6 +46,7 @@ class ToolCallRecord:
     tool_name: str = ""
     arguments: dict = field(default_factory=dict)
     result_preview: str = ""
+    latency_seconds: float = 0.0
 
 
 @dataclass
@@ -76,8 +77,9 @@ class QuestionResult:
 class MCPClient:
     """Minimal MCP client over StreamableHTTP. No dependencies beyond requests."""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, timeout: int = 30):
         self.url = url
+        self.timeout = timeout
         self.session_id: str | None = None
         self.tools: list[dict] = []
         self._http = requests.Session()
@@ -91,7 +93,7 @@ class MCPClient:
         if self.session_id:
             headers["mcp-session-id"] = self.session_id
 
-        resp = self._http.post(self.url, json=payload, headers=headers, timeout=30)
+        resp = self._http.post(self.url, json=payload, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
 
         # Capture session ID from response headers
@@ -234,11 +236,19 @@ def run_agent(
         (answer, tool_calls, agent_steps, total_input_tokens, total_output_tokens)
     """
     system_prompt = (
-        "You are an expert code analyst performing an EXHAUSTIVE codebase audit. "
+        "You are an expert code analyst and software architect performing an EXHAUSTIVE codebase audit. "
         "You have access to a knowledge graph spanning MULTIPLE repositories. "
-        "Your job is to find EVERY file that is relevant to the question — missing even one file is a failure.\n\n"
+        "Your job is to find EVERY file that is relevant to the question, understand how they interact, "
+        "and produce a grounded, evidence-backed analysis — missing even one file is a failure.\n\n"
 
-        "## Workflow\n\n"
+        "## Phase 1: Planning\n\n"
+        "Before making any tool calls, reason about the question:\n"
+        "- What domains does this touch? (DB, backend, frontend, config, infra)\n"
+        "- What keywords, class names, or patterns should I search for?\n"
+        "- Which repos are likely involved?\n"
+        "Plan your search strategy, then execute it.\n\n"
+
+        "## Phase 2: Discovery\n\n"
         "1. Call `server_info` first.\n"
         "2. Call `list_knowledge` to discover ALL available repositories.\n"
         "3. For EACH repo that could be relevant, search with `graph_search` using multiple query variations "
@@ -248,17 +258,23 @@ def run_agent(
         "5. Follow the dependency chain: if file A imports/calls file B, search for file B too.\n"
         "6. Search across ALL layers: DB schema/SQL, backend service/controller/helper/DAO, "
         "frontend UI components, config files, API DTOs.\n"
-        "7. BEFORE answering, ask yourself: 'Have I searched ALL repos? Have I covered DB, backend, "
-        "frontend, and config layers? Have I followed imports and call chains?' "
-        "If the answer is no, keep searching.\n"
-        "8. Only produce your final answer when you are >90%% confident you have found ALL relevant files.\n\n"
+        "7. After each round of tool calls, assess: 'What have I found so far? What gaps remain? "
+        "Have I covered ALL repos and ALL layers?' If gaps remain, keep searching.\n"
+        "8. Only move to Phase 3 when you are >90%% confident you have found ALL relevant files.\n\n"
 
-        "## Answer Format\n\n"
-        "Your answer MUST be proper Markdown with:\n"
-        "- A clear explanation of the flow/architecture\n"
-        "- Code-level details (class names, method names, DB columns) where relevant\n"
-        "- A ## Relevant Files section at the END with EVERY file across ALL repos:\n\n"
-        "## Relevant Files\n\n"
+        "## Phase 3: Synthesis & Answer\n\n"
+        "Your answer MUST be proper Markdown with these sections:\n\n"
+        "### 1. Architecture Overview\n"
+        "Explain the end-to-end flow/architecture. How do the components interact? "
+        "What is the request/data path from start to finish?\n\n"
+        "### 2. Detailed Analysis\n"
+        "For each major component, provide code-level details:\n"
+        "- Exact class names, method signatures, DB table/column names\n"
+        "- How data flows between components (API calls, imports, shared models)\n"
+        "- **Ground every claim in tool output** — cite the specific file and function/class you found. "
+        "Do NOT make claims that are not backed by evidence from your tool calls.\n\n"
+        "### 3. Relevant Files\n\n"
+        "A complete table with EVERY file across ALL repos:\n\n"
         "| Repo | File Path | Why |\n"
         "|------|-----------|-----|\n"
         "| repo-name | full/path/to/File.java | Specific reason (mention class/method/field names) |\n\n"
@@ -323,8 +339,10 @@ def run_agent(
 
         # Execute all tool calls in parallel
         def _exec_tool(tc_id, tool_name, tool_args):
+            t0 = time.perf_counter()
             result_text = mcp.call_tool(tool_name, tool_args)
-            return tc_id, tool_name, tool_args, result_text
+            elapsed = round(time.perf_counter() - t0, 3)
+            return tc_id, tool_name, tool_args, result_text, elapsed
 
         results_map = {}
         with ThreadPoolExecutor(max_workers=min(len(parsed_calls), 8)) as pool:
@@ -333,23 +351,24 @@ def run_agent(
                 for tc_id, name, args in parsed_calls
             }
             for future in as_completed(futures):
-                tc_id, tool_name, tool_args, result_text = future.result()
-                results_map[tc_id] = (tool_name, tool_args, result_text)
+                tc_id, tool_name, tool_args, result_text, elapsed = future.result()
+                results_map[tc_id] = (tool_name, tool_args, result_text, elapsed)
 
         # Append results in original order (must match tool_calls order)
         for tc_id, tool_name, tool_args in parsed_calls:
-            _, _, result_text = results_map[tc_id]
+            _, _, result_text, tool_elapsed = results_map[tc_id]
 
             result_preview = result_text[:500] + ("..." if len(result_text) > 500 else "")
             tool_records.append(ToolCallRecord(
                 tool_name=tool_name,
                 arguments=tool_args,
                 result_preview=result_preview,
+                latency_seconds=tool_elapsed,
             ))
 
             if verbose:
                 preview = result_text[:200].replace("\n", " ")
-                logger.info(f"    {tool_name} -> {preview}...")
+                logger.info(f"    {tool_name} ({tool_elapsed}s) -> {preview}...")
 
             messages.append({
                 "role": "tool",
@@ -373,13 +392,60 @@ def run_agent(
     return message.get("content", ""), tool_records, steps, total_input, total_output
 
 
+# ─── Models config ────────────────────────────────────────────────────────────
+
+_models_config: dict = {}
+_MODELS_JSON = Path(__file__).resolve().parent.parent / "models.json"
+
+
+def load_models_config(path: Path | None = None) -> dict:
+    """Load models.json. Cached after first call."""
+    global _models_config
+    if _models_config:
+        return _models_config
+    p = path or _MODELS_JSON
+    if p.exists():
+        with open(p) as f:
+            _models_config = json.load(f)
+        logger.info(f"Loaded {len(_models_config.get('models', {}))} models from {p.name}")
+    else:
+        logger.warning(f"models.json not found at {p} — using empty config")
+        _models_config = {"models": {}}
+    return _models_config
+
+
+def get_model_pricing(model: str) -> tuple[float, float]:
+    """Return (input_cost_per_million, output_cost_per_million) for a model.
+
+    Lookup order:
+      1. models.json per-model pricing
+      2. OpenRouter pricing API
+      3. Zero (free)
+    """
+    cfg = load_models_config()
+    model_entry = cfg.get("models", {}).get(model) or cfg.get("models", {}).get(model.split(":")[0])
+
+    if model_entry:
+        return (
+            float(model_entry["input_cost_per_million_tokens"]),
+            float(model_entry["output_cost_per_million_tokens"]),
+        )
+
+    # Fallback: OpenRouter API
+    cache = _fetch_openrouter_pricing()
+    pricing = cache.get(model.split(":")[0])
+    if pricing:
+        return pricing["input"], pricing["output"]
+
+    return 0.0, 0.0
+
+
 # ─── Token cost estimation ───────────────────────────────────────────────────
 
 _pricing_cache: dict[str, dict] = {}
-DEFAULT_PRICING = {"input": 3.0, "output": 15.0}
 
 
-def fetch_openrouter_pricing() -> dict[str, dict]:
+def _fetch_openrouter_pricing() -> dict[str, dict]:
     global _pricing_cache
     if _pricing_cache:
         return _pricing_cache
@@ -400,10 +466,10 @@ def fetch_openrouter_pricing() -> dict[str, dict]:
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    cache = fetch_openrouter_pricing()
-    pricing = cache.get(model.split(":")[0], DEFAULT_PRICING)
-    cost = (input_tokens * pricing["input"] / 1_000_000) + \
-           (output_tokens * pricing["output"] / 1_000_000)
+    """Calculate cost in USD using per-model pricing from models.json."""
+    input_rate, output_rate = get_model_pricing(model)
+    cost = (input_tokens * input_rate / 1_000_000) + \
+           (output_tokens * output_rate / 1_000_000)
     return round(cost, 6)
 
 
@@ -516,9 +582,17 @@ def run_benchmark(args: argparse.Namespace):
 
     # Run
     results: list[dict] = []
-    output_path = Path(args.output)
+
+    # Auto-generate output filename: {timestamp}-{model_name}.json
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_model = model_name.replace("/", "_").replace(":", "_")
+    output_path = Path(args.output_dir) / f"{run_ts}-{safe_model}.json"
+
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Results file: {output_path}")
 
     run_start = time.perf_counter()
 
@@ -662,7 +736,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ByteBell SWE-bench Pro MCP Benchmark Runner")
     parser.add_argument("--questions", "-q", required=True)
     parser.add_argument("--mcp-config", "-m", required=True)
-    parser.add_argument("--output", "-o", default="benchmark_results.json")
+    parser.add_argument("--output-dir", "-o", default="results")
     parser.add_argument("--data-dir", "-d", default="results")
     parser.add_argument("--model", default=None)
     parser.add_argument("--api-key", default=None)
