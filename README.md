@@ -36,9 +36,9 @@ Edit `models.json` to configure which models to evaluate and their pricing.
 
 ## Datasets
 
-### KubeCluster30 — 40 Cross-Repository Impact Questions
+### KubeCluster40 — 40 Cross-Repository Impact Questions
 
-The primary dataset lives in `results/KubeCluster30/` and contains **40 questions** across two categories:
+The primary dataset lives in `results/KubeCluster40/` and contains **40 questions** across two categories:
 
 | Prefix | Count | Description |
 |--------|:-----:|-------------|
@@ -324,13 +324,13 @@ After all models finish, prints a comparison table with success count, errors, a
 
 ```bash
 python3 src/mcp_context_generation.py \
-    --questions-dir results/KubeCluster30 \
+    --questions-dir results/KubeCluster40 \
     --mcp-config mcp_config.json \
     --threads 3
 
 # Only run specific models:
 python3 src/mcp_context_generation.py \
-    --questions-dir results/KubeCluster30 \
+    --questions-dir results/KubeCluster40 \
     --mcp-config mcp_config.json \
     --models "xiaomi/mimo-v2-flash" "deepseek/deepseek-chat-v3.1"
 ```
@@ -371,7 +371,7 @@ Computes two scores per model answer:
 python3 src/evaluate.py --results-dir results
 
 # Or for a specific subfolder:
-python3 src/evaluate.py --results-dir results/KubeCluster30
+python3 src/evaluate.py --results-dir results/KubeCluster40
 ```
 
 | Flag | Short | Default | Description |
@@ -388,7 +388,7 @@ Aggregates per-model scores from all `evaluation.json` and `analysis.json` files
 python3 src/aggregate_metrics.py --results-dir results
 
 # Or for a specific subfolder:
-python3 src/aggregate_metrics.py --results-dir results/KubeCluster30
+python3 src/aggregate_metrics.py --results-dir results/KubeCluster40
 ```
 
 | Flag | Short | Default | Description |
@@ -429,10 +429,10 @@ python3 src/replace_questions.py
 
 ## Output Structure
 
-Questions live in folders like `results/KubeCluster30/` with per-question subfolders. Model results are saved back into the same folders:
+Questions live in folders like `results/KubeCluster40/` with per-question subfolders. Model results are saved back into the same folders:
 
 ```
-results/KubeCluster30/
+results/KubeCluster40/
   question_MIXED_TC001/
     question.json                    # The question + expected answer + expected files
     xiaomi_mimo-v2-flash.json        # Model answer + tool calls + cost
@@ -520,9 +520,9 @@ For each question, `analysis.json` contains an LLM-generated comparison of each 
 ### Evaluation Workflow
 
 ```text
-1. Run mcp_context_generation.py -q results/KubeCluster30  →  question_*/<model>.json
-2. Run evaluate.py -r results/KubeCluster30                →  question_*/evaluation.json + analysis.json
-3. Run aggregate_metrics.py -r results/KubeCluster30       →  metrics.json
+1. Run mcp_context_generation.py -q results/KubeCluster40  →  question_*/<model>.json
+2. Run evaluate.py -r results/KubeCluster40                →  question_*/evaluation.json + analysis.json
+3. Run aggregate_metrics.py -r results/KubeCluster40       →  metrics.json
 ```
 
 ## Test Case Categories
@@ -539,7 +539,7 @@ For each question, `analysis.json` contains an LLM-generated comparison of each 
 
 ## Adding New Questions
 
-To add more queries for the ByteBell MCP to resolve, create new question folders following the same format as `results/KubeCluster30/question_*/question.json`.
+To add more queries for the ByteBell MCP to resolve, create new question folders following the same format as `results/KubeCluster40/question_*/question.json`.
 
 ### Steps
 
@@ -564,7 +564,7 @@ To add more queries for the ByteBell MCP to resolve, create new question folders
 
 ```bash
 python3 src/mcp_context_generation.py \
-    --questions-dir results/KubeCluster30 \
+    --questions-dir results/KubeCluster40 \
     --mcp-config mcp_config.json
 ```
 
@@ -572,7 +572,7 @@ You can add any number of question folders. The script discovers all `question_*
 
 ### Using a Different Folder
 
-You don't have to use `KubeCluster30`. You can create any folder with `question_*/question.json` subfolders and point the script at it:
+You don't have to use `KubeCluster40`. You can create any folder with `question_*/question.json` subfolders and point the script at it:
 
 ```bash
 # Create a new question set

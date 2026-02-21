@@ -157,13 +157,13 @@ python3 src/download_dataset.py
 
 # 3. Generate model answers via MCP
 python3 src/mcp_context_generation.py \
-    --questions-dir results/KubeCluster30 \
+    --questions-dir results/KubeCluster40 \
     --mcp-config mcp_config.json
 
 
 # 4. Run the LLM judge
 python3 src/evaluate.py \
-    --results-dir results/KubeCluster30 \
+    --results-dir results/KubeCluster40 \
     --workers 4
 ```
 

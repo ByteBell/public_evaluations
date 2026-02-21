@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Aggregate per-model metrics into metrics.json")
     parser.add_argument("--results-dir", "-r", required=True,
-                        help="Path to results folder (e.g. results/KubeCluster30)")
+                        help="Path to results folder (e.g. results/KubeCluster40)")
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)

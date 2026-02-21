@@ -322,7 +322,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate LLM answers using a comparative LLM judge")
     parser.add_argument("--results-dir", "-r", required=True,
-                        help="Path to results folder (e.g. results/KubeCluster30)")
+                        help="Path to results folder (e.g. results/KubeCluster40)")
     parser.add_argument("--force", "-f", action="store_true",
                         help="Force re-evaluation even if evaluation.json/analysis.json exist")
     parser.add_argument("--questions", "-n", type=str, default=None,

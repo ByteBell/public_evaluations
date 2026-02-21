@@ -2,18 +2,18 @@
 MCP Context Generation — runs every question against every model in models.json.
 
 Reads questions from a folder containing question_*/question.json files
-(e.g. results/KubeCluster30/). For each model, batches all questions through
+(e.g. results/KubeCluster40/). For each model, batches all questions through
 --threads concurrent workers, tracks per-question results, and produces a
 side-by-side comparison.
 
 Usage:
     python src/mcp_context_generation.py \
-        --questions-dir results/KubeCluster30 \
+        --questions-dir results/KubeCluster40 \
         --mcp-config mcp_config.json
 
     # Only run specific models:
     python src/mcp_context_generation.py \
-        --questions-dir results/KubeCluster30 \
+        --questions-dir results/KubeCluster40 \
         --mcp-config mcp_config.json \
         --models "xiaomi/mimo-v2-flash" "z-ai/glm-5"
 """
@@ -240,7 +240,7 @@ def main():
                     "Reads questions from question_*/question.json folders.")
     parser.add_argument("--questions-dir", "-q", required=True,
                         help="Path to folder containing question_*/question.json files "
-                             "(e.g. results/KubeCluster30)")
+                             "(e.g. results/KubeCluster40)")
     parser.add_argument("--mcp-config", "-m", required=True,
                         help="Path to MCP config JSON file")
     parser.add_argument("--models", nargs="+", default=None,
