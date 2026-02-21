@@ -1,17 +1,19 @@
 """
-Multi-model evaluation — runs every question against every model in models.json.
+MCP Context Generation — runs every question against every model in models.json.
 
-For each model, batches all questions through --threads concurrent workers,
-tracks per-question results, and produces a side-by-side comparison.
+Reads questions from a folder containing question_*/question.json files
+(e.g. results/KubeCluster30/). For each model, batches all questions through
+--threads concurrent workers, tracks per-question results, and produces a
+side-by-side comparison.
 
 Usage:
-    python src/multi_model_eval.py \
-        --questions cross_repo_whole.json \
+    python src/mcp_context_generation.py \
+        --questions-dir results/KubeCluster30 \
         --mcp-config mcp_config.json
 
     # Only run specific models:
-    python src/multi_model_eval.py \
-        --questions cross_repo_whole.json \
+    python src/mcp_context_generation.py \
+        --questions-dir results/KubeCluster30 \
         --mcp-config mcp_config.json \
         --models "xiaomi/mimo-v2-flash" "z-ai/glm-5"
 """
@@ -32,7 +34,8 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from evals import (MCPClient, LLMClient, run_agent, estimate_cost,
-                    load_models_config, get_model_pricing)
+                    load_models_config, get_model_pricing, AgentTimeoutError,
+                    condense_answer)
 
 
 class PaymentError(Exception):
@@ -44,7 +47,25 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("multi_model_eval")
+logger = logging.getLogger("mcp_context_generation")
+
+
+# ─── Question loading ─────────────────────────────────────────────────────────
+
+def load_questions_from_dir(questions_dir: Path) -> list[dict]:
+    """Scan questions_dir for question_*/question.json and return a list of question dicts."""
+    questions = []
+    for q_dir in sorted(questions_dir.iterdir()):
+        if not q_dir.is_dir() or not q_dir.name.startswith("question_"):
+            continue
+        q_file = q_dir / "question.json"
+        if not q_file.exists():
+            logger.warning(f"Skipping {q_dir.name} — no question.json found")
+            continue
+        with open(q_file) as f:
+            q = json.load(f)
+        questions.append(q)
+    return questions
 
 
 # ─── Worker ──────────────────────────────────────────────────────────────────
@@ -75,7 +96,8 @@ MAX_RETRIES = 3
 
 def run_one_question(thread_id: int, question: dict, mcp_url: str,
                      api_key: str, model: str, max_steps: int,
-                     timeout: int = 120, max_retries: int = MAX_RETRIES) -> dict:
+                     timeout: int = 120, max_retries: int = MAX_RETRIES,
+                     wall_timeout: int = 600) -> dict:
     """Run a single question through the LLM agent with retries."""
     q_id = question.get("id", "?")
     q_text = question.get("question", "")
@@ -106,6 +128,7 @@ def run_one_question(thread_id: int, question: dict, mcp_url: str,
         try:
             answer, tool_records, steps, inp_tok, out_tok = run_agent(
                 llm, mcp, q_text, max_steps=max_steps, verbose=False,
+                wall_timeout=wall_timeout,
             )
             elapsed = round(time.perf_counter() - t0, 2)
             cost = estimate_cost(model, inp_tok, out_tok)
@@ -129,6 +152,12 @@ def run_one_question(thread_id: int, question: dict, mcp_url: str,
             }
         except KeyboardInterrupt:
             raise
+        except AgentTimeoutError as e:
+            elapsed = round(time.perf_counter() - t0, 2)
+            last_error = f"AgentTimeoutError: {e}"
+            logger.error(f"    [T{thread_id}] [{model}] WALL TIMEOUT q={q_id} | {elapsed}s | {last_error}")
+            # Don't retry wall timeouts — they'll just timeout again
+            return _empty_result(thread_id, q_id, q_text, "timeout", elapsed, last_error)
         except Exception as e:
             if "402" in str(e):
                 raise PaymentError(f"402 Payment Required for model {model}: {e}")
@@ -148,7 +177,8 @@ def run_one_question(thread_id: int, question: dict, mcp_url: str,
 def run_all_questions(questions: list[dict], mcp_url: str, api_key: str,
                       model: str, max_steps: int, threads: int,
                       timeout: int,
-                      on_result: "callable | None" = None) -> list[dict]:
+                      on_result: "callable | None" = None,
+                      wall_timeout: int = 600) -> list[dict]:
     """Run all questions for a single model using a continuous thread pool.
 
     Threads that finish early immediately pick up the next pending question
@@ -156,6 +186,7 @@ def run_all_questions(questions: list[dict], mcp_url: str, api_key: str,
 
     Args:
         on_result: Optional callback(result_dict) called as each question completes.
+        wall_timeout: Max wall-clock seconds per question's agent loop (default 600).
     """
     all_results: list[dict] = []
     total = len(questions)
@@ -165,7 +196,8 @@ def run_all_questions(questions: list[dict], mcp_url: str, api_key: str,
         for idx, q in enumerate(questions):
             tid = idx % threads
             futures[pool.submit(run_one_question, tid, q, mcp_url,
-                                api_key, model, max_steps, timeout)] = (idx, q)
+                                api_key, model, max_steps, timeout,
+                                wall_timeout=wall_timeout)] = (idx, q)
 
         for future in as_completed(futures):
             idx, q = futures[future]
@@ -200,93 +232,15 @@ def run_all_questions(questions: list[dict], mcp_url: str, api_key: str,
     return all_results
 
 
-# ─── Per-question saving ─────────────────────────────────────────────────────
-
-def build_question_info(question: dict) -> dict:
-    """Build a normalised question.json dict from either MIXED or OBS format."""
-    q_id = question.get("id", "")
-
-    # MIXED format: top-level "question", "answer", "files"
-    q_text = question.get("question", "")
-    expected_answer = question.get("answer", "")
-    expected_files = question.get("files", [])
-    repo = question.get("repo", "")
-
-    # OBS format: "source_change" + "expected_affected_files"
-    sc = question.get("source_change", {})
-    if not q_text and sc:
-        q_text = sc.get("description", sc.get("specific_change", ""))
-    if not expected_answer and sc:
-        expected_answer = sc.get("specific_change", "")
-    if not expected_files and "expected_affected_files" in question:
-        expected_files = question["expected_affected_files"]
-    if not repo and sc:
-        repo = sc.get("repo", "")
-
-    return {
-        "id": q_id,
-        "question": q_text,
-        "expected_answer": expected_answer,
-        "expected_files": expected_files,
-        "repo": repo,
-    }
-
-
-def save_model_results(output_dir: Path, questions: list[dict],
-                       model_id: str, results: list[dict]):
-    """Save one model's results into per-question directories immediately."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_model = model_id.replace("/", "_").replace(":", "_")
-
-    for q_idx, question in enumerate(questions):
-        q_id = question.get("id", q_idx + 1)
-        q_dir = output_dir / f"question_{q_id}"
-        q_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save question info (idempotent — overwrites if already exists)
-        q_info = build_question_info(question)
-        with open(q_dir / "question.json", "w") as f:
-            json.dump(q_info, f, indent=2, default=str)
-
-        # Find this question's result
-        model_result = None
-        for r in results:
-            if r.get("question_id") == q_id:
-                model_result = r
-                break
-
-        if model_result is None:
-            continue
-
-        model_output = {
-            "model": model_id,
-            "answer": model_result.get("answer", ""),
-            "cost": {
-                "input_tokens": model_result.get("input_tokens", 0),
-                "output_tokens": model_result.get("output_tokens", 0),
-                "total_tokens": model_result.get("total_tokens", 0),
-                "cost_usd": model_result.get("cost_usd", 0.0),
-            },
-            "status": model_result.get("status", ""),
-            "latency_seconds": model_result.get("latency_seconds", 0),
-            "tool_calls_count": model_result.get("tool_calls_count", 0),
-            "agent_steps": model_result.get("agent_steps", 0),
-            "tool_calls": model_result.get("tool_calls", []),
-            "error": model_result.get("error", ""),
-        }
-        with open(q_dir / f"{safe_model}.json", "w") as f:
-            json.dump(model_output, f, indent=2, default=str)
-
-    logger.info(f"  Saved {model_id} results to {output_dir}/")
-
-
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-model evaluation — run all questions against all models")
-    parser.add_argument("--questions", "-q", default=None,
-                        help="Path to questions JSON file (optional if --output-dir has question_*/ folders)")
+        description="MCP Context Generation — run all questions against all models. "
+                    "Reads questions from question_*/question.json folders.")
+    parser.add_argument("--questions-dir", "-q", required=True,
+                        help="Path to folder containing question_*/question.json files "
+                             "(e.g. results/KubeCluster30)")
     parser.add_argument("--mcp-config", "-m", required=True,
                         help="Path to MCP config JSON file")
     parser.add_argument("--models", nargs="+", default=None,
@@ -299,21 +253,15 @@ def main():
                         help="Read timeout per MCP call in seconds (default: 120)")
     parser.add_argument("--api-key", default=None,
                         help="OpenRouter API key")
-    parser.add_argument("--num-questions", "-n", type=int, default=None,
-                        help="Number of questions to run (default: all)")
-    parser.add_argument("--output-dir", "-o", default="results",
-                        help="Base output directory (default: results)")
-    parser.add_argument("--version", "-V", default=None,
-                        help="Version label (e.g. v1, v1.1). Creates results/<version>/ subfolder")
+    parser.add_argument("--questions", "-n", type=str, default=None,
+                        help="Comma-separated question IDs to run (e.g. OBS_TC001,OBS_TC002). Default: all")
+    parser.add_argument("--wall-timeout", type=int, default=600,
+                        help="Max wall-clock seconds per question agent loop (default: 600)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
 
     load_dotenv()
-
-    # Resolve versioned output directory
-    if args.version:
-        args.output_dir = str(Path(args.output_dir) / args.version)
 
     api_key = args.api_key or os.getenv("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -323,6 +271,7 @@ def main():
     # Load models config
     models_cfg = load_models_config()
     all_models = models_cfg.get("models", {})
+    smoke_model = models_cfg.get("smoke_test_model", "xiaomi/mimo-v2-flash")
 
     if args.models:
         model_ids = args.models
@@ -337,36 +286,27 @@ def main():
         logger.error("No models to evaluate. Add models to models.json or use --models")
         sys.exit(1)
 
-    # Load questions
-    qpath = Path(args.questions)
-    if not qpath.exists():
-        logger.error(f"Questions file not found: {qpath}")
+    # Load questions from directory
+    questions_dir = Path(args.questions_dir)
+    if not questions_dir.is_dir():
+        logger.error(f"Questions directory not found: {questions_dir}")
         sys.exit(1)
 
-    with open(qpath) as f:
-        raw = json.load(f)
-
-    if isinstance(raw, list):
-        questions = raw
-    elif isinstance(raw, dict):
-        if "test_cases" in raw:
-            questions = []
-            for tc in raw["test_cases"]:
-                sc = tc.get("source_change", {})
-                questions.append({
-                    "id": tc.get("id", ""),
-                    "question": sc.get("description", sc.get("specific_change", "")),
-                })
-            logger.info(f"Loaded cross-repo format: {len(questions)} test cases")
-        else:
-            questions = raw.get("questions", raw.get("data", [raw]))
+    questions = load_questions_from_dir(questions_dir)
 
     if not questions:
-        logger.error("No questions found in the file")
+        logger.error(f"No question_*/question.json files found in {questions_dir}")
         sys.exit(1)
 
-    if args.num_questions is not None:
-        questions = questions[:args.num_questions]
+    if args.questions is not None:
+        requested_ids = {qid.strip() for qid in args.questions.split(",")}
+        questions = [q for q in questions if q.get("id", "") in requested_ids]
+        missing = requested_ids - {q.get("id", "") for q in questions}
+        if missing:
+            logger.warning(f"Question IDs not found: {', '.join(sorted(missing))}")
+
+    # Output goes to the same questions directory
+    output_dir = questions_dir
 
     # Load MCP URL
     with open(Path(args.mcp_config)) as f:
@@ -378,16 +318,22 @@ def main():
 
     # ── Banner ──
     logger.info("=" * 60)
-    logger.info("MULTI-MODEL EVALUATION")
+    logger.info("MCP CONTEXT GENERATION")
     logger.info("=" * 60)
     logger.info(f"  Models:          {len(model_ids)}")
     for mid in model_ids:
         inp, out = get_model_pricing(mid)
         logger.info(f"    - {mid}  (${inp}/M in, ${out}/M out)")
-    logger.info(f"  Questions:       {len(questions)}")
+    if args.questions:
+        logger.info(f"  Questions:       {len(questions)} (filtered: {args.questions})")
+    else:
+        logger.info(f"  Questions:       {len(questions)}")
+    logger.info(f"  Questions dir:   {questions_dir}")
     logger.info(f"  Threads:         {args.threads}")
     logger.info(f"  Max steps:       {args.max_steps}")
     logger.info(f"  Timeout:         {args.timeout}s")
+    logger.info(f"  Wall timeout:    {args.wall_timeout}s")
+    logger.info(f"  Condenser:       {smoke_model}")
     logger.info(f"  MCP endpoint:    {mcp_url.split('?')[0]}")
     logger.info("=" * 60)
 
@@ -396,7 +342,7 @@ def main():
         """Run all questions for one model, save results, return summary."""
         logger.info(f"  [{model_id}] Starting...")
         safe_model = model_id.replace("/", "_").replace(":", "_")
-        out_dir = Path(args.output_dir)
+        out_dir = output_dir
 
         # Split questions into cached (already have results) and pending
         pending_questions: list[dict] = []
@@ -410,6 +356,19 @@ def main():
                         cached = json.load(rf)
                     # Only cache successful results — retry errors/blanks
                     if cached.get("status") == "success" and cached.get("answer", "").strip():
+                        # Backfill llm_condensed_answer if missing
+                        if not cached.get("llm_condensed_answer"):
+                            q_text = q.get("question", "")
+                            logger.info(f"  [{model_id}] Condensing cached q={q_id}...")
+                            cached["llm_condensed_answer"] = condense_answer(
+                                cached["answer"], q_text, api_key,
+                                model=smoke_model,
+                            )
+                            with open(result_file, "w") as wf:
+                                json.dump(cached, wf, indent=2, default=str)
+                        else:
+                            logger.info(f"  [{model_id}] Skipping q={q_id} (cached + condensed)")
+
                         cached_results.append({
                             "thread": 0,
                             "question_id": q_id,
@@ -425,7 +384,6 @@ def main():
                             "cost_usd": cached.get("cost", {}).get("cost_usd", 0.0),
                             "answer": cached.get("answer", ""),
                         })
-                        logger.info(f"  [{model_id}] Skipping q={q_id} (cached success)")
                     else:
                         logger.info(f"  [{model_id}] Retrying q={q_id} (previous status: {cached.get('status', '?')})")
                         result_file.unlink()
@@ -445,11 +403,23 @@ def main():
             # Save each result to disk as soon as it completes
             def _save_one(result: dict):
                 q_id = result.get("question_id", "?")
+                q_text = result.get("question_text", "")
                 q_dir = out_dir / f"question_{q_id}"
                 q_dir.mkdir(parents=True, exist_ok=True)
+
+                full_answer = result.get("answer", "")
+                condensed = ""
+                if full_answer.strip() and result.get("status") == "success":
+                    logger.info(f"    [{model_id}] Condensing q={q_id}...")
+                    condensed = condense_answer(
+                        full_answer, q_text, api_key,
+                        model=smoke_model,
+                    )
+
                 model_output = {
                     "model": model_id,
-                    "answer": result.get("answer", ""),
+                    "answer": full_answer,
+                    "llm_condensed_answer": condensed,
                     "cost": {
                         "input_tokens": result.get("input_tokens", 0),
                         "output_tokens": result.get("output_tokens", 0),
@@ -470,7 +440,8 @@ def main():
             try:
                 new_results = run_all_questions(pending_questions, mcp_url, api_key,
                                                 model_id, args.max_steps, args.threads,
-                                                args.timeout, on_result=_save_one)
+                                                args.timeout, on_result=_save_one,
+                                                wall_timeout=args.wall_timeout)
             except PaymentError as e:
                 logger.error(f"  [{model_id}] 402 PAYMENT ERROR — skipping remaining questions: {e}")
                 new_results = []
@@ -487,14 +458,6 @@ def main():
 
         if pending_questions:
             m_elapsed = round(time.perf_counter() - m_start, 2)
-            # Also save question.json for each pending question
-            for q in pending_questions:
-                q_id = q.get("id", "?")
-                q_dir = out_dir / f"question_{q_id}"
-                q_dir.mkdir(parents=True, exist_ok=True)
-                q_info = build_question_info(q)
-                with open(q_dir / "question.json", "w") as wf:
-                    json.dump(q_info, wf, indent=2, default=str)
         else:
             m_elapsed = 0.0
 
@@ -555,20 +518,47 @@ def main():
                     "success": 0, "errors": len(questions),
                     "avg_latency": 0, "total_tokens": 0, "total_cost": 0,
                 }
-                save_model_results(Path(args.output_dir), questions, mid, error_results)
 
     total_elapsed = round(time.perf_counter() - test_start, 1)
 
+    # ── Load existing judge scores from analysis.json files ──
+    from collections import defaultdict
+    score_agg: dict[str, dict] = defaultdict(lambda: {"scores": [], "hallucinations": 0, "judged": 0})
+    for qfolder in sorted(output_dir.iterdir()):
+        if not qfolder.is_dir() or not qfolder.name.startswith("question_"):
+            continue
+        af = qfolder / "analysis.json"
+        if not af.exists():
+            continue
+        try:
+            with open(af) as _f:
+                adata = json.load(_f)
+            for ms in adata.get("model_scores", []):
+                model = ms.get("model", "")
+                sc = ms.get("score", 0)
+                just = (ms.get("justification", "") or "").lower()
+                agg = score_agg[model]
+                agg["judged"] += 1
+                if sc > 0:
+                    agg["scores"].append(sc)
+                # Count hallucination mentions in justification
+                if any(w in just for w in ("hallucin", "irrelevant", "incorrect", "wrong", "fabricat")):
+                    agg["hallucinations"] += 1
+        except Exception:
+            pass
+
     # ── Comparison Table ──
     logger.info("")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
     logger.info("COMPARISON TABLE")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
 
     header = (f"  {'Model':<35} | {'OK':>4} | {'Err':>4} | "
-              f"{'Avg Lat':>8} | {'Tokens':>10} | {'Cost':>10} | {'Time':>7}")
+              f"{'Avg Lat':>8} | {'Tokens':>10} | {'Cost':>10} | "
+              f"{'Score':>6} | {'Halluc':>6} | {'Time':>7}")
     sep = (f"  {'-'*35}-+-{'-'*4}-+-{'-'*4}-+-"
-           f"{'-'*8}-+-{'-'*10}-+-{'-'*10}-+-{'-'*7}")
+           f"{'-'*8}-+-{'-'*10}-+-{'-'*10}-+-"
+           f"{'-'*6}-+-{'-'*6}-+-{'-'*7}")
     logger.info(header)
     logger.info(sep)
 
@@ -579,27 +569,32 @@ def main():
         grand_cost += s["total_cost"]
         grand_tokens += s["total_tokens"]
         model_short = mid if len(mid) <= 35 else mid[:32] + "..."
+        # Judge scores
+        sa = score_agg.get(mid, {"scores": [], "hallucinations": 0, "judged": 0})
+        avg_score = round(sum(sa["scores"]) / len(sa["scores"]), 4) if sa["scores"] else 0
+        halluc = sa["hallucinations"]
+        score_str = f"{avg_score:.4f}" if sa["judged"] > 0 else "  n/a "
+        halluc_str = f"{halluc:>6}" if sa["judged"] > 0 else "  n/a "
         logger.info(
             f"  {model_short:<35} | {s['success']:>4} | {s['errors']:>4} | "
             f"{s['avg_latency']:>7.2f}s | {s['total_tokens']:>10} | "
-            f"${s['total_cost']:>9.4f} | {s['total_time']:>6.1f}s"
+            f"${s['total_cost']:>9.4f} | {score_str} | {halluc_str} | {s['total_time']:>6.1f}s"
         )
 
     logger.info(sep)
     logger.info(f"  {'TOTAL':<35} | {'':>4} | {'':>4} | "
                 f"{'':>8} | {grand_tokens:>10} | "
-                f"${grand_cost:>9.4f} | {total_elapsed:>6.1f}s")
-    logger.info("=" * 60)
+                f"${grand_cost:>9.4f} | {'':>6} | {'':>6} | {total_elapsed:>6.1f}s")
+    logger.info("=" * 80)
 
     # ── Save summary JSON ──
-    results_dir = Path(args.output_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = results_dir / f"{run_ts}-multi_model_eval.json"
+    output_path = output_dir / f"{run_ts}-mcp_context_generation.json"
 
     output = {
-        "multi_model_eval": True,
-        "questions_file": args.questions,
+        "mcp_context_generation": True,
+        "questions_dir": str(questions_dir),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "config": {
             "threads": args.threads,

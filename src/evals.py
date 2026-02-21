@@ -217,12 +217,33 @@ class LLMClient:
             "X-Title": "ByteBell SWE-bench Benchmark",
         }
 
-        resp = requests.post(self.base_url, json=payload, headers=headers, timeout=120)
-        resp.raise_for_status()
-        return resp.json()
+        t0 = time.perf_counter()
+        try:
+            resp = requests.post(self.base_url, json=payload, headers=headers, timeout=120)
+            resp.raise_for_status()
+            elapsed = round(time.perf_counter() - t0, 1)
+            data = resp.json()
+            usage = data.get("usage", {})
+            logger.info(f"[LLM] {self.model} replied in {elapsed}s | "
+                         f"prompt={usage.get('prompt_tokens', '?')} "
+                         f"completion={usage.get('completion_tokens', '?')}")
+            return data
+        except requests.exceptions.Timeout:
+            elapsed = round(time.perf_counter() - t0, 1)
+            logger.error(f"[LLM] {self.model} TIMED OUT after {elapsed}s")
+            raise
+        except requests.exceptions.HTTPError as e:
+            elapsed = round(time.perf_counter() - t0, 1)
+            logger.error(f"[LLM] {self.model} HTTP {e.response.status_code} after {elapsed}s")
+            raise
 
 
 # ─── Agent Loop ──────────────────────────────────────────────────────────────
+
+class AgentTimeoutError(TimeoutError):
+    """Raised when the agent loop exceeds its wall-clock timeout."""
+    pass
+
 
 def run_agent(
     llm: LLMClient,
@@ -230,10 +251,15 @@ def run_agent(
     question: str,
     max_steps: int = 25,
     verbose: bool = False,
+    wall_timeout: int = 600,
 ) -> tuple[str, list[ToolCallRecord], int, int, int]:
     """
     Simple tool-calling loop. Returns:
         (answer, tool_calls, agent_steps, total_input_tokens, total_output_tokens)
+
+    Args:
+        wall_timeout: Maximum wall-clock seconds for the entire agent loop (default 600 = 10 min).
+                      Set to 0 to disable.
     """
     system_prompt = (
         "You are an expert code analyst and software architect performing an EXHAUSTIVE codebase audit. "
@@ -294,15 +320,33 @@ def run_agent(
     total_input = 0
     total_output = 0
     steps = 0
+    wall_start = time.perf_counter()
+
+    def _check_wall_timeout(phase: str):
+        if wall_timeout and (time.perf_counter() - wall_start) > wall_timeout:
+            elapsed = round(time.perf_counter() - wall_start, 1)
+            raise AgentTimeoutError(
+                f"Agent wall-clock timeout ({wall_timeout}s) exceeded during {phase} "
+                f"after {elapsed}s and {steps} steps"
+            )
 
     for step in range(max_steps):
         steps += 1
+        step_start = time.perf_counter()
 
-        if verbose:
-            logger.info(f"  Step {step + 1}/{max_steps}")
+        _check_wall_timeout(f"step {step + 1} start")
+
+        logger.info(f"[AGENT] Step {step + 1}/{max_steps} | "
+                     f"wall={round(time.perf_counter() - wall_start, 1)}s | "
+                     f"tokens_so_far={total_input + total_output}")
 
         # Call LLM
+        logger.info(f"[LLM] Calling {llm.model} ...")
+        llm_start = time.perf_counter()
         resp = llm.chat(messages, tools=tools)
+        llm_elapsed = round(time.perf_counter() - llm_start, 1)
+        logger.info(f"[LLM] Response in {llm_elapsed}s")
+
         choice = resp.get("choices", [{}])[0]
         message = choice.get("message", {})
         finish_reason = choice.get("finish_reason", "")
@@ -333,9 +377,8 @@ def run_agent(
                 tool_args = {}
             parsed_calls.append((tc.get("id", ""), tool_name, tool_args))
 
-        if verbose:
-            names = [name for _, name, _ in parsed_calls]
-            logger.info(f"    Executing {len(parsed_calls)} tool call(s) in parallel: {names}")
+        names = [name for _, name, _ in parsed_calls]
+        logger.info(f"[TOOLS] Executing {len(parsed_calls)} tool call(s) in parallel: {names}")
 
         # Execute all tool calls in parallel
         def _exec_tool(tc_id, tool_name, tool_args):
@@ -344,15 +387,38 @@ def run_agent(
             elapsed = round(time.perf_counter() - t0, 3)
             return tc_id, tool_name, tool_args, result_text, elapsed
 
+        # Calculate remaining wall-clock budget for tool execution
+        tool_timeout = None
+        if wall_timeout:
+            remaining = wall_timeout - (time.perf_counter() - wall_start)
+            if remaining <= 0:
+                _check_wall_timeout("tool execution start")
+            tool_timeout = max(remaining, 10)  # at least 10s
+
         results_map = {}
         with ThreadPoolExecutor(max_workers=min(len(parsed_calls), 8)) as pool:
             futures = {
                 pool.submit(_exec_tool, tc_id, name, args): tc_id
                 for tc_id, name, args in parsed_calls
             }
-            for future in as_completed(futures):
-                tc_id, tool_name, tool_args, result_text, elapsed = future.result()
-                results_map[tc_id] = (tool_name, tool_args, result_text, elapsed)
+            done_futures = set()
+            try:
+                for future in as_completed(futures, timeout=tool_timeout):
+                    tc_id, tool_name, tool_args, result_text, elapsed = future.result()
+                    results_map[tc_id] = (tool_name, tool_args, result_text, elapsed)
+                    done_futures.add(future)
+                    logger.info(f"[TOOLS] {tool_name} completed in {elapsed}s")
+            except TimeoutError:
+                # Some tool calls didn't finish in time — cancel them
+                pending_ids = []
+                for f, tid in futures.items():
+                    if f not in done_futures:
+                        f.cancel()
+                        pending_ids.append(tid)
+                raise AgentTimeoutError(
+                    f"Tool execution timed out after {tool_timeout:.0f}s. "
+                    f"Pending tool call IDs: {pending_ids}"
+                )
 
         # Append results in original order (must match tool_calls order)
         for tc_id, tool_name, tool_args in parsed_calls:
@@ -376,18 +442,33 @@ def run_agent(
                 "content": result_text,
             })
 
+        step_elapsed = round(time.perf_counter() - step_start, 1)
+        logger.info(f"[AGENT] Step {step + 1} complete in {step_elapsed}s | "
+                     f"total_tool_calls={len(tool_records)}")
+
     # Max steps reached — ask for final answer
+    wall_elapsed = round(time.perf_counter() - wall_start, 1)
+    logger.info(f"[AGENT] Max steps ({max_steps}) reached after {wall_elapsed}s — requesting final answer")
     messages.append({
         "role": "user",
         "content": "You have reached the maximum number of tool calls. Please provide your best answer now based on what you've gathered.",
     })
+    logger.info(f"[LLM] Calling {llm.model} (final answer) ...")
+    llm_start = time.perf_counter()
     resp = llm.chat(messages, tools=None)
+    llm_elapsed = round(time.perf_counter() - llm_start, 1)
+    logger.info(f"[LLM] Final answer in {llm_elapsed}s")
+
     choice = resp.get("choices", [{}])[0]
     message = choice.get("message", {})
     usage = resp.get("usage", {})
     total_input += usage.get("prompt_tokens", 0)
     total_output += usage.get("completion_tokens", 0)
     steps += 1
+
+    total_wall = round(time.perf_counter() - wall_start, 1)
+    logger.info(f"[AGENT] Complete: {steps} steps, {len(tool_records)} tool calls, "
+                 f"{total_input + total_output} tokens, {total_wall}s wall time")
 
     return message.get("content", ""), tool_records, steps, total_input, total_output
 
@@ -471,6 +552,67 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     cost = (input_tokens * input_rate / 1_000_000) + \
            (output_tokens * output_rate / 1_000_000)
     return round(cost, 6)
+
+
+# ─── Answer condensation ─────────────────────────────────────────────────────
+
+
+def condense_answer(answer: str, question: str, api_key: str,
+                    model: str | None = None) -> str:
+    """Condense a verbose model answer into a short summary + file list.
+
+    Uses the smoke_test_model (cheap/fast) from models.json to extract
+    just the essential findings: brief summary and affected file paths.
+
+    Returns condensed text, or the original answer (truncated) on failure.
+    """
+    if not answer or not answer.strip():
+        return "(empty)"
+
+    if model is None:
+        cfg = load_models_config()
+        model = cfg.get("smoke_test_model", "xiaomi/mimo-v2-flash")
+
+    prompt = (
+        "Condense the following model answer into a structured summary.\n"
+        "Extract ONLY:\n"
+        "1. A 2-3 sentence summary of the key findings\n"
+        "2. The list of specific file paths mentioned with a brief reason for each\n\n"
+        f"QUESTION: {question}\n\n"
+        f"FULL ANSWER:\n{answer}\n\n"
+        "Respond in this exact format (no markdown, no code fences):\n"
+        "SUMMARY: <2-3 sentences>\n"
+        "FILES:\n"
+        "- <repo>/<path/to/file> — <brief reason>\n"
+        "- <repo>/<path/to/file> — <brief reason>\n"
+        "...\n"
+    )
+
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": 4096,
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        condensed = content.strip()
+        if condensed:
+            return condensed
+    except Exception as e:
+        logger.warning(f"condense_answer failed: {e}")
+
+    # Fallback: truncate original
+    return answer[:3000] + "\n... [truncated]" if len(answer) > 3000 else answer
 
 
 # ─── Benchmark Runner ────────────────────────────────────────────────────────
