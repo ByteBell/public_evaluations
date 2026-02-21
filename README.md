@@ -123,27 +123,29 @@ The LLM judge (`judge_model` in `models.json`, currently `google/gemini-3.1-pro-
 | **30%** | Reasoning Quality | Did the model explain *why* each file is affected — interface implementation, dependency chain, data flow? Did it describe what specifically needs to change? |
 | **10%** | Precision Penalty | Did the model list clearly irrelevant files (hallucination)? Models that pad answers with irrelevant files score lower. |
 
-Scores are **normalized to sum to 1.0** across all models for each question, then averaged across questions.
+Each model is scored **independently** as a percentage accuracy (0-100%). Scores are not normalized across models — multiple models can receive the same score.
 
 ### Analysis Output
 
 After evaluation, `analysis_summary.json` contains the final leaderboard with accuracy vs. cost:
 
 ```
-Model                                         |  Avg Score |    Total |     Cost $ |    Score/$ | Judged
-----------------------------------------------+------------+----------+------------+------------+-------
-openai/gpt-5.1-codex-max                      |     0.2535 |   6.5900 |   $34.0892 |     0.0074 |     26
-google/gemini-3-flash-preview                 |     0.2012 |   5.2300 |    $3.5100 |     0.0573 |     26
-anthropic/claude-haiku-4.5                    |     0.1707 |   2.5600 |    $0.9800 |     0.1742 |     15
-deepseek/deepseek-chat-v3.1                   |     0.1331 |   3.4600 |    $0.8200 |     0.1623 |     26
-xiaomi/mimo-v2-flash                          |     0.0793 |   1.7450 |    $0.2310 |     0.3433 |     22
+Model                                         |   Avg % |     Cost $ |      %/$ | Judged
+----------------------------------------------+---------+------------+----------+-------
+openai/gpt-5.1-codex-max                      |   78.8% | $  43.7883 |     1.80 |     40
+anthropic/claude-haiku-4.5                    |   77.2% | $  17.2828 |     4.47 |     16
+google/gemini-3-flash-preview                 |   72.1% | $  12.4790 |     5.78 |     40
+deepseek/deepseek-chat-v3.1                   |   63.1% | $   3.0286 |    20.84 |     40
+x-ai/grok-code-fast-1                         |   48.5% | $   5.4157 |     8.96 |     40
+claude-opus-4.6/aicopilot                       |   44.8% | $   0.0000 |     0.00 |     40
+openai/gpt-5.1-codex-mini                     |   44.1% | $   9.6812 |     4.56 |     40
+xiaomi/mimo-v2-flash                          |   43.6% | $   3.8807 |    11.24 |     40
 ```
 
 Key metrics per model:
-- **Avg Score** — mean normalized score across all judged questions (higher = better)
-- **Total** — sum of all scores
+- **Avg %** — mean independent accuracy percentage across all judged questions (higher = better)
 - **Cost $** — total USD spent across all questions (input + output tokens)
-- **Score/$** — average score divided by total cost (higher = more accuracy per dollar)
+- **%/$** — accuracy percentage per dollar spent (higher = more accuracy per dollar)
 - **Judged** — number of questions where the model produced a scoreable answer
 
 ### Evaluation Pipeline
