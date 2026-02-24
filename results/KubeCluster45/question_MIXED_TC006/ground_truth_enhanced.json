@@ -1,0 +1,385 @@
+{
+  "$schema": "ground_truth_enhanced.schema.json",
+  "id": "MIXED_TC006",
+  "question": "Change the Data field on corev1.Secret from map[string][]byte to a new named type SecretData with different accessor methods. Which files across Helm, ArgoCD, cert-manager, and external-secrets would break because they directly access Secret.Data as a map?",
+  "change": {
+    "module": "corev1.Secret",
+    "source_repo": "kubernetes",
+    "source_file": "staging/src/k8s.io/api/core/v1/types.go",
+    "before": "type Secret struct {\n\tmetav1.TypeMeta `json:\",inline\"`\n\tmetav1.ObjectMeta `json:\"metadata,omitempty\" protobuf:\"bytes,1,opt,name=metadata\"`\n\tImmutable *bool `json:\"immutable,omitempty\" protobuf:\"varint,5,opt,name=immutable\"`\n\tData map[string][]byte `json:\"data,omitempty\" protobuf:\"bytes,2,rep,name=data\"`\n\tStringData map[string]string `json:\"stringData,omitempty\" protobuf:\"bytes,4,rep,name=stringData\"`\n\tType SecretType `json:\"type,omitempty\" protobuf:\"bytes,3,opt,name=type,casttype=SecretType\"`\n}",
+    "after": "type SecretData interface {\n\tGet(key string) ([]byte, bool)\n\tSet(key string, value []byte)\n\tKeys() []string\n\tLen() int\n}\n\ntype Secret struct {\n\tmetav1.TypeMeta `json:\",inline\"`\n\tmetav1.ObjectMeta `json:\"metadata,omitempty\" protobuf:\"bytes,1,opt,name=metadata\"`\n\tImmutable *bool `json:\"immutable,omitempty\" protobuf:\"varint,5,opt,name=immutable\"`\n\tData SecretData `json:\"data,omitempty\" protobuf:\"bytes,2,rep,name=data\"`\n\tStringData map[string]string `json:\"stringData,omitempty\" protobuf:\"bytes,4,rep,name=stringData\"`\n\tType SecretType `json:\"type,omitempty\" protobuf:\"bytes,3,opt,name=type,casttype=SecretType\"`\n}",
+    "description": "The Data field changes from map[string][]byte to SecretData interface. All direct map operations (indexing, range loops, nil checks, map literal assignments) will break."
+  },
+  "breaking_patterns": [
+    {
+      "id": "map_index_read",
+      "example": "value := secret.Data[\"key\"]",
+      "why_breaks": "Direct map indexing no longer works. Must use Get() method instead."
+    },
+    {
+      "id": "map_index_write",
+      "example": "secret.Data[\"key\"] = []byte(\"value\")",
+      "why_breaks": "Direct map assignment no longer works. Must use Set() method instead."
+    },
+    {
+      "id": "range_over_map",
+      "example": "for k, v := range secret.Data { ... }",
+      "why_breaks": "Cannot range over interface. Must use Keys() method and Get() for each key."
+    },
+    {
+      "id": "map_key_exists_check",
+      "example": "if _, ok := secret.Data[key]; ok { ... }",
+      "why_breaks": "Cannot use two-value map index on interface. Must use Get() which returns (value, exists)."
+    },
+    {
+      "id": "nil_check_or_len",
+      "example": "if secret.Data == nil || len(secret.Data[key]) == 0 { ... }",
+      "why_breaks": "Cannot check nil or use len() on interface field. Must use Len() method or check returned value from Get()."
+    }
+  ],
+  "impacted_files": [
+    {
+      "repo": "helm",
+      "file": "pkg/storage/driver/secrets.go",
+      "breaking_patterns": ["map_index_read"],
+      "code_evidence": [
+        "func (secrets *Secrets) Get(key string) (release.Releaser, error) {",
+        "\tobj, err := secrets.impl.Get(context.Background(), key, metav1.GetOptions{})",
+        "\tif err != nil {",
+        "\t\tif apierrors.IsNotFound(err) {",
+        "\t\t\treturn nil, ErrReleaseNotFound",
+        "\t\t}",
+        "\t\treturn nil, fmt.Errorf(\"get: failed to get %q: %w\", key, err)",
+        "\t}",
+        "\tr, err := decodeRelease(string(obj.Data[\"release\"]))",
+        "\tif err != nil {",
+        "\t\treturn r, fmt.Errorf(\"get: failed to decode data %q: %w\", key, err)",
+        "\t}"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Change obj.Data[\"release\"] to use Get method: if val, ok := obj.Data.Get(\"release\"); ok { r, err := decodeRelease(string(val)) ... }"
+    },
+    {
+      "repo": "helm",
+      "file": "pkg/storage/driver/secrets_test.go",
+      "breaking_patterns": ["map_index_write"],
+      "code_evidence": [
+        "\tsecret.Data[\"release\"] = []byte(base64.StdEncoding.EncodeToString(b))"
+      ],
+      "severity": "test_only",
+      "suggested_fix": "Change to secret.Data.Set(\"release\", []byte(base64.StdEncoding.EncodeToString(b)))"
+    },
+    {
+      "repo": "argo-cd",
+      "file": "gitops-engine/pkg/diff/diff.go",
+      "breaking_patterns": ["range_over_map", "map_index_write", "nil_check_or_len"],
+      "code_evidence": [
+        "\tfor k, v := range secret.Data {",
+        "\t\tif len(v) == 0 {",
+        "\t\t\tsecret.Data[k] = []byte(\"\")",
+        "\t\t}",
+        "\t}",
+        "\tif secret.Data != nil {",
+        "\t\terr = unstructured.SetNestedField(un.Object, newObj[\"data\"], \"data\")",
+        "\t\tif err != nil {",
+        "\t\t\to.log.Error(err, \"failed to set secret.data\")",
+        "\t\t\treturn",
+        "\t\t}",
+        "\t}"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace range with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok && len(v) == 0 { secret.Data.Set(k, []byte(\"\")) } }. Replace nil check with: if secret.Data.Len() > 0 { ... }"
+    },
+    {
+      "repo": "argo-cd",
+      "file": "applicationset/generators/plugin.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\tsecretValues := make(map[string]string, len(secret.Data))",
+        "",
+        "\tfor k, v := range secret.Data {",
+        "\t\tsecretValues[k] = string(v)",
+        "\t}"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace range with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { secretValues[k] = string(v) } }. Change len(secret.Data) to secret.Data.Len()."
+    },
+    {
+      "repo": "argo-cd",
+      "file": "common/common.go",
+      "breaking_patterns": ["map_key_exists_check", "map_index_read"],
+      "code_evidence": [
+        "\t_, ok := secret.Data[RedisInitialCredentialsKey]",
+        "\tif !ok {",
+        "\t\treturn fmt.Errorf(\"secret %s/%s does not contain key %s\", namespace, RedisInitialCredentials, RedisInitialCredentialsKey)",
+        "\t}",
+        "\tredisOptions.Password = string(secret.Data[RedisInitialCredentialsKey])"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: val, ok := secret.Data.Get(RedisInitialCredentialsKey); if !ok { return fmt.Errorf(...) }; redisOptions.Password = string(val)"
+    },
+    {
+      "repo": "argo-cd",
+      "file": "util/settings/settings.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\tfor k, v := range argoCDSecret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range argoCDSecret.Data.Keys() { if v, ok := argoCDSecret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "argo-cd",
+      "file": "cmd/argocd/commands/admin/generatespec_utils.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\tfor k, v := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/issuer/acme/setup.go",
+      "breaking_patterns": ["map_key_exists_check"],
+      "code_evidence": [
+        "\tencodedKeyData, ok := sec.Data[eab.Key]"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: encodedKeyData, ok := sec.Data.Get(eab.Key)"
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/issuer/acme/dns/rfc2136/provider.go",
+      "breaking_patterns": ["map_key_exists_check"],
+      "code_evidence": [
+        "\tif d, ok := secret.Data[key]; ok {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: if d, ok := secret.Data.Get(key); ok { ... }"
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/issuer/acme/dns/dns.go",
+      "breaking_patterns": ["map_index_read", "map_key_exists_check"],
+      "code_evidence": [
+        "\t\t\tkeyData = saSecret.Data[saKey]",
+        "\t\tkeyData, ok := saSecret.Data[saSecretKey]",
+        "\t\tapiToken := string(apiTokenSecret.Data[providerConfig.DigitalOcean.Token.Key])",
+        "\t\t\tsecretAccessKeyIDBytes, ok := secretAccessKeyIDSecret.Data[providerConfig.Route53.SecretAccessKeyID.Key]",
+        "\t\t\tsecretAccessKeyBytes, ok := secretAccessKeySecret.Data[providerConfig.Route53.SecretAccessKey.Key]"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace all map indexing with Get() method calls. For example: if val, ok := saSecret.Data.Get(saKey); ok { keyData = val }"
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/issuer/venafi/client/venaficlient.go",
+      "breaking_patterns": ["map_index_read"],
+      "code_evidence": [
+        "\t\tusername := string(tppSecret.Data[tppUsernameKey])",
+        "\t\tpassword := string(tppSecret.Data[tppPasswordKey])",
+        "\t\tclientId := string(tppSecret.Data[tppClientIdKey])",
+        "\t\taccessToken := string(tppSecret.Data[tppAccessTokenKey])",
+        "\t\tapiKey := string(cloudSecret.Data[k])"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace all secret.Data[key] with secret.Data.Get(key) calls. Handle the ok return value appropriately."
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/controller/certificates/keymanager/keymanager_controller.go",
+      "breaking_patterns": ["nil_check_or_len", "map_index_read"],
+      "code_evidence": [
+        "\tif secret.Data == nil || len(secret.Data[corev1.TLSPrivateKeyKey]) == 0 {",
+        "\t\tlog.V(logf.DebugLevel).Info(\"Deleting Secret resource as it contains no data\")",
+        "\t\treturn c.deleteSecretResources(ctx, secrets)",
+        "\t}",
+        "\tpkData := secret.Data[corev1.TLSPrivateKeyKey]"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: pkData, ok := secret.Data.Get(corev1.TLSPrivateKeyKey); if !ok || len(pkData) == 0 { ... }"
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/controller/certificates/readiness/readiness_controller.go",
+      "breaking_patterns": ["map_index_read"],
+      "code_evidence": [
+        "\t\tx509cert, err := pki.DecodeX509CertificateBytes(input.Secret.Data[corev1.TLSCertKey])"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: if certData, ok := input.Secret.Data.Get(corev1.TLSCertKey); ok { x509cert, err := pki.DecodeX509CertificateBytes(certData) ... }"
+    },
+    {
+      "repo": "cert-manager",
+      "file": "test/e2e/framework/helper/validation/certificates/certificates.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\tfor k := range secret.Data {"
+      ],
+      "severity": "test_only",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { ... }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "pkg/controllers/webhookconfig/webhookconfig.go",
+      "breaking_patterns": ["map_key_exists_check"],
+      "code_evidence": [
+        "\tcrt, ok := secret.Data[caCertName]"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: crt, ok := secret.Data.Get(caCertName)"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "pkg/controllers/pushsecret/pushsecret_controller.go",
+      "breaking_patterns": ["map_key_exists_check"],
+      "code_evidence": [
+        "func secretKeyExists(key string, secret *v1.Secret) bool {",
+        "\t_, ok := secret.Data[key]",
+        "\treturn key == \"\" || ok",
+        "}"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: _, ok := secret.Data.Get(key)"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "runtime/esutils/utils.go",
+      "breaking_patterns": ["range_over_map", "map_index_read", "map_key_exists_check"],
+      "code_evidence": [
+        "\tif data.GetSecretKey() == \"\" {",
+        "\t\tdecodedMap := make(map[string]string)",
+        "\t\tfor k, v := range secret.Data {",
+        "\t\t\tdecodedMap[k] = string(v)",
+        "\t\t}",
+        "\t\tvalue, err = JSONMarshal(decodedMap)",
+        "\t} else {",
+        "\t\tvalue, ok = secret.Data[data.GetSecretKey()]",
+        ""
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace range with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { decodedMap[k] = string(v) } }. Replace map index with: value, ok = secret.Data.Get(data.GetSecretKey())"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/vault/client_push.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\t\tfor k, v := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/kubernetes/client.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\t\tfor key, val := range secret.Data {",
+        "\t\t\tm[key] = string(val)",
+        "\t\t}"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, key := range secret.Data.Keys() { if val, ok := secret.Data.Get(key); ok { m[key] = string(val) } }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/akeyless/akeyless.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\t\tfor k, v := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/gcp/secretmanager/client.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\t\tfor k, v := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/delinea/client.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\tfor k := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { ... }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/oracle/oracle.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\t\tfor k, v := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/azure/keyvault/keyvault.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\tfor k, v := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, k := range secret.Data.Keys() { if v, ok := secret.Data.Get(k); ok { ... } }"
+    },
+    {
+      "repo": "external-secrets",
+      "file": "providers/v1/webhook/pkg/webhook/webhook.go",
+      "breaking_patterns": ["range_over_map"],
+      "code_evidence": [
+        "\t\tfor sKey, sVal := range secret.Data {"
+      ],
+      "severity": "compile_error",
+      "suggested_fix": "Replace with: for _, sKey := range secret.Data.Keys() { if sVal, ok := secret.Data.Get(sKey); ok { ... } }"
+    }
+  ],
+  "false_positives": [],
+  "impact_summary": {
+    "total_impacted_files": 26,
+    "total_false_positives": 0,
+    "repos_affected": [
+      "argo-cd",
+      "cert-manager",
+      "external-secrets",
+      "helm"
+    ],
+    "by_pattern": {
+      "map_index_read": 12,
+      "map_index_write": 2,
+      "range_over_map": 16,
+      "map_key_exists_check": 9,
+      "nil_check_or_len": 2
+    },
+    "by_severity": {
+      "compile_error": 24,
+      "test_only": 2
+    }
+  },
+  "_pipeline_notes": {
+    "phase1_search_terms": [
+      ".Data[",
+      "range.*secret.*\\.Data",
+      "secret.Data ==",
+      "len(secret.Data",
+      "make(map[string][]byte)"
+    ],
+    "phase2_candidate_count": {
+      "helm": 10,
+      "argo-cd": 25,
+      "cert-manager": 30,
+      "external-secrets": 45
+    },
+    "phase3_verdict": "All files that directly access Secret.Data as a map will break. The change from map[string][]byte to a named interface type SecretData breaks: (1) direct indexing operations; (2) range loops; (3) nil/len checks; (4) map literal assignments. Every code site must migrate to using Get()/Set()/Keys()/Len() methods."
+  }
+}
