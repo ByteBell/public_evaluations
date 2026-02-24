@@ -1,0 +1,298 @@
+{
+  "model": "stepfun/step-3.5-flash",
+  "answer": "Based on my analysis of the codebase, I can provide a comprehensive overview of how ValidatingWebhook.ClientConfig is used across Gatekeeper, Istio, and Crossplane.\n\n## Architecture Overview\n\nThe `ValidatingWebhook.ClientConfig` is a Kubernetes API field that defines how the API server connects to an admission webhook. It supports two connection methods:\n1. **URL** - Direct HTTPS endpoint\n2. **Service** - In-cluster Kubernetes Service reference (with optional path and port)\n\nAll three projects use the Service-based approach for in-cluster webhooks, with CA bundle injection for TLS certificate validation.\n\n## Detailed Analysis\n\n### 1. Kubernetes API Structure\n\nThe `ValidatingWebhook` type (from `admissionregistration.k8s.io/v1`) contains:\n- `ClientConfig` - Either a `url` or `service` reference plus optional `caBundle`\n- `rules` - Which operations/resources trigger the webhook\n- `failurePolicy` - Fail or Ignore if webhook is unreachable\n- `namespaceSelector` / `objectSelector` - Label-based scoping\n- `sideEffects` - Whether webhook has side effects\n\n### 2. Gatekeeper (Policy Engine)\n\n**Configuration Pattern**: Helm-based with flexible URL or service selection\n\n**Key File**: `charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml`\n\nGatekeeper defines **two** validating webhooks:\n\n**Webhook 1 - Policy Validation** (lines 15-80):\n```yaml\nclientConfig:\n  {{- if .Values.validatingWebhookURL }}\n  url: https://{{ .Values.validatingWebhookURL }}/v1/admit\n  {{- else }}\n  service:\n    name: gatekeeper-webhook-service\n    namespace: '{{ .Release.Namespace }}'\n    path: /v1/admit\n  {{- end }}\n```\n- Supports both external URL and internal service\n- Uses namespace selector to exclude specific namespaces\n- Configurable failure policy and timeout\n- Matches all resources (`*`) with configurable subresources\n\n**Webhook 2 - Label Check** (lines 81-111):\n```yaml\nclientConfig:\n  service:\n    name: gatekeeper-webhook-service\n    namespace: '{{ .Release.Namespace }}'\n    path: /v1/admitlabel\n```\n- Dedicated webhook for namespace label validation\n- Only validates namespaces (core API group)\n- Simpler configuration\n\n**Controller Logic**: `pkg/controller/webhookconfig/webhookconfig_controller.go`\n- Monitors ValidatingWebhookConfiguration changes\n- Triggers ConstraintTemplate reconciliation when webhook config changes\n- Ensures synchronization between webhook config and policy templates\n\n### 3. Crossplane (Infrastructure Control Plane)\n\n**Configuration Pattern**: Static YAML with programmatic CA injection\n\n**Key Files**:\n- `cluster/webhookconfigurations/usage.yaml` - Static webhook definition\n- `internal/initializer/webhook_configurations.go` - Programmatic injection logic\n\n**Webhook Configuration** (`usage.yaml`):\n```yaml\nclientConfig:\n  service:\n    name: webhook-service\n    namespace: system\n    path: /validate-no-usages\n```\n- Single-purpose webhook preventing deletion of in-use resources\n- Uses `objectSelector` to scope to resources with label `crossplane.io/in-use: \"true\"`\n- `failurePolicy: Fail` - Ensures deletion blocked if webhook unavailable\n- Only intercepts DELETE operations on all resources\n\n**Initialization Logic** (`webhook_configurations.go` lines 115-123):\n```go\ncase *admv1.ValidatingWebhookConfiguration:\n    for i := range conf.Webhooks {\n        conf.Webhooks[i].ClientConfig.CABundle = caBundle\n        conf.Webhooks[i].ClientConfig.Service.Name = c.ServiceReference.Name\n        conf.Webhooks[i].ClientConfig.Service.Namespace = c.ServiceReference.Namespace\n        conf.Webhooks[i].ClientConfig.Service.Port = c.ServiceReference.Port\n    }\n```\n- Reads TLS secret to get CA bundle\n- Injects service reference (name, namespace, port) into all webhooks\n- Supports both ValidatingWebhookConfiguration and MutatingWebhookConfiguration\n- Uses functional options pattern for configuration\n\n**Cleanup Logic** (lines 158-201):\n- Removes obsolete webhooks from ValidatingWebhookConfiguration during uninstall\n- Prevents stale webhook entries from causing request failures\n\n### 4. Istio (Service Mesh)\n\n**Configuration Pattern**: Helm-based with revision-aware deployment\n\n**Key File**: `manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml`\n\n**Webhook Configuration** (lines 16-67):\n```yaml\nclientConfig:\n  {{- if .Values.base.validationURL }}\n  url: {{ .Values.base.validationURL }}\n  {{- else }}\n  service:\n    name: istiod{{- if not (eq .Values.revision \"\") }}-{{ .Values.revision }}{{- end }}\n    namespace: {{ .Values.global.istioNamespace }}\n    path: \"/validate\"\n  {{- end }}\n  {{- if .Values.base.validationCABundle }}\n  caBundle: \"{{ .Values.base.validationCABundle }}\"\n  {{- end }}\n```\n- Supports both URL and service-based configuration\n- Service name includes revision suffix for multi-revision deployments\n- CA bundle injected via Helm value\n- Conditional `failurePolicy`: `Fail` when CA bundle present, otherwise `Ignore` (wait for webhook readiness)\n\n**Scoping**:\n- Validates Istio-specific API groups: `security.istio.io`, `networking.istio.io`, `telemetry.istio.io`, `extensions.istio.io`\n- Uses `objectSelector` to match resources with `istio.io/rev` label\n- Supports per-revision validation in multi-revision setups\n\n**Deployment Conditions**:\n- Only created when `global.configValidation` is enabled\n- Only for appropriate resource scopes (all/cluster)\n- Handles remote istiod scenarios\n\n## Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| Kubernetes API | `staging/src/k8s.io/api/admissionregistration/v1/types.go` | Defines ValidatingWebhook.ClientConfig structure (URL or Service + CABundle) |\n| Kubernetes API | `staging/src/k8s.io/client-go/applyconfigurations/admissionregistration/v1/validatingwebhook.go` | Declarative builder for ValidatingWebhook configuration |\n| Kubernetes API | `staging/src/k8s.io/client-go/applyconfigurations/admissionregistration/v1/webhookclientconfig.go` | Builder for ClientConfig (URL, Service, CABundle) |\n| Gatekeeper | `charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml` | Helm template defining two webhooks with service-based ClientConfig |\n| Gatekeeper | `pkg/controller/webhookconfig/webhookconfig_controller.go` | Controller that reconciles ValidatingWebhookConfiguration and triggers ConstraintTemplate reconciliation |\n| Gatekeeper | `config/crd/patches/webhook_in_*.yaml` | CRD patches enabling conversion webhooks with placeholder ClientConfig |\n| Crossplane | `cluster/webhookconfigurations/usage.yaml` | Static ValidatingWebhookConfiguration with service-based ClientConfig for resource protection |\n| Crossplane | `internal/initializer/webhook_configurations.go` | Programmatic injection of CABundle and Service reference into webhook configurations |\n| Crossplane | `cluster/webhookconfigurations/README.md` | Documentation explaining webhook configuration lifecycle management |\n| Istio | `manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml` | Helm template for Istio's validating webhook with revision-aware service naming |\n| Istio | `pkg/config/analysis/analyzers/externalcontrolplane/externalcontrolplane.go` | Analyzer that validates ValidatingWebhookConfiguration URLs use hostnames |\n| Common | `addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/types.go` | Legacy v1beta1 API types (for older clusters) |\n| Common | `staging/src/k8s.io/apiserver/pkg/util/webhook/client.go` | Kubernetes apiserver webhook client implementation |\n\n## Key Differences\n\n| Aspect | Gatekeeper | Crossplane | Istio |\n|--------|-----------|------------|-------|\n| **Webhook Count** | 2 (validation + label check) | 1 (usage protection) | 1 (CRD validation) |\n| **Config Source** | Helm template | Static YAML + init container | Helm template |\n| **CA Bundle** | Injected by cert-manager/cainjector | Injected by init container from TLS secret | Injected via Helm value |\n| **Service Naming** | Fixed: `gatekeeper-webhook-service` | Fixed: `webhook-service` | Revision-aware: `istiod[-<revision>]` |\n| **Failure Policy** | Configurable (default Fail) | Fail | Conditional: Fail with CA, else Ignore |\n| **Selector Strategy** | Namespace + object selectors | Object selector only | Object selector (revision-based) |\n| **Programmatic Mgmt** | Controller watches webhook config | Init container injects config | Helm chart manages config |\n| **Multi-tenancy** | Namespace exemptions via labels | Namespace-scoped service | Revision-based multi-revision |\n\nAll three projects follow Kubernetes best practices: they use service-based ClientConfig for in-cluster communication, require CA bundles for TLS verification, and use label selectors to scope webhook invocation appropriately.",
+  "cost": {
+    "input_tokens": 1414936,
+    "output_tokens": 7265,
+    "total_tokens": 1422201,
+    "cost_usd": 0.143673
+  },
+  "status": "success",
+  "latency_seconds": 180.25,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.073
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.191
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ValidatingWebhook",
+        "channels": [
+          "classes",
+          "purpose",
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/types.go\",\n        \"purpose\": \"Defines the API types for Kubernetes admission webhook configurations, including validating and mutating webhooks, rules, and client configurations. This file provides the data structures used by the Kubernetes API server for admission control, enabling external webhooks to validate or mutate resources during API requests.\"\n      },\n      {\n        ...",
+      "latency_seconds": 0.715
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ClientConfig",
+        "channels": [
+          "classes",
+          "purpose",
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/types.go\",\n        \"purpose\": \"Defines the API types for Kubernetes admission webhook configurations, including validating and mutating webhooks, rules, and client configurations. This file provides the data structures used by the Kubernetes API server for admission control, enabling external webhooks to validate or mutate resources during API requests.\"\n      },\n      {\n        ...",
+      "latency_seconds": 0.767
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "webhook client config service",
+        "channels": [
+          "semantic",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/conversion.go\",\n        \"purpose\": \"Provides conversion functions for Kubernetes API machinery types, enabling serialization and deserialization between different type representations (e.g., pointers, slices, selectors) for use in API servers and clients.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/conversion/converter.go\",\n        \"purpose\": \"Pro...",
+      "latency_seconds": 2.581
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "type ValidatingWebhook struct",
+        "channels": [
+          "classes"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/controller/cainjector/injectables.go\",\n        \"purpose\": \"This file defines interfaces, types, and functions for injecting Certificate Authority (CA) data into various Kubernetes resources such as mutating webhooks, validating webhooks, API services, and custom resource definitions. It supports both direct replacement and merging of CA bundles based on feature gates, enabling secure communication in cert-manager's CA injector controlle...",
+      "latency_seconds": 0.294
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Gatekeeper validatingwebhookconfiguration",
+        "channels": [
+          "paths",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml\",\n        \"purpose\": \"This file defines a Kubernetes ValidatingWebhookConfiguration for the Gatekeeper admission controller. It configures two validating webhooks: one for general policy validation and another for checking/ignoring labels on namespaces. The webhook configuration is templated using Helm, allowing customization of behavio...",
+      "latency_seconds": 0.427
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Crossplane validatingwebhookconfiguration",
+        "channels": [
+          "paths",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/client-go/kubernetes/typed/admissionregistration/v1beta1/validatingwebhookconfiguration.go\",\n        \"purpose\": \"This file is a generated Kubernetes client-go client for managing ValidatingWebhookConfiguration resources in the admissionregistration/v1beta1 API group. It provides a typed interface for CRUD operations on webhook configurations, enabling programmatic management of admission webhooks within a Kubernete...",
+      "latency_seconds": 0.592
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Istio validatingwebhookconfiguration",
+        "channels": [
+          "paths",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml\",\n        \"purpose\": \"Creates a Kubernetes ValidatingWebhookConfiguration for Istio's control plane when validation is enabled, using Helm templating to conditionally include the resource based on global and istiod remote settings. It configures the webhook client, rules, failure policy, side\u00e2\u0080\u0091effects, and selects objects by revision.\"\n      },\n     ...",
+      "latency_seconds": 0.489
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ValidatingWebhook ClientConfig Service",
+        "channels": [
+          "classes"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/types.go\",\n        \"purpose\": \"Defines the API types for Kubernetes admission webhook configurations, including validating and mutating webhooks, rules, and client configurations. This file provides the data structures used by the Kubernetes API server for admission control, enabling external webhooks to validate or mutate resources during API requests.\"\n      },\n      {\n        ...",
+      "latency_seconds": 0.293
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "relativePaths": [
+          "staging/src/k8s.io/api/admissionregistration/v1/types.go"
+        ]
+      },
+      "result_preview": "MCP error -32602: Input validation error: Invalid arguments for tool retrieve_file: [\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"string\",\n    \"received\": \"undefined\",\n    \"path\": [\n      \"knowledgeId\"\n    ],\n    \"message\": \"Required\"\n  }\n]",
+      "latency_seconds": 0.038
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "staging/src/k8s.io/api/admissionregistration/v1/types.go",
+        "channels": [
+          "paths"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"staging/src/k8s.io/api/admissionregistration/v1/types.go\",\n        \"purpose\": \"staging/src/k8s.io/api/admissionregistration/v1/types.go#chunk0: Defines the API schema for ValidatingAdmissionPolicy and related configuration types in Kubernetes admission control.\\nstaging/src/k8s.io/api/admissionregistration/v1/types.go#chunk1: Define API types for Kubernetes admission control policies and webhook configurations.\\nstaging/src/k8s.io/api/admissi...",
+      "latency_seconds": 0.167
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "admissionregistration v1 types ValidatingWebhook",
+        "channels": [
+          "classes"
+        ],
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c"
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"staging/src/k8s.io/client-go/applyconfigurations/internal/internal.go\",\n        \"purpose\": \"This file defines the comprehensive schema structure for Kubernetes API resources used in client-go apply configurations. It provides type-safe serialization and deserialization definitions for a vast range of resources across admission control, core workloads, networking, policy, and storage APIs. The file acts as a central registry for API type def...",
+      "latency_seconds": 0.283
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "staging/src/k8s.io/client-go/applyconfigurations/admissionregistration/v1/validatingwebhook.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/applyconfigurations/admissionregistration/v1/validatingwebhook.go\",\n      \"purpose\": \"This file provides a declarative apply configuration for Kubernetes ValidatingWebhook objects, enabling structured, type-safe construction of webhook configurations via the client-go apply pattern. It serves as a bridge between the Kube...",
+      "latency_seconds": 0.118
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "staging/src/k8s.io/client-go/applyconfigurations/admissionregistration/v1/webhookclientconfig.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/applyconfigurations/admissionregistration/v1/webhookclientconfig.go\",\n      \"purpose\": \"This file provides a Go apply configuration builder for WebhookClientConfig, a Kubernetes API type used to configure TLS connections to admission webhooks. It enables declarative configuration of webhook endpoints via URL or service r...",
+      "latency_seconds": 0.119
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [
+          "charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"509a1028-e065-4f57-9af4-6513f3929680\",\n  \"files\": [\n    {\n      \"path\": \"charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml\",\n      \"purpose\": \"This file defines a Kubernetes ValidatingWebhookConfiguration for the Gatekeeper admission controller. It configures two validating webhooks: one for general policy validation and another for checking/ignoring labels on nam...",
+      "latency_seconds": 0.11
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePath": "charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml"
+      },
+      "result_preview": "# charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml\nLines: 1 - 112 of 112\n\n1 | ---\n2 | {{- if not .Values.disableValidatingWebhook }}\n3 | apiVersion: admissionregistration.k8s.io/v1\n4 | kind: ValidatingWebhookConfiguration\n5 | metadata:\n6 |   annotations: {{- toYaml .Values.validatingWebhookAnnotations | trim | nindent 4 }}\n7 |   labels:\n8 |     app: '{{ template \"gatekeeper.name\" . }}'\n9 |     chart: '{{ template \"gatekeeper.name\" . }}'\n...",
+      "latency_seconds": 1.639
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "35e89bea-571d-4ea9-9cbc-21cf45f4c6bc",
+        "relativePaths": [
+          "cluster/webhookconfigurations/usage.yaml"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"35e89bea-571d-4ea9-9cbc-21cf45f4c6bc\",\n  \"files\": [\n    {\n      \"path\": \"cluster/webhookconfigurations/usage.yaml\",\n      \"purpose\": \"ValidatingWebhookConfiguration that prevents deletion of Kubernetes resources marked with the label crossplane.io/in-use: 'true' by intercepting DELETE operations across all resources and groups via a webhook.\",\n      \"summary\": \"{\\\"Webhook Purpose (~L1-31)\\\":\\\"Implements a protection mech...",
+      "latency_seconds": 0.146
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "35e89bea-571d-4ea9-9cbc-21cf45f4c6bc",
+        "relativePath": "cluster/webhookconfigurations/usage.yaml"
+      },
+      "result_preview": "# cluster/webhookconfigurations/usage.yaml\nLines: 1 - 31 of 31\n\n1 | ---\n2 | # Note(turkenh): It is not possible to get this generated by kubebuilder at the moment due to\n3 | # lack of support for objectSelector in controller-tools.\n4 | # See: https://github.com/kubernetes-sigs/controller-tools/blob/master/pkg/webhook/parser.go#L202-L212\n5 | apiVersion: admissionregistration.k8s.io/v1\n6 | kind: ValidatingWebhookConfiguration\n7 | metadata:\n8 |   name: crossplane-no-usages\n9 | webhooks:\n10 |   - ad...",
+      "latency_seconds": 1.333
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml\",\n      \"purpose\": \"Creates a Kubernetes ValidatingWebhookConfiguration for Istio's control plane when validation is enabled, using Helm templating to conditionally include the resource based on global and istiod remote settings. It configures the webhook cl...",
+      "latency_seconds": 0.129
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml"
+      },
+      "result_preview": "# manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml\nLines: 1 - 70 of 70\n\n1 | {{- if or (eq .Values.global.resourceScope \"all\") (eq .Values.global.resourceScope \"cluster\") }}\n2 | # Created if this is not a remote istiod, OR if it is and is also a config cluster\n3 | {{- if or (not .Values.istiodRemote.enabled) (and .Values.istiodRemote.enabled (or .Values.global.configCluster .Values.istiodRemote.enabledLocalInjectorIstiod)) }}\n4 | {{- if .Values.global.c...",
+      "latency_seconds": 1.228
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "35e89bea-571d-4ea9-9cbc-21cf45f4c6bc",
+        "relativePaths": [
+          "internal/initializer/webhook_configurations.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"35e89bea-571d-4ea9-9cbc-21cf45f4c6bc\",\n  \"files\": [\n    {\n      \"path\": \"internal/initializer/webhook_configurations.go\",\n      \"purpose\": \"This file implements initialization logic for Kubernetes webhook configurations\u00e2\u0080\u0094specifically applying ValidatingWebhookConfiguration and MutatingWebhookConfiguration resources with TLS CA bundle and service reference injection, and removing obsolete webhooks from a validating webho...",
+      "latency_seconds": 0.131
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "35e89bea-571d-4ea9-9cbc-21cf45f4c6bc",
+        "relativePath": "internal/initializer/webhook_configurations.go"
+      },
+      "result_preview": "# internal/initializer/webhook_configurations.go\nLines: 1 - 202 of 202\n\n1 | /*\n2 | Copyright 2022 The Crossplane Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"A...",
+      "latency_seconds": 1.468
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [
+          "pkg/controller/webhookconfig/webhookconfig_controller.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"509a1028-e065-4f57-9af4-6513f3929680\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controller/webhookconfig/webhookconfig_controller.go\",\n      \"purpose\": \"This file implements a Kubernetes controller for managing ValidatingWebhookConfiguration resources in the Gatekeeper project. It monitors changes to webhook configurations and triggers reconciliation of ConstraintTemplates when matching fields change, ensuring that webhook ...",
+      "latency_seconds": 0.129
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ClientConfig CABundle Service",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "channels": [
+          "classes",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"demo/agilebank/constraints/unique_service_selector.yaml\",\n        \"purpose\": \"Defines a Gatekeeper constraint policy to enforce unique service selectors across Kubernetes resources, preventing duplicate selector configurations that could cause routing conflicts.\"\n      },\n      {\n        \"path\": \"website/src/pages/index.js\",\n        \"purpose\": \"This file is the main entry point for the Gatekeeper project's documentation website homepage. It...",
+      "latency_seconds": 0.403
+    }
+  ],
+  "error": ""
+}

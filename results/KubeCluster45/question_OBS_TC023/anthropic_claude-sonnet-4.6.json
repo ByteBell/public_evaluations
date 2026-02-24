@@ -1,0 +1,504 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "answer": "I now have a complete picture of the entire codebase. Let me compile the full analysis.\n\n---\n\n## 1. Architecture Overview\n\nGrafana's datasource API is structured as a **Kubernetes-style API server extension** under the `datasource.grafana.app/v0alpha1` API group. The `DataSourceConnection` struct is the **wire type** that flows through every layer of this system \u2014 from the canonical type definition, through the registry storage layer, the query API routing layer, the HTTP client layer, and into test mocks.\n\nThe end-to-end data path for a connection lookup is:\n\n```\nHTTP GET /apis/datasource.grafana.app/v0alpha1/namespaces/{ns}/connections\n         \u2502\n         \u25bc\npkg/registry/apis/query/routes.go          \u2190 calls b.connections.ListConnections(...)\n         \u2502                                    returns *DataSourceConnectionList\n         \u25bc\npkg/registry/apis/datasource/connections.go \u2190 connectionAccess.List() \u2192 PluginDatasourceProvider\n         \u2502\n         \u25bc\npkg/registry/apis/datasource/plugincontext.go \u2190 scopedDatasourceProvider.ListDataSources()\n         \u2502\n         \u25bc\npkg/registry/apis/datasource/converter.go  \u2190 Converter.AsDataSource() (builds DataSource, not Connection)\n         \u2502\n         \u25bc\npkg/apis/datasource/v0alpha1/connection.go \u2190 DataSourceConnection struct (THE DEFINITION)\n```\n\nThe `DataSourceConnection` struct is also consumed by:\n- `pkg/api/datasource/connections.go` \u2014 HTTP client that deserializes `DataSourceConnectionList` from the K8s API\n- `pkg/api/datasource/connections_test.go` \u2014 constructs `DataSourceConnection{}` literals directly in test table data\n- `pkg/registry/apis/datasource/sub_query_test.go` \u2014 mock `PluginDatasourceProvider` returns `*DataSourceConnection`\n- `pkg/registry/apis/query/routes.go` \u2014 references `DataSourceConnectionList` schema by OpenAPI model name\n- `pkg/tests/apis/openapi_snapshots/datasource.grafana.app-v0alpha1.json` \u2014 snapshot of the OpenAPI schema that includes `DataSourceConnection`\n\n---\n\n## 2. Detailed Analysis\n\n### Layer 1 \u2014 The Struct Definition (Ground Zero)\n\n**File:** `pkg/apis/datasource/v0alpha1/connection.go` (lines 35\u201354)\n\n```go\n// Connection to a datasource instance\ntype DataSourceConnection struct {\n    Title      string `json:\"title\"`\n    Name       string `json:\"name\"`\n    APIGroup   string `json:\"group\"`\n    APIVersion string `json:\"version\"`\n    Plugin     string `json:\"plugin,omitempty\"`\n    // TODO: labels? things the UI would need to show in a list\n}\n```\n\nAdding `AuthConfig AuthenticationConfig` as a **required** (non-pointer, no `omitempty`) field here is the root cause of all downstream breakage. Every composite literal `DataSourceConnection{Name: \"x\"}` that omits `AuthConfig` will fail to compile with:\n> `cannot use DataSourceConnection literal (missing field AuthConfig in struct literal)`\n\nThe `AuthenticationConfig` type itself would also need to be defined in this package (or imported), and the `OpenAPIModelName()` method at line 52 would need to remain consistent.\n\n**Also in this file:**\n- `DataSourceConnectionList` (lines 56\u201367) embeds `[]DataSourceConnection` \u2014 its `DeepCopyObject()` (generated in `zz_generated.deepcopy.go`) will need regeneration to deep-copy the new `AuthConfig` field.\n- `DataSourceConnectionProvider` interface (lines 10\u201314) returns `*DataSourceConnectionList` \u2014 no signature change needed, but all implementations must now populate `AuthConfig`.\n\n---\n\n### Layer 2 \u2014 Generated Deep Copy\n\n**File:** `pkg/apis/datasource/v0alpha1/doc.go`\n\n```go\n// +k8s:deepcopy-gen=package\n// +k8s:openapi-gen=true\n```\n\nThe `doc.go` carries the `+k8s:deepcopy-gen=package` annotation, which means a `zz_generated.deepcopy.go` file is generated for the entire package. Adding a new struct field to `DataSourceConnection` requires **re-running `make generate`** (or the equivalent `deepcopy-gen` invocation) to regenerate the `DeepCopyInto` / `DeepCopy` methods. If `AuthenticationConfig` contains pointer fields or slices, the generated deep-copy logic must handle them correctly.\n\n---\n\n### Layer 3 \u2014 Registry Storage Layer\n\n**File:** `pkg/registry/apis/datasource/connections.go`\n\nThe `connectionAccess` struct implements `rest.Getter` and `rest.Lister`. Its `Get` and `List` methods delegate to `PluginDatasourceProvider`:\n\n```go\nfunc (s *connectionAccess) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {\n    return s.datasources.GetDataSource(ctx, name)\n}\nfunc (s *connectionAccess) List(ctx context.Context, options *internalversion.ListOptions) (runtime.Object, error) {\n    return s.datasources.ListDataSources(ctx)\n}\n```\n\nThese return `*DataSource` / `*DataSourceList`, not `*DataSourceConnection` directly. However, the `connectionAccess` struct is registered as the REST handler for the `/connections` sub-resource, and the `DataSourceConnection` type is what the API server serializes to the wire. Any code that constructs `DataSourceConnection` items to populate a `DataSourceConnectionList` response must now supply `AuthConfig`.\n\n---\n\n### Layer 4 \u2014 Plugin Context Provider (Interface Implementor)\n\n**File:** `pkg/registry/apis/datasource/plugincontext.go`\n\nThe `scopedDatasourceProvider` struct (lines 81\u201387) implements `PluginDatasourceProvider`. Its `ListDataSources` method (lines 183\u2013206) builds a `DataSourceList` (not `DataSourceConnectionList`), but the `PluginDatasourceProvider` interface is also used by `connectionAccess` which serves the `/connections` endpoint. Any code path that constructs `DataSourceConnection{}` literals to populate the list response must be updated.\n\nThe `PluginDatasourceProvider` interface (lines 20\u201339) does **not** directly return `DataSourceConnection`, but the `mockDatasources` in `sub_query_test.go` (lines 104\u2013112) does:\n\n```go\nfunc (m mockDatasources) GetConnection(ctx context.Context, uid string) (*v0alpha1.DataSourceConnection, error) {\n    return nil, nil\n}\nfunc (m mockDatasources) ListConnections(ctx context.Context) (*v0alpha1.DataSourceConnectionList, error) {\n    return nil, nil\n}\n```\n\nThese return `nil` today, but any non-nil construction would break.\n\n---\n\n### Layer 5 \u2014 Query API Builder (Consumer of DataSourceConnectionProvider)\n\n**File:** `pkg/registry/apis/query/register.go` (lines 42\u201358)\n\n```go\ntype QueryAPIBuilder struct {\n    ...\n    connections datasourceV0.DataSourceConnectionProvider\n    ...\n}\n```\n\nThe `QueryAPIBuilder` holds a `DataSourceConnectionProvider` and calls `ListConnections` in the route handler. The returned `DataSourceConnectionList.Items` are `[]DataSourceConnection` \u2014 any code that iterates over these items and accesses fields will need to handle the new `AuthConfig` field.\n\n**File:** `pkg/registry/apis/query/routes.go` (lines 73, 134\u2013138)\n\n```go\nsearchResults := defs[queryV1.OpenAPIPrefix+\"DataSourceConnectionList\"].Schema\n...\nlist, err := b.connections.ListConnections(r.Context(), queryV1.DataSourceConnectionQuery{...})\n```\n\nThe OpenAPI schema reference `\"DataSourceConnectionList\"` will automatically pick up the new field once the OpenAPI spec is regenerated \u2014 but the **snapshot test** will fail.\n\n---\n\n### Layer 6 \u2014 HTTP Client Layer\n\n**File:** `pkg/api/datasource/connections.go` (lines 76\u201379)\n\n```go\nvar conn dsV0.DataSourceConnectionList\nif err := json.Unmarshal(body, &conn); err != nil {\n    return nil, fmt.Errorf(\"failed to unmarshal connection: %w\", err)\n}\n```\n\nThis `json.Unmarshal` call will silently succeed even if the server returns a response without `AuthConfig` (JSON unmarshaling is lenient). However, if `AuthConfig` is a required field in the Go struct (non-pointer, no `omitempty`), callers that access `conn.Items[i].AuthConfig` on old server responses will get a zero-value struct \u2014 which may cause panics if `AuthConfig` contains pointer fields.\n\n**File:** `pkg/api/datasource/connections_test.go` (lines 80\u201393)\n\n```go\nresponseBody: mustMarshal(t, queryV0.DataSourceConnectionList{\n    Items: []queryV0.DataSourceConnection{{Name: \"conn1\"}, {Name: \"conn2\"}},\n}),\nexpectedItems: []queryV0.DataSourceConnection{{Name: \"conn1\"}, {Name: \"conn2\"}},\n```\n\nThese **composite literals** omit `AuthConfig`. With a required (non-pointer) field, Go will **compile-error** unless `AuthConfig` has a zero value that is valid. If `AuthenticationConfig` is a struct type, Go will zero-initialize it \u2014 so these literals will compile but the `assert.Equal` comparison will fail unless the expected items also include the zero `AuthConfig`.\n\n---\n\n### Layer 7 \u2014 OpenAPI Snapshot Test\n\n**File:** `pkg/tests/apis/openapi_snapshots/datasource.grafana.app-v0alpha1.json`\n\nThis golden-file snapshot captures the full OpenAPI schema for `datasource.grafana.app/v0alpha1`, including the `DataSourceConnection` schema. Adding a new field will cause the snapshot to diverge from the generated spec, **breaking the snapshot test** until the file is regenerated with `go test ./pkg/tests/apis/... -update`.\n\n---\n\n### Layer 8 \u2014 Datasource Plugin Standalone Adapters\n\nThe standalone datasource adapters (`pkg/tsdb/loki/standalone/datasource.go`, `pkg/tsdb/tempo/standalone/datasource.go`, `pkg/tsdb/graphite/standalone/datasource.go`, etc.) do **not** directly construct `DataSourceConnection` structs \u2014 they implement `backend.QueryDataHandler`, `backend.CheckHealthHandler`, and `backend.CallResourceHandler`. They are **not directly broken** by this change.\n\nHowever, the `DataSourceAPIBuilder` in `pkg/registry/apis/datasource/register.go` is instantiated once per plugin (line 100: `NewDataSourceAPIBuilder(groupName, pluginJSON, client, datasources.GetDatasourceProvider(pluginJSON), ...)`), and the `connectionAccess` storage it registers serves `DataSourceConnection` objects for every plugin. Any plugin-specific code that constructs `DataSourceConnection` literals would break.\n\n---\n\n## 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| grafana | `pkg/apis/datasource/v0alpha1/connection.go` | **Root cause** \u2014 defines `DataSourceConnection` struct (lines 35\u201354), `DataSourceConnectionList` (lines 56\u201367), `DataSourceConnectionProvider` interface (lines 10\u201314), and `DataSourceApiServerRegistry` interface. Adding `AuthConfig AuthenticationConfig` here is the single source of truth change. |\n| grafana | `pkg/apis/datasource/v0alpha1/types.go` | Sibling file in the same package; defines `OpenAPIPrefix = \"com.github.grafana.grafana.pkg.apis.datasource.v0alpha1.\"` (line 10) used by `DataSourceConnection.OpenAPIModelName()`. New `AuthenticationConfig` type must be defined here or in a new file in this package. |\n| grafana | `pkg/apis/datasource/v0alpha1/register.go` | Defines `GROUP`, `VERSION`, `SchemeGroupVersion`, and `DataSourceResourceInfo` for the `datasource.grafana.app/v0alpha1` API group. The new field must be consistent with the registered schema. |\n| grafana | `pkg/apis/datasource/v0alpha1/datasource.go` | Sibling file defining `DataSource`, `DataSourceList`, `GenericDataSourceSpec` \u2014 same package, same code-gen pass. |\n| grafana | `pkg/apis/datasource/v0alpha1/doc.go` | Carries `// +k8s:deepcopy-gen=package` and `// +k8s:openapi-gen=true` \u2014 triggers regeneration of `zz_generated.deepcopy.go` and OpenAPI definitions for the entire package including `DataSourceConnection`. |\n| grafana | `pkg/apis/datasource/v0alpha1/query.go` | Same package \u2014 part of the same code-gen pass for deepcopy and OpenAPI. |\n| grafana | `pkg/apis/datasource/v0alpha1/unstructured.go` | Same package \u2014 `UnstructuredSpec` used by `DataSource`; same code-gen pass. |\n| grafana | `pkg/apis/datasource/v0alpha1/sqlschema.go` | Same package \u2014 same code-gen pass. |\n| grafana | `pkg/registry/apis/datasource/connections.go` | Implements `connectionAccess` REST storage for the `/connections` sub-resource. `Get` and `List` methods return objects that are serialized as `DataSourceConnection`. The `connectionAccess` struct uses `PluginDatasourceProvider` which must now populate `AuthConfig`. |\n| grafana | `pkg/registry/apis/datasource/plugincontext.go` | Defines `PluginDatasourceProvider` interface and `scopedDatasourceProvider` implementation. `ListDataSources` builds `DataSourceList` items; any path that converts these to `DataSourceConnection` must populate `AuthConfig`. Also defines `ScopedPluginDatasourceProvider` and `cachingDatasourceProvider`. |\n| grafana | `pkg/registry/apis/datasource/converter.go` | `Converter` struct with `AsDataSource()` method (line 47) converts legacy `datasources.DataSource` \u2192 `datasourceV0.DataSource`. If a parallel `AsDataSourceConnection()` method exists or is added, it must populate `AuthConfig`. |\n| grafana | `pkg/registry/apis/datasource/register.go` | `DataSourceAPIBuilder` struct (lines 47\u201357) and `RegisterAPIService` (lines 59\u2013123) \u2014 instantiates one `DataSourceAPIBuilder` per plugin, registers `connectionAccess` storage. `NewDataSourceAPIBuilder` (lines 135\u2013159) wires the builder. |\n| grafana | `pkg/registry/apis/datasource/openapi.go` | `PostProcessOpenAPI` method customizes the OpenAPI spec for each datasource plugin. The `DataSourceConnection` schema will gain a new required property; the method may need to annotate it correctly. |\n| grafana | `pkg/registry/apis/datasource/legacy_store.go` | `legacyStorage` implements `rest.Getter`, `rest.Lister`, etc. for datasources. `List` delegates to `PluginDatasourceProvider.ListDataSources`. Indirectly affected. |\n| grafana | `pkg/registry/apis/datasource/sub_query_test.go` | **Directly broken** \u2014 `mockDatasources` (lines 74\u2013112) implements `PluginDatasourceProvider` and has `GetConnection` returning `*v0alpha1.DataSourceConnection` and `ListConnections` returning `*v0alpha1.DataSourceConnectionList`. Any non-nil construction must include `AuthConfig`. |\n| grafana | `pkg/registry/apis/datasource/sub_resource_test.go` | Test file for datasource sub-resource REST handler; uses `mockDatasources` from the same package \u2014 indirectly affected. |\n| grafana | `pkg/registry/apis/datasource/converter_test.go` | Tests `Converter` conversions; if any test constructs `DataSourceConnection{}` literals, they will break. |\n| grafana | `pkg/registry/apis/query/register.go` | `QueryAPIBuilder` struct (lines 42\u201358) holds `connections datasourceV0.DataSourceConnectionProvider` (line 56). `NewQueryAPIBuilder` (lines 60\u2013106) injects the provider. Consumers of `DataSourceConnection` items from `ListConnections` must handle `AuthConfig`. |\n| grafana | `pkg/registry/apis/query/routes.go`",
+  "llm_condensed_answer": "SUMMARY: Adding a required AuthConfig field to the DataSourceConnection struct in Grafana's datasource API types will cause compilation failures across the codebase, as all existing composite literals and test mocks that construct DataSourceConnection objects will be missing the new field. The change also requires regenerating deep copy methods and OpenAPI schema snapshots, and may affect HTTP client deserialization if old server responses lack the new field.\n\nFILES:\n- grafana/pkg/apis/datasource/v0alpha1/connection.go \u2014 Defines the DataSourceConnection struct; adding AuthConfig here is the root cause of breakage\n- grafana/pkg/apis/datasource/v0alpha1/doc.go \u2014 Contains code generation annotations; requires regeneration after adding the new field\n- grafana/pkg/registry/apis/datasource/sub_query_test.go \u2014 Directly broken; mock implementations return DataSourceConnection and must include AuthConfig\n- grafana/pkg/api/datasource/connections_test.go \u2014 Contains composite literals for DataSourceConnection that will break compilation\n- grafana/pkg/tests/apis/openapi_snapshots/datasource.grafana.app-v0alpha1.json \u2014 OpenAPI snapshot that will diverge and break tests after the field is added",
+  "cost": {
+    "input_tokens": 1629463,
+    "output_tokens": 10387,
+    "total_tokens": 1639850,
+    "cost_usd": 5.044194
+  },
+  "status": "success",
+  "latency_seconds": 220.76,
+  "tool_calls_count": 38,
+  "agent_steps": 20,
+  "tool_calls": [
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "DataSourceConnection struct"
+      },
+      "result_preview": "{\n  \"query\": \"DataSourceConnection struct\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"cilium\",\n    \"autoscaler\",\n    \"crossplane\",\n    \"opentelemetry-collector\",\n    \"gatekeeper\",\n    \"opentelemetry-collector-contrib\",\n    \"kubernetes\",\n    \"grafana\",\n    \"istio\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"Documentation/contributing/docs/docsstructure.rst\",...",
+      "latency_seconds": 1.504
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "datasource plugin connection backend"
+      },
+      "result_preview": "{\n  \"query\": \"datasource plugin connection backend\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"grafana\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/tsdb/grafana-pyroscope-datasource/service.go\",\n      \"repo_name\": \"grafana\",\n      \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n      \"score\": 0.665,\n      \"matched_channels\": [\n        \"purpose\",...",
+      "latency_seconds": 1.605
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DataSourceConnection",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "classes",
+          "purpose",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/connection.go\",\n        \"purpose\": \"Defines Go types and interfaces for managing datasource connections and API servers in a Kubernetes-based system, enabling querying and listing of datasources across multiple API servers for Grafana or similar platforms.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      }\n    ],\n    \"pagination\": {\n      \"page\": 1,\n      \"pa...",
+      "latency_seconds": 0.55
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "datasource v0alpha1 types",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "paths",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/types.go\",\n        \"purpose\": \"Defines API types for datasource health checks and access information in Grafana's Kubernetes custom resource definitions, providing structured data models for health status and permissions metadata to enable integration with Kubernetes APIs.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"apps/advisor...",
+      "latency_seconds": 0.744
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/apis/datasource/v0alpha1/connection.go",
+          "pkg/apis/datasource/v0alpha1/types.go",
+          "pkg/apis/datasource/v0alpha1/datasource.go",
+          "pkg/api/datasource/connections.go",
+          "pkg/registry/apis/datasource/connections.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/apis/datasource/v0alpha1/connection.go\",\n      \"purpose\": \"Defines Go types and interfaces for managing datasource connections and API servers in a Kubernetes-based system, enabling querying and listing of datasources across multiple API servers for Grafana or similar platforms.\",\n      \"summary\": \"{\\\"DataSourceConnectionProvider (~L11-14)\\\":\\\"Interface enabling retrieval o...",
+      "latency_seconds": 0.736
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DataSourceConnection",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "imports",
+          "semantic",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"DataSourceConnection\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  },\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha...",
+      "latency_seconds": 0.83
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/apis/datasource/v0alpha1/connection.go",
+        "fromLine": 1,
+        "toLine": 116
+      },
+      "result_preview": "# pkg/apis/datasource/v0alpha1/connection.go\nLines: 1 - 116 of 117\nMore: fromLine=117\n\n1 | package v0alpha1\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \n6 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n7 | \t\"k8s.io/apimachinery/pkg/runtime/schema\"\n8 | )\n9 | \n10 | // Get all datasource connections -- this will be backed by search or duplicated resource in unified storage\n11 | type DataSourceConnectionProvider interface {\n12 | \t// List lists all data sources the user in context can see\n13 | \tListConnec...",
+      "latency_seconds": 0.728
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/connections.go",
+        "fromLine": 1,
+        "toLine": 59
+      },
+      "result_preview": "# pkg/registry/apis/datasource/connections.go\nLines: 1 - 59 of 60\nMore: fromLine=60\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \n6 | \t\"github.com/grafana/grafana/pkg/apimachinery/utils\"\n7 | \t\"k8s.io/apimachinery/pkg/apis/meta/internalversion\"\n8 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n9 | \t\"k8s.io/apimachinery/pkg/runtime\"\n10 | \t\"k8s.io/apiserver/pkg/registry/rest\"\n11 | )\n12 | \n13 | var (\n14 | \t_ rest.Scoper               = (*connectionAccess)(nil)\n15 | \t_ rest.SingularN...",
+      "latency_seconds": 4.27
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DataSourceConnection ListConnections",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "purpose",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/connection.go\",\n        \"purpose\": \"Defines Go types and interfaces for managing datasource connections and API servers in a Kubernetes-based system, enabling querying and listing of datasources across multiple API servers for Grafana or similar platforms.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"public/app/features/plugins...",
+      "latency_seconds": 0.623
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "PluginDatasourceProvider GetDataSource ListDataSources",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "functions",
+          "purpose",
+          "classes"
+        ]
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"public/app/features/variables/shared/testing/helpers.ts\",\n        \"purpose\": \"Provides a helper function for creating mock DataSourceInstanceSettings objects in Grafana's variable testing infrastructure, used to simulate data source configurations in unit tests.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"public/app/features/variables/editor/selectors.t...",
+      "latency_seconds": 0.611
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "PluginDatasourceProvider",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "classes",
+          "purpose",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/registry/apis/datasource/plugincontext.go\",\n        \"purpose\": \"Provides a scoped datasource provider interface and implementation for Grafana's plugin system, enabling datasource CRUD operations and instance settings retrieval with caching and namespace-aware authorization.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/registry/apis/datasource/sub_...",
+      "latency_seconds": 0.837
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "datasource standalone service prometheus loki tempo mimir",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "paths",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"docs/sources/datasources/tempo/service-graph.md\",\n        \"purpose\": \"Documentation file explaining how to use the Service Graph feature in Grafana Tempo, including configuration steps, visualization details, and interaction patterns for exploring trace data relationships.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/tsdb/loki/standalone/datasource.go\",\n...",
+      "latency_seconds": 1.195
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/registry/apis/datasource/plugincontext.go",
+          "pkg/registry/apis/datasource/sub_query_test.go",
+          "pkg/api/datasource/connections.go",
+          "pkg/api/datasource/connections_test.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/registry/apis/datasource/plugincontext.go\",\n      \"purpose\": \"Provides a scoped datasource provider interface and implementation for Grafana's plugin system, enabling datasource CRUD operations and instance settings retrieval with caching and namespace-aware authorization.\",\n      \"summary\": \"{\\\"Interface Abstraction (~L20-48)\\\":\\\"Defines clean interfaces for datasource ope...",
+      "latency_seconds": 0.398
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "standalone datasource service.go prometheus graphite pyroscope",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "paths",
+          "purpose"
+        ],
+        "path": "pkg/tsdb"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/tsdb/grafana-pyroscope-datasource/service.go\",\n        \"purpose\": \"Service layer for Grafana Pyroscope datasource plugin that implements backend datasource interfaces (QueryData, CheckHealth, Stream) and manages instance lifecycle via instance manager. Acts as the entry point for all datasource operations.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg...",
+      "latency_seconds": 0.752
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/plugincontext.go",
+        "fromLine": 1,
+        "toLine": 206
+      },
+      "result_preview": "# pkg/registry/apis/datasource/plugincontext.go\nLines: 1 - 206 of 207\nMore: fromLine=207\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"fmt\"\n6 | \n7 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend\"\n8 | \t\"github.com/grafana/grafana/pkg/apimachinery/identity\"\n9 | \tdatasourceV0 \"github.com/grafana/grafana/pkg/apis/datasource/v0alpha1\"\n10 | \t\"github.com/grafana/grafana/pkg/plugins\"\n11 | \t\"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request\"\n12 | \t\"github.com/grafa...",
+      "latency_seconds": 1.583
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/api/datasource/connections.go",
+        "fromLine": 1,
+        "toLine": 82
+      },
+      "result_preview": "# pkg/api/datasource/connections.go\nLines: 1 - 82 of 83\nMore: fromLine=83\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"encoding/json\"\n5 | \t\"fmt\"\n6 | \n7 | \t\"k8s.io/apimachinery/pkg/api/errors\"\n8 | \t\"k8s.io/client-go/dynamic\"\n9 | \t\"k8s.io/client-go/rest\"\n10 | \n11 | \tdsV0 \"github.com/grafana/grafana/pkg/apis/datasource/v0alpha1\"\n12 | \tgrafanaapiserver \"github.com/grafana/grafana/pkg/services/apiserver\"\n13 | \t\"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request\"\n14 | \tcontextmodel...",
+      "latency_seconds": 1.614
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/registry/apis/query/register.go",
+          "pkg/registry/apis/query/routes.go",
+          "pkg/apis/datasource/v0alpha1/register.go",
+          "pkg/apis/datasource/v0alpha1/types.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/registry/apis/query/register.go\",\n      \"purpose\": \"Registers the Grafana Query API as a Kubernetes API server extension, providing a unified query endpoint for datasources and expressions. It acts as the entry point for the query service, configuring storage, authorization, and OpenAPI schema generation.\",\n      \"summary\": \"{\\\"API Group Registration (~L170-210)\\\":\\\"Impleme...",
+      "latency_seconds": 0.73
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DataSourceConnectionProvider ListConnections query",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "purpose",
+          "functions",
+          "imports"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"packages/grafana-prometheus/src/add_label_to_query.ts\",\n        \"purpose\": \"Provides utilities to add or modify label filters in PromQL query strings used by Grafana's Prometheus datasource. It parses queries, identifies vector selectors, and injects label filters while preserving original formatting and handling potentially invalid queries.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n   ...",
+      "latency_seconds": 1.155
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/query/routes.go",
+        "fromLine": 1,
+        "toLine": 153
+      },
+      "result_preview": "# pkg/registry/apis/query/routes.go\nLines: 1 - 153 of 154\nMore: fromLine=154\n\n1 | package query\n2 | \n3 | import (\n4 | \t\"encoding/json\"\n5 | \t\"net/http\"\n6 | \n7 | \t\"github.com/gorilla/mux\"\n8 | \t\"k8s.io/apimachinery/pkg/runtime/schema\"\n9 | \t\"k8s.io/kube-openapi/pkg/spec3\"\n10 | \t\"k8s.io/kube-openapi/pkg/validation/spec\"\n11 | \n12 | \tqueryV1 \"github.com/grafana/grafana/pkg/apis/datasource/v0alpha1\"\n13 | \t\"github.com/grafana/grafana/pkg/services/apiserver/builder\"\n14 | \t\"github.com/grafana/grafana/pkg/s...",
+      "latency_seconds": 1.654
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Converter AsDataSourceConnection datasource connection builder",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "functions",
+          "purpose",
+          "classes"
+        ],
+        "path": "pkg/registry/apis/datasource"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/registry/apis/datasource/register.go\",\n        \"purpose\": \"Registers and builds the Grafana datasource API group for plugin-specific datasource configurations, providing REST endpoints for query execution, health checks, and resource management. It acts as a bridge between Grafana's plugin system and the Kubernetes-style API server.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      ...",
+      "latency_seconds": 0.66
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/registry/apis/datasource/converter.go",
+          "pkg/registry/apis/datasource/register.go",
+          "pkg/registry/apis/query/register.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/registry/apis/datasource/converter.go\",\n      \"purpose\": \"Provides a converter for transforming between Grafana's legacy datasource models and Kubernetes API-based datasource resources, enabling seamless integration and migration of datasource configurations including secure values handling.\",\n      \"summary\": \"{\\\"Converter Pattern (~L27-41)\\\":\\\"Factory pattern for creating...",
+      "latency_seconds": 0.391
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DataSourceConnectionList Items DataSourceConnection",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "purpose",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"public/app/features/dashboard-scene/scene/layout-rows/RowItems.tsx\",\n        \"purpose\": \"Defines the RowItems class that implements EditableDashboardElement for managing a collection of RowItem objects in the Grafana dashboard scene, providing editing capabilities, row retrieval, deletion, and header visibility toggling to support dashboard layout customization.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo...",
+      "latency_seconds": 0.485
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/converter.go",
+        "fromLine": 1,
+        "toLine": 110
+      },
+      "result_preview": "# pkg/registry/apis/datasource/converter.go\nLines: 1 - 110 of 268\nMore: fromLine=111\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"crypto/sha256\"\n5 | \t\"encoding/hex\"\n6 | \t\"fmt\"\n7 | \t\"iter\"\n8 | \t\"maps\"\n9 | \t\"slices\"\n10 | \t\"strconv\"\n11 | \t\"strings\"\n12 | \t\"time\"\n13 | \n14 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n15 | \n16 | \t\"github.com/grafana/authlib/types\"\n17 | \tcommon \"github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1\"\n18 | \t\"github.com/grafana/grafana/pkg/apimachinery/ut...",
+      "latency_seconds": 1.022
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/query/register.go",
+        "fromLine": 40,
+        "toLine": 106
+      },
+      "result_preview": "# pkg/registry/apis/query/register.go\nLines: 40 - 106 of 319\nMore: fromLine=107\n\n40 | var _ builder.APIGroupBuilder = (*QueryAPIBuilder)(nil)\n41 | \n42 | type QueryAPIBuilder struct {\n43 | \tlog                  log.Logger\n44 | \tconcurrentQueryLimit int\n45 | \tfeatures             featuremgmt.FeatureToggles\n46 | \n47 | \tauthorizer authorizer.Authorizer\n48 | \n49 | \ttracer                 tracing.Tracer\n50 | \tmetrics                *metrics.ExprMetrics\n51 | \tinstanceProvider       clientapi.InstancePr...",
+      "latency_seconds": 1.05
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/register.go",
+        "fromLine": 36,
+        "toLine": 160
+      },
+      "result_preview": "# pkg/registry/apis/datasource/register.go\nLines: 36 - 160 of 349\nMore: fromLine=161\n\n36 | var (\n37 | \t_ builder.APIGroupBuilder = (*DataSourceAPIBuilder)(nil)\n38 | )\n39 | \n40 | type DataSourceAPIBuilderConfig struct {\n41 | \tLoadQueryTypes         bool\n42 | \tUseDualWriter          bool\n43 | \tEnableResourceEndpoint bool\n44 | }\n45 | \n46 | // DataSourceAPIBuilder is used just so wire has something unique to return\n47 | type DataSourceAPIBuilder struct {\n48 | \tdatasourceResourceInfo utils.ResourceIn...",
+      "latency_seconds": 1.642
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/sub_query_test.go",
+        "fromLine": 74,
+        "toLine": 128
+      },
+      "result_preview": "# pkg/registry/apis/datasource/sub_query_test.go\nLines: 74 - 128 of 129\nMore: fromLine=129\n\n74 | var _ PluginDatasourceProvider = (*mockDatasources)(nil)\n75 | \n76 | type mockDatasources struct {\n77 | }\n78 | \n79 | // CreateDataSource implements PluginDatasourceProvider.\n80 | func (m mockDatasources) CreateDataSource(ctx context.Context, ds *v0alpha1.DataSource) (*v0alpha1.DataSource, error) {\n81 | \treturn nil, nil\n82 | }\n83 | \n84 | // UpdateDataSource implements PluginDatasourceProvider.\n85 | fun...",
+      "latency_seconds": 1.599
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/legacy_store.go",
+        "fromLine": 1,
+        "toLine": 80
+      },
+      "result_preview": "# pkg/registry/apis/datasource/legacy_store.go\nLines: 1 - 80 of 225\nMore: fromLine=81\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"errors\"\n6 | \t\"fmt\"\n7 | \t\"time\"\n8 | \n9 | \t\"github.com/prometheus/client_golang/prometheus\"\n10 | \tapierrors \"k8s.io/apimachinery/pkg/api/errors\"\n11 | \t\"k8s.io/apimachinery/pkg/apis/meta/internalversion\"\n12 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n13 | \t\"k8s.io/apimachinery/pkg/runtime\"\n14 | \t\"k8s.io/apimachinery/pkg/util/validation/field\"\n15 |...",
+      "latency_seconds": 1.734
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/apis/datasource/v0alpha1/types.go",
+        "fromLine": 1,
+        "toLine": 46
+      },
+      "result_preview": "# pkg/apis/datasource/v0alpha1/types.go\nLines: 1 - 46 of 46\n\n1 | package v0alpha1\n2 | \n3 | import (\n4 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n5 | \n6 | \tcommon \"github.com/grafana/grafana/pkg/apimachinery/apis/common/v0alpha1\"\n7 | \t\"github.com/grafana/grafana/pkg/services/accesscontrol\"\n8 | )\n9 | \n10 | const OpenAPIPrefix = \"com.github.grafana.grafana.pkg.apis.datasource.v0alpha1.\"\n11 | \n12 | // +k8s:deepcopy-gen=true\n13 | // +k8s:openapi-gen=true\n14 | // +k8s:deepcopy-gen:interfaces=k8s...",
+      "latency_seconds": 0.713
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/querier.go",
+        "fromLine": 1,
+        "toLine": 100
+      },
+      "result_preview": "# pkg/registry/apis/datasource/querier.go\nLines: 1 - 97 of 97\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \n6 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend\"\n7 | \t\"github.com/grafana/grafana/pkg/apimachinery/utils\"\n8 | \t\"github.com/grafana/grafana/pkg/plugins\"\n9 | \t\"github.com/grafana/grafana/pkg/services/apiserver/endpoints/request\"\n10 | \t\"github.com/grafana/grafana/pkg/services/datasources\"\n11 | )\n12 | \n13 | type QuerierFactoryFunc func(ctx context.Context, ri utils.Resou...",
+      "latency_seconds": 1.606
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/apis/datasource/v0alpha1/register.go",
+        "fromLine": 1,
+        "toLine": 53
+      },
+      "result_preview": "# pkg/apis/datasource/v0alpha1/register.go\nLines: 1 - 53 of 54\nMore: fromLine=54\n\n1 | package v0alpha1\n2 | \n3 | import (\n4 | \t\"fmt\"\n5 | \t\"time\"\n6 | \n7 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n8 | \t\"k8s.io/apimachinery/pkg/runtime\"\n9 | \t\"k8s.io/apimachinery/pkg/runtime/schema\"\n10 | \n11 | \t\"github.com/grafana/grafana/pkg/apimachinery/utils\"\n12 | )\n13 | \n14 | const (\n15 | \tGROUP   = \"datasource.grafana.app\"\n16 | \tVERSION = \"v0alpha1\"\n17 | )\n18 | \n19 | var (\n20 | \t// SchemeGroupVersion is gr...",
+      "latency_seconds": 0.72
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/openapi.go",
+        "fromLine": 1,
+        "toLine": 60
+      },
+      "result_preview": "# pkg/registry/apis/datasource/openapi.go\nLines: 1 - 60 of 117\nMore: fromLine=61\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"fmt\"\n5 | \n6 | \t\"k8s.io/kube-openapi/pkg/spec3\"\n7 | \t\"k8s.io/kube-openapi/pkg/validation/spec\"\n8 | \n9 | \t\"github.com/grafana/grafana/pkg/registry/apis/query/queryschema\"\n10 | )\n11 | \n12 | func (b *DataSourceAPIBuilder) PostProcessOpenAPI(oas *spec3.OpenAPI) (*spec3.OpenAPI, error) {\n13 | \t// The plugin description\n14 | \toas.Info.Description = b.pluginJSON.Info.Descripti...",
+      "latency_seconds": 1.035
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "zz_generated deepcopy datasource v0alpha1",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "paths"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/connection.go\",\n        \"purpose\": \"Defines Go types and interfaces for managing datasource connections and API servers in a Kubernetes-based system, enabling querying and listing of datasources across multiple API servers for Grafana or similar platforms.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/...",
+      "latency_seconds": 0.919
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "zz_generated deepcopy DataSourceConnection",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "paths",
+          "purpose"
+        ],
+        "path": "pkg/apis/datasource"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[paths] 0 results for \\\"zz_generated deepcopy DataSourceConnection\\\". Full paths are brittle \u00e2\u0080\u0094 the stored relative_path may differ by prefix or structure. Try searching with just the FILENAME (e.g. \\\"shared_informer.go\\\" instead of \\\"staging/src/k8s.io/client-go/tools/cache/shared_inf...",
+      "latency_seconds": 0.51
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "expand",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/apis/datasource/v0alpha1/doc.go",
+          "pkg/apis/datasource/v0alpha1/query.go",
+          "pkg/apis/datasource/v0alpha1/sqlschema.go",
+          "pkg/apis/datasource/v0alpha1/unstructured.go",
+          "pkg/tests/apis/openapi_snapshots/datasource.grafana.app-v0alpha1.json"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"expand\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/apis/datasource/v0alpha1/doc.go\",\n      \"purpose\": \"Package documentation for the v0alpha1 version of the datasource API, defining the API group name for Kubernetes custom resource definitions and enabling code generation tools.\",\n      \"classes\": [],\n      \"functions\": [],\n      \"language\": \"unknown\",\n      \"lineCount\": 0\n    },\n    {\n      \"path\": \"pkg/apis/datasource/v0alp...",
+      "latency_seconds": 0.425
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "zz_generated deepcopy",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "channels": [
+          "glob"
+        ],
+        "glob": "pkg/apis/datasource/**/*.go"
+      },
+      "result_preview": "{\n  \"glob\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/connection.go\",\n        \"purpose\": \"Defines Go types and interfaces for managing datasource connections and API servers in a Kubernetes-based system, enabling querying and listing of datasources across multiple API servers for Grafana or similar platforms.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/apis/datasource/v0alpha1/d...",
+      "latency_seconds": 0.821
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/apis/datasource/v0alpha1/doc.go",
+        "fromLine": 1,
+        "toLine": 30
+      },
+      "result_preview": "# pkg/apis/datasource/v0alpha1/doc.go\nLines: 1 - 7 of 7\n\n1 | // +k8s:deepcopy-gen=package\n2 | // +k8s:openapi-gen=true\n3 | // +k8s:defaulter-gen=TypeMeta\n4 | // +groupName=datasource.grafana.com\n5 | \n6 | package v0alpha1\n7 | ",
+      "latency_seconds": 0.73
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/api/datasource/connections_test.go",
+        "fromLine": 53,
+        "toLine": 135
+      },
+      "result_preview": "# pkg/api/datasource/connections_test.go\nLines: 53 - 135 of 136\nMore: fromLine=136\n\n53 | func TestGetConnectionByUID(t *testing.T) {\n54 | \ttests := []struct {\n55 | \t\tname          string\n56 | \t\tuid           string\n57 | \t\tstatusCode    int\n58 | \t\tresponseBody  []byte\n59 | \t\texpectedError string\n60 | \t\texpectedItems []queryV0.DataSourceConnection\n61 | \t}{\n62 | \t\t{\n63 | \t\t\tname:          \"connection not found returns error\",\n64 | \t\t\tuid:           \"non-existent-uid\",\n65 | \t\t\tstatusCode:    http.St...",
+      "latency_seconds": 1.062
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/registry/apis/datasource/sub_query_test.go",
+        "fromLine": 1,
+        "toLine": 73
+      },
+      "result_preview": "# pkg/registry/apis/datasource/sub_query_test.go\nLines: 1 - 73 of 129\nMore: fromLine=74\n\n1 | package datasource\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"errors\"\n6 | \t\"fmt\"\n7 | \t\"testing\"\n8 | \n9 | \t\"github.com/stretchr/testify/require\"\n10 | \tk8serrors \"k8s.io/apimachinery/pkg/api/errors\"\n11 | \t\"k8s.io/apimachinery/pkg/runtime\"\n12 | \n13 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend\"\n14 | \t\"github.com/grafana/grafana/pkg/apis/datasource/v0alpha1\"\n15 | \t\"github.com/grafana/grafana/pkg/services/...",
+      "latency_seconds": 1.06
+    }
+  ],
+  "error": ""
+}

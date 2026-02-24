@@ -1,0 +1,710 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "answer": "I now have a comprehensive picture of all the files. Let me compile the complete analysis.\n\n---\n\n## 1. Architecture Overview\n\nThe new `go.opentelemetry.io/collector/scraper` package (in the **opentelemetry-collector** core repo) defines a clean, signal-typed pull-based scraper abstraction. The data flow is:\n\n```\nscraper.Factory (NewFactory + WithMetrics/WithLogs)\n    \u2514\u2500\u25ba scraper.Metrics / scraper.Logs  (created via NewMetrics / NewLogs)\n            \u251c\u2500 ScrapeMetrics(ctx) (pmetric.Metrics, error)   \u2190 metrics signal\n            \u251c\u2500 ScrapeLogs(ctx)   (plog.Logs, error)          \u2190 logs signal\n            \u251c\u2500 scraper.WithStart(startFunc)                  \u2190 lifecycle hook\n            \u2514\u2500 scraper.WithShutdown(shutdownFunc)            \u2190 lifecycle hook\n\nscraperhelper.NewMetricsController / NewLogsController\n    \u2514\u2500\u25ba wraps one or more scraper.Metrics / scraper.Logs\n    \u2514\u2500\u25ba schedules periodic ScrapeMetrics / ScrapeLogs calls\n    \u2514\u2500\u25ba forwards results to consumer.Metrics / consumer.Logs\n\nreceiver.Factory (receiver.NewFactory + receiver.WithMetrics/WithLogs)\n    \u2514\u2500\u25ba createMetricsReceiver / createLogsReceiver\n            \u2514\u2500\u25ba instantiates scraper(s) \u2192 wraps in scraperhelper controller \u2192 returns receiver.Metrics/Logs\n```\n\n**Two distinct usage patterns exist:**\n\n1. **Sub-scraper pattern** (hostmetricsreceiver sub-scrapers, zookeeperscraper): The scraper itself is a `scraper.Factory` (returned by `scraper.NewFactory`). The parent receiver's factory calls `scraperhelper.AddFactoryWithConfig(factory, cfg)` to register each sub-scraper with the controller.\n\n2. **Inline scraper pattern** (database receivers, Kubernetes receivers, network receivers): The receiver factory directly calls `scraper.NewMetrics(s.scrape, scraper.WithStart(s.start), scraper.WithShutdown(s.shutdown))` and passes the result to `scraperhelper.AddMetricsScraper(metadata.Type, s)` or `scraperhelper.NewMetricsController`.\n\n---\n\n## 2. Detailed Analysis\n\n### Core Package \u2014 `go.opentelemetry.io/collector/scraper` (opentelemetry-collector repo)\n\n| File | Key API |\n|------|---------|\n| `scraper/scraper.go` | `ScrapeFunc[T]`, `WithStart(component.StartFunc)`, `WithShutdown(component.ShutdownFunc)`, `baseScraper` struct |\n| `scraper/metrics.go` | `type Metrics interface { component.Component; ScrapeMetrics(context.Context) (pmetric.Metrics, error) }`, `NewMetrics(ScrapeMetricsFunc, ...Option) (Metrics, error)` |\n| `scraper/logs.go` | `type Logs interface { component.Component; ScrapeLogs(context.Context) (plog.Logs, error) }`, `NewLogs(ScrapeLogsFunc, ...Option) (Logs, error)` |\n| `scraper/factory.go` | `type Factory interface { CreateMetrics(...) (Metrics, error); CreateLogs(...) (Logs, error); ... }`, `NewFactory(cfgType, createDefaultConfig, ...FactoryOption)`, `WithMetrics(CreateMetricsFunc, StabilityLevel)`, `WithLogs(CreateLogsFunc, StabilityLevel)`, `type Settings struct { ID, TelemetrySettings, BuildInfo }` |\n| `scraper/scraperhelper/controller.go` | `NewMetricsController(cfg, rSet, consumer, ...ControllerOption)`, `NewLogsController(...)`, `AddMetricsScraper(type, scraper.Metrics)`, `AddFactoryWithConfig(factory, cfg)` |\n\n### hostmetricsreceiver \u2014 Top-Level Factory\n\n**`receiver/hostmetricsreceiver/factory.go`** is the orchestrator. It:\n- Declares a `scraperFactories` map populated with all 11 sub-scraper factories (cpu, disk, filesystem, load, memory, network, nfs, paging, processes, process, system)\n- In `createMetricsReceiver`, calls `scraperhelper.NewMetricsController` with `scraperhelper.AddFactoryWithConfig(factory, cfg)` for each configured scraper\n- Wraps each factory with `internal.NewEnvVarFactory` to inject gopsutil env vars\n\n**`receiver/hostmetricsreceiver/internal/scraper.go`** \u2014 The `envVarScraper` struct directly implements `scraper.Metrics` by implementing `ScrapeMetrics(ctx context.Context) (pmetric.Metrics, error)`, delegating to the wrapped scraper after injecting env vars into context.\n\n### hostmetricsreceiver Sub-Scrapers \u2014 Factory Pattern\n\nAll 11 sub-scraper factories follow the identical pattern:\n```go\nfunc NewFactory() scraper.Factory {\n    return scraper.NewFactory(metadata.Type, createDefaultConfig,\n        scraper.WithMetrics(createMetricsScraper, metadata.MetricsStability))\n}\n\nfunc createMetricsScraper(ctx context.Context, settings scraper.Settings, config component.Config) (scraper.Metrics, error) {\n    s := newXxxScraper(ctx, settings, cfg)\n    return scraper.NewMetrics(s.scrape,\n        scraper.WithStart(s.start),\n        scraper.WithShutdown(s.shutdown),  // only where needed\n    )\n}\n```\n\n| Sub-scraper | Factory file | Scraper impl file | Notes |\n|-------------|-------------|-------------------|-------|\n| cpu | `cpuscraper/factory.go` | `cpuscraper/cpu_scraper.go` | `WithStart` only |\n| disk | `diskscraper/factory.go` | `diskscraper/disk_scraper_others.go` + `_windows.go` | `WithStart` only |\n| filesystem | `filesystemscraper/factory.go` | `filesystemscraper/filesystem_scraper.go` | Container detection in factory |\n| load | `loadscraper/factory.go` | `loadscraper/load_scraper.go` | `WithStart` + `WithShutdown` |\n| memory | `memoryscraper/factory.go` | `memoryscraper/memory_scraper.go` | `WithStart` only |\n| network | `networkscraper/factory.go` | `networkscraper/network_scraper.go` | `WithStart` only |\n| nfs | `nfsscraper/factory.go` | `nfsscraper/nfs_scraper.go` + `_linux.go` | Linux-only guard; `WithStart` |\n| paging | `pagingscraper/factory.go` | `pagingscraper/paging_scraper.go` | `WithStart` only |\n| processes | `processesscraper/factory.go` | `processesscraper/processes_scraper.go` | `WithStart` only |\n| process | `processscraper/factory.go` | `processscraper/process_scraper.go` | Platform guard (Linux/Win/macOS/FreeBSD); `WithStart` |\n| system | `systemscraper/factory.go` | `systemscraper/system_scraper.go` | OS guard (Linux/Win/macOS); `WithStart` |\n\n### Database Receivers \u2014 Inline Scraper Pattern\n\nThese receivers use `receiver.NewFactory` (not `scraper.NewFactory`) at the top level, but internally call `scraper.NewMetrics` / `scraper.NewLogs` directly:\n\n**MySQL** (`receiver/mysqlreceiver/factory.go`):\n- Metrics: `scraper.NewMetrics(ns.scrape, scraper.WithStart(ns.start), scraper.WithShutdown(ns.shutdown))`\n- Logs (top query): `scraper.NewLogs(ns.scrapeTopQueryFunc, scraper.WithStart(ns.start), scraper.WithShutdown(ns.shutdown))` wrapped in `scraper.NewFactory(..., scraper.WithLogs(...))` + `scraperhelper.AddFactoryWithConfig`\n- Logs (query sample): same pattern with `ns.scrapeQuerySampleFunc`\n\n**PostgreSQL** (`receiver/postgresqlreceiver/factory.go`):\n- Metrics: `scraper.NewMetrics(ns.scrape, scraper.WithShutdown(ns.shutdown))`\n- Logs (query samples): `scraper.NewLogs(func(ctx) { return ns.scrapeQuerySamples(...) }, scraper.WithShutdown(ns.shutdown))`\n- Logs (top query): `scraper.NewLogs(func(ctx) { return ns.scrapeTopQuery(...) }, scraper.WithShutdown(ns.shutdown))`\n- Both logs scrapers wrapped in `scraper.NewFactory(..., scraper.WithLogs(...))` + `scraperhelper.AddFactoryWithConfig`\n\n**MongoDB** (`receiver/mongodbreceiver/factory.go`):\n- `scraper.NewMetrics(ms.scrape, scraper.WithStart(ms.start), scraper.WithShutdown(ms.shutdown))`\n\n**Elasticsearch** (`receiver/elasticsearchreceiver/factory.go`):\n- `scraper.NewMetrics(es.scrape, scraper.WithStart(es.start))`\n\n**Redis** (`receiver/redisreceiver/redis_scraper.go`):\n- `scraper.NewMetrics(rs.Scrape, scraper.WithShutdown(rs.shutdown))` \u2014 notably constructed inside `newRedisScraperWithClient`, not in `factory.go`\n\n### Kubernetes Receivers\n\n**kubeletstatsreceiver** (`receiver/kubeletstatsreceiver/factory.go` + `scraper.go`):\n- `newKubeletScraper` in `scraper.go` returns `scraper.Metrics` via `scraper.NewMetrics(ks.scrape, scraper.WithStart(ks.start), scraper.WithShutdown(ks.shutdown))`\n- `scrape(context.Context) (pmetric.Metrics, error)` is the core method\n\n**dockerstatsreceiver** (`receiver/dockerstatsreceiver/factory.go`):\n- `scraper.NewMetrics(dsr.scrapeV2, scraper.WithStart(dsr.start), scraper.WithShutdown(dsr.shutdown))`\n\n### Network Receivers\n\n**snmpreceiver** (`receiver/snmpreceiver/factory.go`):\n- `scraper.NewMetrics(snmpScraper.scrape, scraper.WithStart(snmpScraper.start))`\n\n**haproxyreceiver** (`receiver/haproxyreceiver/factory.go`):\n- `scraper.NewMetrics(mp.scrape, scraper.WithStart(mp.start))`\n\n### Standalone Scraper Package (zookeeperscraper)\n\n**`scraper/zookeeperscraper/factory.go`** \u2014 Uses `scraper.NewFactory` directly (not wrapped in a receiver), returning `scraper.Metrics` from `createMetrics`. This is the \"pure scraper\" pattern where the scraper is consumed by a `scraperreceiver`.\n\n### Internal SQL Query Scraper\n\n**`internal/sqlquery/scraper.go`** \u2014 The `Scraper` struct has `var _ scraper.Metrics = (*Scraper)(nil)` compile-time assertion, implementing `ScrapeMetrics(context.Context) (pmetric.Metrics, error)` directly (not via `scraper.NewMetrics`). Used by `sqlqueryreceiver` and `oracledbreceiver`.\n\n### Reference Implementation (mdatagen)\n\n**`cmd/mdatagen/internal/samplescraper/factory.go`** \u2014 The canonical reference showing both `scraper.WithMetrics` and `scraper.WithLogs` in a single `scraper.NewFactory` call, with `scraper.NewMetrics` and `scraper.NewLogs` returning no-op implementations.\n\n---\n\n## 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| opentelemetry-collector | `scraper/scraper.go` | Defines `ScrapeFunc[T]`, `WithStart`, `WithShutdown`, `baseScraper`, `Option` interface |\n| opentelemetry-collector | `scraper/metrics.go` | Defines `scraper.Metrics` interface with `ScrapeMetrics(context.Context) (pmetric.Metrics, error)`, `NewMetrics()` constructor |\n| opentelemetry-collector | `scraper/logs.go` | Defines `scraper.Logs` interface with `ScrapeLogs(context.Context) (plog.Logs, error)`, `NewLogs()` constructor |\n| opentelemetry-collector | `scraper/factory.go` | Defines `scraper.Factory` interface, `scraper.Settings`, `NewFactory()`, `WithMetrics()`, `WithLogs()`, `CreateMetricsFunc`, `CreateLogsFunc` |\n| opentelemetry-collector | `scraper/doc.go` | Package-level documentation for the scraper package |\n| opentelemetry-collector | `scraper/scraperhelper/controller.go` | `NewMetricsController`, `NewLogsController`, `AddMetricsScraper`, `AddFactoryWithConfig`, `ControllerOption` |\n| opentelemetry-collector | `scraper/scraperhelper/doc.go` | Package documentation for scraperhelper |\n| opentelemetry-collector | `scraper/xscraper/factory.go` | Extended factory for profiles signal support |\n| opentelemetry-collector | `scraper/xscraper/scraper.go` | Generic scraper base for xscraper |\n| opentelemetry-collector | `scraper/xscraper/profiles.go` | `scraper.Profiles` interface for profile signal |\n| opentelemetry-collector | `scraper/scraperhelper/xscraperhelper/controller.go` | Controller for xscraper.Profiles |\n| opentelemetry-collector | `scraper/scrapererror/doc.go` | Custom error types for scrapers |\n| opentelemetry-collector | `cmd/mdatagen/internal/samplescraper/factory.go` | Reference implementation: `scraper.NewFactory` + `scraper.WithMetrics` + `scraper.WithLogs` + `scraper.NewMetrics` + `scraper.NewLogs` |\n| opentelemetry-collector-contrib | `receiver/hostmetricsreceiver/factory.go` | Top-level receiver factory; registers all 11 sub-scraper factories via `scraperFactories` map; calls `scraperhelper.NewMetricsController` + `scraperhelper.AddFactoryWithConfig` |\n| opentelemetry-collector-contrib | `receiver/hostmetricsreceiver/internal/scraper.go` | `envVarScraper` directly implements `scraper.Metrics` interface (`ScrapeMetrics` method); `NewEnvVarFactory` wraps sub-scraper factories |\n| opentelemetry-collector-contrib | `receiver/hostmetricsreceiver/internal/scraper/cpuscraper/factory.go` | `NewFactory() scraper.Factory` via `scraper.NewFactory`; `createMetricsScraper` returns `scraper.NewMetrics(s.scrape, scraper.WithStart(s.start))` |\n| opentelemetry-collector-contrib | `receiver/hostmetricsreceiver/internal/scraper/cpuscraper/cpu_scraper.go` | `cpuScraper.scrape(ctx) (pmetric.Metrics, error)` \u2014 implements `ScrapeMetricsFunc` |\n| opentelemetry-collector-contrib | `receiver/hostmetricsreceiver/internal/scraper/cpuscraper/cpu_scraper_linux.go` | Linux-specific CPU scrape logic |\n| opentelemetry-collector-contrib | `receiver/hostmetricsreceiver/internal/scraper/cpuscraper/cpu_scraper_others.go` | Non-Linux CPU scrape stubs |\n| opentel",
+  "llm_condensed_answer": "SUMMARY: The new go.opentelemetry.io/collector/scraper package provides typed interfaces (scraper.Metrics, scraper.Logs) and factory methods for building pull-based scrapers. Receivers adopt this via two patterns: hostmetricsreceiver uses a sub-scraper factory pattern, while database, Kubernetes, and network receivers use an inline scraper pattern where the receiver factory directly instantiates scrapers using scraper.NewMetrics/NewLogs.\n\nFILES:\n- opentelemetry-collector/scraper/scraper.go \u2014 Defines base scraper options (WithStart, WithShutdown) and ScrapeFunc\n- opentelemetry-collector/scraper/metrics.go \u2014 Defines scraper.Metrics interface and NewMetrics constructor\n- opentelemetry-collector/scraper/logs.go \u2014 Defines scraper.Logs interface and NewLogs constructor\n- opentelemetry-collector/scraper/factory.go \u2014 Defines scraper.Factory interface, Settings, and WithMetrics/WithLogs options\n- opentelemetry-collector/scraper/scraperhelper/controller.go \u2014 Provides NewMetricsController/NewLogsController and AddFactoryWithConfig\n- opentelemetry-collector/cmd/mdatagen/internal/samplescraper/factory.go \u2014 Reference implementation using scraper.NewFactory, WithMetrics, WithLogs, NewMetrics, NewLogs\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/factory.go \u2014 Top-level factory registering all sub-scraper factories and using scraperhelper.NewMetricsController\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper.go \u2014 envVarScraper implementing scraper.Metrics interface with ScrapeMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/cpuscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/cpuscraper/cpu_scraper.go \u2014 Implements ScrapeMetricsFunc for CPU metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/diskscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/diskscraper/disk_scraper_others.go \u2014 Platform-specific disk scrape logic\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/filesystemscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/filesystemscraper/filesystem_scraper.go \u2014 Implements ScrapeMetricsFunc for filesystem metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/loadscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics with WithShutdown\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/loadscraper/load_scraper.go \u2014 Implements ScrapeMetricsFunc for load metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/memoryscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/memoryscraper/memory_scraper.go \u2014 Implements ScrapeMetricsFunc for memory metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/networkscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/networkscraper/network_scraper.go \u2014 Implements ScrapeMetricsFunc for network metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/nfsscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics (Linux-only)\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/nfsscraper/nfs_scraper.go \u2014 Implements ScrapeMetricsFunc for NFS metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/pagingscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/pagingscraper/paging_scraper.go \u2014 Implements ScrapeMetricsFunc for paging metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper/processes_scraper.go \u2014 Implements ScrapeMetricsFunc for processes metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics (platform-guarded)\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processscraper/process_scraper.go \u2014 Implements ScrapeMetricsFunc for process metrics\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/systemscraper/factory.go \u2014 Sub-scraper factory using scraper.NewFactory and scraper.NewMetrics (OS-guarded)\n- opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/systemscraper/system_scraper.go \u2014 Implements ScrapeMetricsFunc for system metrics\n- opentelemetry-collector-contrib/receiver/mysqlreceiver/factory.go \u2014 Uses scraper.NewMetrics and scraper.NewLogs with WithStart/WithShutdown for metrics and logs\n- opentelemetry-collector-contrib/receiver/postgresqlreceiver/factory.go \u2014 Uses scraper.NewMetrics and scraper.NewLogs with WithShutdown for metrics and logs\n- opentelemetry-collector-contrib/receiver/mongodbreceiver/factory.go \u2014 Uses scraper.NewMetrics with WithStart and WithShutdown\n- opentelemetry-collector-contrib/receiver/elasticsearchreceiver/factory.go \u2014 Uses scraper.NewMetrics with WithStart\n- opentelemetry-collector-contrib/receiver/redisreceiver/redis_scraper.go \u2014 Uses scraper.NewMetrics with WithShutdown inside newRedisScraperWithClient\n- opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/factory.go \u2014 Uses scraper.NewMetrics with WithStart and WithShutdown via newKubeletScraper\n- opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/scraper.go \u2014 newKubeletScraper returns scraper.Metrics via scraper.NewMetrics\n- opentelemetry-collector-contrib/receiver/dockerstatsreceiver/factory.go \u2014 Uses scraper.NewMetrics with WithStart and WithShutdown\n- opentelemetry-collector-contrib/receiver/snmpreceiver/factory.go \u2014 Uses scraper.NewMetrics with WithStart\n- opentelemetry-collector-contrib/receiver/haproxyreceiver/factory.go \u2014 Uses scraper.NewMetrics with WithStart\n- opentelemetry-collector-contrib/scraper/zookeeperscraper/factory.go \u2014 Pure scraper pattern using scraper.NewFactory directly\n- opentelemetry-collector-contrib/internal/sqlquery/scraper.go \u2014 Scraper struct implements scraper.Metrics interface directly with ScrapeMetrics method\n- opentelemetry-collector-contrib/receiver/sqlqueryreceiver/factory.go \u2014 Uses internal/sqlquery scraper which implements scraper.Metrics\n- opentelemetry-collector-contrib/receiver/oracledbreceiver/factory.go \u2014 Uses internal/sqlquery scraper which implements scraper.Metrics",
+  "cost": {
+    "input_tokens": 2212970,
+    "output_tokens": 13199,
+    "total_tokens": 2226169,
+    "cost_usd": 6.836895
+  },
+  "status": "success",
+  "latency_seconds": 264.02,
+  "tool_calls_count": 54,
+  "agent_steps": 24,
+  "tool_calls": [
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "go.opentelemetry.io/collector/scraper",
+        "channels": [
+          "imports",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"go.opentelemetry.io/collector/scraper\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  },\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\":...",
+      "latency_seconds": 0.554
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "scraper.NewFactory scraper.NewMetrics scraper.NewLogs",
+        "channels": [
+          "purpose",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/hostmetricsreceiver/internal/scraper/nfsscraper/factory.go\",\n        \"purpose\": \"Factory implementation for the NFS metrics scraper in the hostmetricsreceiver module; it defines how the scraper is instantiated, validates OS compatibility (Linux-only), and wires together configuration and scraping logic.\",\n        \"knowledge_id\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n        \"repo_name\": \"opentelemetry-collector-contrib\"\n      },\n...",
+      "latency_seconds": 0.739
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "scraper.NewFactory scraper.NewMetrics scraper.NewLogs",
+        "channels": [
+          "purpose",
+          "semantic"
+        ],
+        "page": 2
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/googlecloudspannerreceiver/factory.go\",\n        \"purpose\": \"Factory implementation for the Google Cloud Spanner receiver, responsible for creating and configuring a metrics receiver that scrapes Spanner metrics using a scraper pattern. It defines default configuration values, instantiates the receiver, and wraps it in a scraper controller for lifecycle management.\",\n        \"knowledge_id\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  ...",
+      "latency_seconds": 0.616
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ScrapeMetrics ScrapeMetrics context pmetric",
+        "channels": [
+          "functions",
+          "purpose"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/prometheusreceiver/metrics_receiver_report_extra_scrape_metrics_test.go\",\n        \"purpose\": \"This test file validates the behavior of extra scrape metrics reporting in the Prometheus receiver, specifically testing how configuration flags (globalExtraScrapeMetrics, scrapeExtraScrapeMetrics) and feature gates interact to control whether additional internal metrics like scrape_body_size_bytes, scrape_sample_limit, and scrape_timeou...",
+      "latency_seconds": 0.734
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "scraper WithStart WithShutdown",
+        "channels": [
+          "functions",
+          "keywords"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"scraper/zookeeperscraper/scraper.go\",\n        \"purpose\": \"Implements a scraper for collecting ZooKeeper metrics by connecting to a ZooKeeper server via TCP, sending 'mntr' and 'ruok' commands, parsing the responses, and converting them into OpenTelemetry metrics using the scraper framework.\",\n        \"knowledge_id\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n        \"repo_name\": \"opentelemetry-collector-contrib\"\n      },\n      {\n        \"pat...",
+      "latency_seconds": 0.716
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "scraper package scraper.Metrics scraper.Logs scraper.Factory interface",
+        "channels": [
+          "purpose",
+          "classes"
+        ],
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"scraper/scrapererror/doc.go\",\n        \"purpose\": \"Provides custom error types for scrapers in the OpenTelemetry Collector, defining a package-level error interface and related types for handling scraper-specific errors.\",\n        \"knowledge_id\": \"f3537db5-0b7d-4942-8809-75ac43e2066f\",\n        \"repo_name\": \"opentelemetry-collector\"\n      },\n      {\n        \"path\": \"scraper/xscraper/doc.go\",\n        \"purpose\": \"Package documentation for the x...",
+      "latency_seconds": 0.751
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "hostmetricsreceiver cpu disk memory network filesystem load paging processes",
+        "channels": [
+          "paths",
+          "purpose"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/hostmetricsreceiver/internal/scraper/cpuscraper/config.go\",\n        \"purpose\": \"Defines the configuration structure for the CPU scraper, which collects CPU-related metrics in the hostmetricsreceiver component. It embeds MetricsBuilderConfig to inherit common metric collection settings and serves as the configuration contract for the scraper's behavior.\",\n        \"knowledge_id\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n        \"repo_na...",
+      "latency_seconds": 0.774
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePaths": [
+          "scraper/scraper.go",
+          "scraper/metrics.go",
+          "scraper/logs.go",
+          "scraper/factory.go",
+          "scraper/scraperhelper/controller.go",
+          "cmd/mdatagen/internal/samplescraper/factory.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"f3537db5-0b7d-4942-8809-75ac43e2066f\",\n  \"files\": [\n    {\n      \"path\": \"scraper/scraper.go\",\n      \"purpose\": \"Defines the core scraper abstraction for the OpenTelemetry collector, providing a generic ScrapeFunc type and an options pattern to configure base scrapers with start and shutdown lifecycle functions, enabling modular data scraping components.\",\n      \"summary\": \"{\\\"Option Pattern (~L18-42)\\\":\\\"Uses functional options to configure scraper ...",
+      "latency_seconds": 0.398
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "hostmetricsreceiver disk paging nfs system scraper factory",
+        "channels": [
+          "paths"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "path": "receiver/hostmetricsreceiver/internal/scraper"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/hostmetricsreceiver/internal/scraper/diskscraper/factory.go\",\n        \"purpose\": \"Factory implementation for the disk scraper component in the hostmetricsreceiver, responsible for creating and configuring a metrics scraper that collects disk usage metrics from the host system. It implements the scraper.Factory interface and wires together configuration, scraper initialization, and the scrape lifecycle.\",\n        \"knowledge_id\": \"1101...",
+      "latency_seconds": 0.651
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "scraper/scraper.go",
+        "fromLine": 1,
+        "toLine": 58
+      },
+      "result_preview": "# scraper/scraper.go\nLines: 1 - 58 of 59\nMore: fromLine=59\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package scraper // import \"go.opentelemetry.io/collector/scraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"errors\"\n9 | \n10 | \t\"go.opentelemetry.io/collector/component\"\n11 | )\n12 | \n13 | var errNilFunc = errors.New(\"nil scrape func\")\n14 | \n15 | // ScrapeFunc scrapes data.\n16 | type ScrapeFunc[T any] func(context.Context) (T, error)\n17 | \n18 | // ...",
+      "latency_seconds": 1.644
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "scraper/metrics.go",
+        "fromLine": 1,
+        "toLine": 44
+      },
+      "result_preview": "# scraper/metrics.go\nLines: 1 - 44 of 44\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package scraper // import \"go.opentelemetry.io/collector/scraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/pdata/pmetric\"\n11 | )\n12 | \n13 | // Metrics is the base interface for metrics scrapers.\n14 | type Metrics interface {\n15 | \tcomponent.Component\n16 | \n17 | \tScrapeMetrics(conte...",
+      "latency_seconds": 1.657
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "scraper/factory.go",
+        "fromLine": 1,
+        "toLine": 137
+      },
+      "result_preview": "# scraper/factory.go\nLines: 1 - 137 of 138\nMore: fromLine=138\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package scraper // import \"go.opentelemetry.io/collector/scraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/pipeline\"\n11 | )\n12 | \n13 | // Settings configures scraper creators.\n14 | type Settings struct {\n15 | \t// ID returns the ID of the component that will be ...",
+      "latency_seconds": 0.718
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/hostmetricsreceiver/internal/scraper/cpuscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/diskscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/memoryscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/networkscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/filesystemscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/loadscraper/factory.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/hostmetricsreceiver/internal/scraper/cpuscraper/factory.go\",\n      \"purpose\": \"Factory implementation for the CPU scraper component in the hostmetricsreceiver module. It defines how the scraper is instantiated, configured, and integrated with the OpenTelemetry Collector's scraper framework. This file serves as the entry point for creating and configuring CPU metric col...",
+      "latency_seconds": 0.718
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/hostmetricsreceiver/internal/scraper/pagingscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/processesscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/processscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/nfsscraper/factory.go",
+          "receiver/hostmetricsreceiver/internal/scraper/systemscraper/factory.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/hostmetricsreceiver/internal/scraper/pagingscraper/factory.go\",\n      \"purpose\": \"Factory implementation for the Paging scraper component in the hostmetricsreceiver, responsible for creating and configuring a metrics scraper that collects system paging statistics (e.g., page in/out, swap usage) from the host OS.\",\n      \"summary\": \"{\\\"Factory Pattern (~L16-18)\\\":\\\"Impl...",
+      "latency_seconds": 0.696
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/cpuscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 39
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/cpuscraper/factory.go\nLines: 1 - 39 of 40\nMore: fromLine=40\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package cpuscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/cpuscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n11 | \n12 | \t\"github...",
+      "latency_seconds": 0.73
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/diskscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 42
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/diskscraper/factory.go\nLines: 1 - 42 of 43\nMore: fromLine=43\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package diskscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/diskscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n11 | \n12 | \t\"git...",
+      "latency_seconds": 1.629
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/nfsscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 50
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/nfsscraper/factory.go\nLines: 1 - 50 of 51\nMore: fromLine=51\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package nfsscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/nfsscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"errors\"\n9 | \t\"runtime\"\n10 | \n11 | \t\"go.opentelemetry.io/collector/component\"\n12 | \t\"go.opentelemetry.io/collect...",
+      "latency_seconds": 0.73
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/mysqlreceiver/factory.go",
+          "receiver/postgresqlreceiver/factory.go",
+          "receiver/mongodbreceiver/factory.go",
+          "receiver/elasticsearchreceiver/factory.go",
+          "receiver/redisreceiver/factory.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/mysqlreceiver/factory.go\",\n      \"purpose\": \"Factory implementation for the MySQL receiver component in the OpenTelemetry Collector Contrib project. This file defines how the MySQL receiver is constructed, including default configuration, metrics and logs receiver creation, and internal caching mechanisms. It serves as the entry point for instantiating the receiver and...",
+      "latency_seconds": 0.69
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/kubeletstatsreceiver/factory.go",
+          "receiver/dockerstatsreceiver/factory.go",
+          "receiver/snmpreceiver/factory.go",
+          "receiver/haproxyreceiver/factory.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/kubeletstatsreceiver/factory.go\",\n      \"purpose\": \"Factory implementation for the kubeletstats receiver, responsible for creating and configuring a metrics scraper that collects Kubernetes node, pod, and container metrics from the Kubelet API. It acts as the entry point for the receiver component, wiring together configuration, client setup, and scraper controller.\",\n...",
+      "latency_seconds": 0.406
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/mysqlreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 100
+      },
+      "result_preview": "# receiver/mysqlreceiver/factory.go\nLines: 1 - 100 of 158\nMore: fromLine=101\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package mysqlreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mysqlreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"time\"\n9 | \n10 | \tlru \"github.com/hashicorp/golang-lru/v2\"\n11 | \t\"github.com/hashicorp/golang-lru/v2/expirable\"\n12 | \t\"go.opentelemetry.io/collector/component\"\n13 | \t\"go.open...",
+      "latency_seconds": 0.727
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/mongodbreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 69
+      },
+      "result_preview": "# receiver/mongodbreceiver/factory.go\nLines: 1 - 69 of 70\nMore: fromLine=70\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package mongodbreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"strconv\"\n9 | \t\"time\"\n10 | \n11 | \t\"go.opentelemetry.io/collector/component\"\n12 | \t\"go.opentelemetry.io/collector/config/confignet\"\n13 | \t\"go.opentelemetry.io/collector/con...",
+      "latency_seconds": 1.403
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/kubeletstatsreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 90
+      },
+      "result_preview": "# receiver/kubeletstatsreceiver/factory.go\nLines: 1 - 90 of 91\nMore: fromLine=91\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package kubeletstatsreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"time\"\n9 | \n10 | \t\"go.opentelemetry.io/collector/component\"\n11 | \t\"go.opentelemetry.io/collector/consumer\"\n12 | \t\"go.opentelemetry.io/collector/receiver\"\n13...",
+      "latency_seconds": 0.717
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/dockerstatsreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 56
+      },
+      "result_preview": "# receiver/dockerstatsreceiver/factory.go\nLines: 1 - 56 of 57\nMore: fromLine=57\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package dockerstatsreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/dockerstatsreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"time\"\n9 | \n10 | \t\"go.opentelemetry.io/collector/component\"\n11 | \t\"go.opentelemetry.io/collector/consumer\"\n12 | \t\"go.opentelemetry.io/collector/receiver\"\n13 | ...",
+      "latency_seconds": 1.369
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/haproxyreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 52
+      },
+      "result_preview": "# receiver/haproxyreceiver/factory.go\nLines: 1 - 52 of 53\nMore: fromLine=53\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package haproxyreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/haproxyreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/consumer\"\n11 | \t\"go.opentelemetry.io/collector/receiver\"\n12 | \t\"go.opentelemetry.io/col...",
+      "latency_seconds": 1.361
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/snmpreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 72
+      },
+      "result_preview": "# receiver/snmpreceiver/factory.go\nLines: 1 - 72 of 111\nMore: fromLine=73\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package snmpreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/snmpreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"errors\"\n9 | \t\"fmt\"\n10 | \t\"net/url\"\n11 | \t\"strings\"\n12 | \n13 | \t\"go.opentelemetry.io/collector/component\"\n14 | \t\"go.opentelemetry.io/collector/confmap/xconfmap\"\n15 | \t\"go.opentele...",
+      "latency_seconds": 1.708
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/mysqlreceiver/scraper.go",
+          "receiver/postgresqlreceiver/scraper.go",
+          "receiver/elasticsearchreceiver/scraper.go",
+          "receiver/redisreceiver/scraper.go",
+          "receiver/mongodbreceiver/scraper.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/mysqlreceiver/scraper.go\",\n      \"purpose\": \"Implements a MySQL database scraper for the OpenTelemetry Collector, collecting performance metrics, query samples, and logs from MySQL instances. It connects to MySQL, executes various SHOW/INFORMATION_SCHEMA queries, transforms raw stats into OpenTelemetry metrics/logs, and emits them with proper resource attributes. Handl...",
+      "latency_seconds": 0.692
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/kubeletstatsreceiver/scraper.go",
+          "receiver/dockerstatsreceiver/receiver.go",
+          "receiver/snmpreceiver/scraper.go",
+          "receiver/haproxyreceiver/scraper.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/kubeletstatsreceiver/scraper.go\",\n      \"purpose\": \"This file implements a Kubernetes metrics scraper for the kubeletstatsreceiver, responsible for collecting node, pod, and container metrics from the kubelet API endpoints (/stats/summary and /pods) and transforming them into OpenTelemetry metrics. It handles metadata enrichment, PVC label resolution, and node resource...",
+      "latency_seconds": 0.402
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/kubeletstatsreceiver/scraper.go",
+        "fromLine": 55,
+        "toLine": 133
+      },
+      "result_preview": "# receiver/kubeletstatsreceiver/scraper.go\nLines: 55 - 133 of 226\nMore: fromLine=134\n\n55 | func newKubeletScraper(\n56 | \trestClient kubelet.RestClient,\n57 | \tset receiver.Settings,\n58 | \trOptions *scraperOptions,\n59 | \tmetricsConfig metadata.MetricsBuilderConfig,\n60 | \tnodeName string,\n61 | ) (scraper.Metrics, error) {\n62 | \tks := &kubeletScraper{\n63 | \t\tstatsProvider:         kubelet.NewStatsProvider(restClient),\n64 | \t\tmetadataProvider:      kubelet.NewMetadataProvider(restClient),\n65 | \t\tlogg...",
+      "latency_seconds": 1.428
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/redisreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 57
+      },
+      "result_preview": "# receiver/redisreceiver/factory.go\nLines: 1 - 57 of 58\nMore: fromLine=58\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package redisreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"time\"\n9 | \n10 | \t\"go.opentelemetry.io/collector/component\"\n11 | \t\"go.opentelemetry.io/collector/config/confignet\"\n12 | \t\"go.opentelemetry.io/collector/config/configtls\"\n13 | \t\"...",
+      "latency_seconds": 1.44
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/elasticsearchreceiver/factory.go",
+        "fromLine": 54,
+        "toLine": 78
+      },
+      "result_preview": "# receiver/elasticsearchreceiver/factory.go\nLines: 54 - 78 of 79\nMore: fromLine=79\n\n54 | // createMetricsReceiver creates a metrics receiver for scraping elasticsearch metrics.\n55 | func createMetricsReceiver(\n56 | \t_ context.Context,\n57 | \tparams receiver.Settings,\n58 | \trConf component.Config,\n59 | \tconsumer consumer.Metrics,\n60 | ) (receiver.Metrics, error) {\n61 | \tc, ok := rConf.(*Config)\n62 | \tif !ok {\n63 | \t\treturn nil, errConfigNotES\n64 | \t}\n65 | \tes := newElasticSearchScraper(params, c)\n...",
+      "latency_seconds": 1.439
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "redisreceiver scraper newRedisScraper scrape",
+        "channels": [
+          "paths",
+          "functions"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "path": "receiver/redisreceiver"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/redisreceiver/redis_scraper.go\",\n        \"purpose\": \"Implements a Redis metrics scraper that periodically collects server, database, and command statistics from Redis instances via the INFO command, transforming raw key-value pairs into structured OpenTelemetry metrics. It handles both standalone and sentinel/cluster modes, supports keyspace metrics per database, command statistics, and latency percentiles, and manages resource lifec...",
+      "latency_seconds": 1.027
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/hostmetricsreceiver/internal/scraper/memoryscraper/memory_scraper.go",
+          "receiver/hostmetricsreceiver/internal/scraper/networkscraper/network_scraper.go",
+          "receiver/hostmetricsreceiver/internal/scraper/pagingscraper/paging_scraper.go",
+          "receiver/hostmetricsreceiver/internal/scraper/processesscraper/processes_scraper.go",
+          "receiver/hostmetricsreceiver/internal/scraper/processscraper/process_scraper.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/hostmetricsreceiver/internal/scraper/memoryscraper/memory_scraper.go\",\n      \"purpose\": \"Implements a memory metrics scraper for the OpenTelemetry Collector's hostmetricsreceiver, collecting system memory usage, utilization, limits, and page size metrics using gopsutil library calls.\",\n      \"summary\": \"{\\\"Design Pattern\\\":\\\"Dependency injection via function fields (bo...",
+      "latency_seconds": 0.999
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/redisreceiver/redis_scraper.go",
+        "fromLine": 1,
+        "toLine": 60
+      },
+      "result_preview": "# receiver/redisreceiver/redis_scraper.go\nLines: 1 - 60 of 298\nMore: fromLine=61\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package redisreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"strconv\"\n9 | \t\"strings\"\n10 | \t\"time\"\n11 | \n12 | \t\"github.com/redis/go-redis/v9\"\n13 | \t\"github.com/redis/go-redis/v9/maintnotifications\"\n14 | \t\"go.opentelemetry.io/collec...",
+      "latency_seconds": 0.705
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/memoryscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 40
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/memoryscraper/factory.go\nLines: 1 - 38 of 38\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package memoryscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/memoryscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n11 | \n12 | \t\"github.com/open...",
+      "latency_seconds": 1.626
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/pagingscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 41
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/pagingscraper/factory.go\nLines: 1 - 41 of 41\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package pagingscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/pagingscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n11 | \n12 | \t\"github.com/open...",
+      "latency_seconds": 1.63
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/redisreceiver/redis_scraper.go",
+        "fromLine": 56,
+        "toLine": 90
+      },
+      "result_preview": "# receiver/redisreceiver/redis_scraper.go\nLines: 56 - 90 of 298\nMore: fromLine=91\n\n56 | func newRedisScraperWithClient(client client, settings receiver.Settings, cfg *Config) (scraper.Metrics, error) {\n57 | \tconfigInfo, err := newConfigInfo(cfg)\n58 | \tif err != nil {\n59 | \t\treturn nil, err\n60 | \t}\n61 | \trs := &redisScraper{\n62 | \t\tclient:     client,\n63 | \t\tredisSvc:   newRedisSvc(client),\n64 | \t\tsettings:   settings.TelemetrySettings,\n65 | \t\tmb:         metadata.NewMetricsBuilder(cfg.MetricsBui...",
+      "latency_seconds": 1.639
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/networkscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 43
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/networkscraper/factory.go\nLines: 1 - 43 of 44\nMore: fromLine=44\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package networkscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/networkscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n11 | \n1...",
+      "latency_seconds": 1.616
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/processesscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 40
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/processesscraper/factory.go\nLines: 1 - 40 of 41\nMore: fromLine=41\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package processesscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n1...",
+      "latency_seconds": 0.705
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/postgresqlreceiver/factory.go",
+        "fromLine": 82,
+        "toLine": 165
+      },
+      "result_preview": "# receiver/postgresqlreceiver/factory.go\nLines: 82 - 165 of 166\nMore: fromLine=166\n\n82 | func createMetricsReceiver(\n83 | \t_ context.Context,\n84 | \tparams receiver.Settings,\n85 | \trConf component.Config,\n86 | \tconsumer consumer.Metrics,\n87 | ) (receiver.Metrics, error) {\n88 | \tcfg := rConf.(*Config)\n89 | \n90 | \tvar clientFactory postgreSQLClientFactory\n91 | \tif connectionPoolGate.IsEnabled() {\n92 | \t\tclientFactory = newPoolClientFactory(cfg)\n93 | \t} else {\n94 | \t\tclientFactory = newDefaultClient...",
+      "latency_seconds": 1.962
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/processscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 60
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/processscraper/factory.go\nLines: 1 - 60 of 61\nMore: fromLine=61\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package processscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"errors\"\n9 | \t\"runtime\"\n10 | \n11 | \t\"go.opentelemetry.io/collector/component\"\n12 | \t\"go.opentelemetr...",
+      "latency_seconds": 2.015
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/systemscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 50
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/systemscraper/factory.go\nLines: 1 - 50 of 51\nMore: fromLine=51\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package systemscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/systemscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"errors\"\n9 | \t\"runtime\"\n10 | \n11 | \t\"go.opentelemetry.io/collector/component\"\n12 | \t\"go.opentelemetry.i...",
+      "latency_seconds": 1.975
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper/loadscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 41
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper/loadscraper/factory.go\nLines: 1 - 41 of 42\nMore: fromLine=42\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package loadscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/loadscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/scraper\"\n11 | \n12 | \t\"git...",
+      "latency_seconds": 1.636
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "nfsscraper scraper scrape nfs metrics",
+        "channels": [
+          "paths"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "path": "receiver/hostmetricsreceiver/internal/scraper/nfsscraper"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/hostmetricsreceiver/internal/scraper/nfsscraper/config.go\",\n        \"purpose\": \"Defines the configuration structure for the NFS metric scraper, which collects NFS-related system metrics in the hostmetricsreceiver module. It embeds MetricsBuilderConfig to customize metric and attribute representation, serving as the configuration contract between the scraper and the collector framework.\",\n        \"knowledge_id\": \"11013c10-9fdc-4638-86...",
+      "latency_seconds": 0.712
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "mysqlreceiver scraper.NewLogs scraper.NewMetrics",
+        "channels": [
+          "functions",
+          "purpose"
+        ],
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "path": "receiver/mysqlreceiver"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"receiver/mysqlreceiver/internal/metadata/generated_metrics_test.go\",\n        \"purpose\": \"This file is a generated test suite for validating the metrics builder in the MySQL receiver, ensuring correct generation, emission, and validation of MySQL-related telemetry metrics against expected structures and attributes. This file is a generated test for validating MySQL receiver metrics against expected golden data. It verifies that the receive...",
+      "latency_seconds": 0.624
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/mysqlreceiver/factory.go",
+        "fromLine": 100,
+        "toLine": 158
+      },
+      "result_preview": "# receiver/mysqlreceiver/factory.go\nLines: 100 - 158 of 158\n\n100 | \t\t\tscraper.WithShutdown(ns.shutdown),\n101 | \t\t)\n102 | \t\tif err != nil {\n103 | \t\t\treturn nil, err\n104 | \t\t}\n105 | \t\topt := scraperhelper.AddFactoryWithConfig(\n106 | \t\t\tscraper.NewFactory(metadata.Type, nil,\n107 | \t\t\t\tscraper.WithLogs(func(context.Context, scraper.Settings, component.Config) (scraper.Logs, error) {\n108 | \t\t\t\t\treturn s, nil\n109 | \t\t\t\t}, component.StabilityLevelDevelopment)), nil)\n110 | \t\topts = append(opts, opt)\n111...",
+      "latency_seconds": 2.015
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "scraper/scraperhelper/controller.go",
+        "fromLine": 28,
+        "toLine": 100
+      },
+      "result_preview": "# scraper/scraperhelper/controller.go\nLines: 28 - 100 of 187\nMore: fromLine=101\n\n28 | // ControllerOption apply changes to internal options.\n29 | type ControllerOption interface {\n30 | \tapply(*controllerOptions)\n31 | }\n32 | \n33 | type optionFunc func(*controllerOptions)\n34 | \n35 | func (of optionFunc) apply(e *controllerOptions) {\n36 | \tof(e)\n37 | }\n38 | \n39 | // AddMetricsScraper configures the scraper.Metrics to be called with the\n40 | // specified options, and at the specified collection inte...",
+      "latency_seconds": 2.341
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "scraper/logs.go",
+        "fromLine": 1,
+        "toLine": 44
+      },
+      "result_preview": "# scraper/logs.go\nLines: 1 - 44 of 45\nMore: fromLine=45\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package scraper // import \"go.opentelemetry.io/collector/scraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/pdata/plog\"\n11 | )\n12 | \n13 | // Logs is the base interface for logs scrapers.\n14 | type Logs interface {\n15 | \tcomponent.Component\n16 | \n17 | \t// ScrapeLogs is...",
+      "latency_seconds": 1.578
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "scraper/scraperhelper/controller.go",
+        "fromLine": 100,
+        "toLine": 145
+      },
+      "result_preview": "# scraper/scraperhelper/controller.go\nLines: 100 - 145 of 187\nMore: fromLine=146\n\n100 | \tco := getOptions(options)\n101 | \tscrapers := make([]scraper.Logs, 0, len(co.factoriesWithConfig))\n102 | \tfor _, fwc := range co.factoriesWithConfig {\n103 | \t\tset := controller.GetSettings(fwc.f.Type(), rSet)\n104 | \t\ts, err := fwc.f.CreateLogs(context.Background(), set, fwc.cfg)\n105 | \t\tif err != nil {\n106 | \t\t\treturn nil, err\n107 | \t\t}\n108 | \t\ts, err = wrapObsLogs(s, rSet.ID, set.ID, set.TelemetrySettings)\n1...",
+      "latency_seconds": 1.643
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "internal/sqlquery/scraper.go",
+        "fromLine": 1,
+        "toLine": 60
+      },
+      "result_preview": "# internal/sqlquery/scraper.go\nLines: 1 - 60 of 175\nMore: fromLine=61\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package sqlquery // import \"github.com/open-telemetry/opentelemetry-collector-contrib/internal/sqlquery\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"database/sql\"\n9 | \t\"errors\"\n10 | \t\"fmt\"\n11 | \t\"net/url\"\n12 | \t\"strings\"\n13 | \t\"time\"\n14 | \n15 | \t\"go.opentelemetry.io/collector/component\"\n16 | \t\"go.opentelemetry.io/collector/pdata/pcommon\"...",
+      "latency_seconds": 1.763
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "scraper/zookeeperscraper/factory.go",
+        "fromLine": 1,
+        "toLine": 50
+      },
+      "result_preview": "# scraper/zookeeperscraper/factory.go\nLines: 1 - 45 of 45\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package zookeeperscraper // import \"github.com/open-telemetry/opentelemetry-collector-contrib/scraper/zookeeperscraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/component\"\n10 | \t\"go.opentelemetry.io/collector/config/confignet\"\n11 | \t\"go.opentelemetry.io/collector/scraper\"\n12 | \n13 | \t\"github.com/open-telemetry/o...",
+      "latency_seconds": 2.04
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f3537db5-0b7d-4942-8809-75ac43e2066f",
+        "relativePath": "cmd/mdatagen/internal/samplescraper/factory.go",
+        "fromLine": 1,
+        "toLine": 33
+      },
+      "result_preview": "# cmd/mdatagen/internal/samplescraper/factory.go\nLines: 1 - 33 of 34\nMore: fromLine=34\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package samplescraper // import \"go.opentelemetry.io/collector/cmd/mdatagen/internal/samplescraper\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"go.opentelemetry.io/collector/cmd/mdatagen/internal/samplescraper/internal/metadata\"\n10 | \t\"go.opentelemetry.io/collector/component\"\n11 | \t\"go.opentelemetry.io/collector/pda...",
+      "latency_seconds": 0.736
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/internal/scraper.go",
+        "fromLine": 1,
+        "toLine": 60
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/internal/scraper.go\nLines: 1 - 51 of 51\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package internal // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \n9 | \t\"github.com/shirou/gopsutil/v4/common\"\n10 | \t\"go.opentelemetry.io/collector/component\"\n11 | \t\"go.opentelemetry.io/collector/pdata/pmetric\"\n12 | \t\"go.opentelemetry.io...",
+      "latency_seconds": 0.74
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/hostmetricsreceiver/factory.go",
+          "receiver/sqlserverreceiver/scraper.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/hostmetricsreceiver/factory.go\",\n      \"purpose\": \"Factory implementation for the hostmetricsreceiver that registers and configures all host metrics scrapers, creates metrics and logs receivers, and manages scraper lifecycle via scraperhelper.Controller. It acts as the entry point for initializing the hostmetricsreceiver component in the OpenTelemetry Collector.\",\n    ...",
+      "latency_seconds": 0.738
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePath": "receiver/hostmetricsreceiver/factory.go",
+        "fromLine": 1,
+        "toLine": 147
+      },
+      "result_preview": "# receiver/hostmetricsreceiver/factory.go\nLines: 1 - 147 of 148\nMore: fromLine=148\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package hostmetricsreceiver // import \"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver\"\n5 | \n6 | import (\n7 | \t\"context\"\n8 | \t\"fmt\"\n9 | \t\"time\"\n10 | \n11 | \t\"github.com/shirou/gopsutil/v4/host\"\n12 | \t\"github.com/shirou/gopsutil/v4/process\"\n13 | \t\"go.opentelemetry.io/collector/compon...",
+      "latency_seconds": 1.892
+    }
+  ],
+  "error": ""
+}

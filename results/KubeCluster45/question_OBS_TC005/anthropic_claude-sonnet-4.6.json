@@ -1,0 +1,483 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "answer": "I now have a thorough understanding of all the files involved. Let me compile the complete analysis.\n\n---\n\n## 1. Architecture Overview\n\nThe `promql.QueryEngine` interface is the **central contract** for PromQL evaluation across the entire observability stack. It is defined in **Prometheus** (`promql/engine.go`) and consumed by **Thanos**, **Grafana Mimir**, and **Grafana** (backend). The interface currently has two methods:\n\n```go\n// promql/engine.go (L124-128)\ntype QueryEngine interface {\n    NewInstantQuery(ctx context.Context, q storage.Queryable, opts QueryOpts, qs string, ts time.Time) (Query, error)\n    NewRangeQuery(ctx context.Context, q storage.Queryable, opts QueryOpts, qs string, start, end time.Time, interval time.Duration) (Query, error)\n}\n```\n\nAdding `ExplainQuery(ctx context.Context, qs string) (*QueryPlan, error)` requires changes in **4 repositories** across **9 implementation/wrapper files** plus the interface definition itself.\n\nThe data flow is:\n```\nHTTP/gRPC Request\n    \u2192 Thanos GRPCAPI / Prometheus web/api/v1/API / Mimir frontend middleware\n        \u2192 promql.QueryEngine (interface)\n            \u251c\u2500\u2500 promql.Engine (Prometheus canonical impl)\n            \u251c\u2500\u2500 streamingpromql.Engine (Mimir MQE impl)\n            \u251c\u2500\u2500 compat.EngineWithFallback (Mimir fallback wrapper)\n            \u251c\u2500\u2500 limiter.UnlimitedMemoryTrackerPromQLEngine (Mimir memory-tracking wrapper)\n            \u2514\u2500\u2500 remoteEngine (Thanos distributed impl)\n```\n\n---\n\n## 2. Detailed Analysis\n\n### Step 1 \u2014 Define `QueryPlan` and extend the interface (`prometheus` repo)\n\n**File: `promql/engine.go`** (L124\u2013128, `prometheus` repo, `knowledgeId: 21712971-2584-493f-ab45-77a6b68c5e9f`)\n\nThis is the **only place** the interface is defined. The `QueryPlan` type must be added here (or in a new file in the `promql` package) and the interface extended:\n\n```go\n// QueryPlan holds the logical execution plan for a PromQL query.\n// It is returned by ExplainQuery and is intentionally kept minimal\n// so that all implementations can populate it without depending on\n// engine-internal types.\ntype QueryPlan struct {\n    // Root is a human-readable, tree-structured description of the\n    // execution plan (e.g. JSON or indented text).\n    Root     string            `json:\"root\"`\n    // Metadata carries optional engine-specific annotations\n    // (e.g. estimated series count, shard count, remote endpoints).\n    Metadata map[string]string `json:\"metadata,omitempty\"`\n}\n\n// QueryEngine defines the interface for the *promql.Engine,\n// so it can be replaced, wrapped or mocked.\ntype QueryEngine interface {\n    NewInstantQuery(ctx context.Context, q storage.Queryable, opts QueryOpts, qs string, ts time.Time) (Query, error)\n    NewRangeQuery(ctx context.Context, q storage.Queryable, opts QueryOpts, qs string, start, end time.Time, interval time.Duration) (Query, error)\n    // ExplainQuery parses qs and returns the logical query plan the engine\n    // would use to evaluate it, without executing the query.\n    ExplainQuery(ctx context.Context, qs string) (*QueryPlan, error)\n}\n```\n\n**File: `promql/engine.go`** \u2014 `Engine` struct (L340\u2013357) is the canonical implementation. Add:\n\n```go\n// ExplainQuery implements QueryEngine. It parses qs, runs the preprocessor\n// (stepInvariant folding, offset adjustment) and returns the resulting AST\n// as a QueryPlan without executing any storage reads.\nfunc (ng *Engine) ExplainQuery(ctx context.Context, qs string) (*QueryPlan, error) {\n    expr, err := parser.ParseExpr(qs)\n    if err != nil {\n        return nil, err\n    }\n    // preprocessExprHelper already exists in engine.go (L4126-4240).\n    preprocessed := ng.preprocessExpr(expr, time.Time{}, time.Time{})\n    return &QueryPlan{\n        Root: preprocessed.String(),\n        Metadata: map[string]string{\n            \"engine\": \"prometheus\",\n        },\n    }, nil\n}\n```\n\n**File: `promql/promqltest/test.go`** (L88\u2013103) \u2014 `NewTestEngine` returns `*promql.Engine`, which now satisfies the extended interface automatically. No change needed to the function signature, but any mock `QueryEngine` used in tests (e.g., `web/api/v1/errors_test.go`) must add the method.\n\n---\n\n### Step 2 \u2014 Prometheus web API (`prometheus` repo)\n\n**File: `web/api/v1/api.go`** (L224\u2013262)\n\nThe `API` struct holds `QueryEngine promql.QueryEngine` (L226). The field type is the interface, so no struct change is needed. However, any **test double** passed to `NewAPI` (L266) must implement `ExplainQuery`. The method can be exposed as a new HTTP endpoint (e.g., `GET /api/v1/query/explain`):\n\n```go\n// In api.go \u2014 new handler wired in Register()\nfunc (api *API) explainQuery(r *http.Request) apiFuncResult {\n    ctx := r.Context()\n    qs := r.FormValue(\"query\")\n    plan, err := api.QueryEngine.ExplainQuery(ctx, qs)\n    if err != nil {\n        return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}\n    }\n    return apiFuncResult{plan, nil, nil, nil}\n}\n```\n\n**File: `rules/manager.go`** (L50) \u2014 `EngineQueryFunc(engine promql.QueryEngine, ...)` takes the interface. No change to the function signature, but the `engine` argument must satisfy the new interface. Since `EngineQueryFunc` only calls `NewInstantQuery`, the function body is unchanged; the caller just needs to pass a conforming engine.\n\n---\n\n### Step 3 \u2014 Grafana Mimir (`mimir` repo, `knowledgeId: 0e6dcaca-9001-4c25-a0ff-8fe71b7ea205`)\n\n#### 3a. `pkg/streamingpromql/engine.go` \u2014 `Engine` struct (L157\u2013180, L191\u2013265)\n\n`Engine` implements `promql.QueryEngine` via `NewInstantQuery` (L191) and `NewRangeQuery` (L195). Add:\n\n```go\n// ExplainQuery implements promql.QueryEngine.\nfunc (e *Engine) ExplainQuery(ctx context.Context, qs string) (*promql.QueryPlan, error) {\n    // Reuse the existing planning pipeline (NewQueryPlan is already called\n    // inside newQueryFromPlanner). Here we call it directly without materializing.\n    enableDelayedNameRemoval, err := e.limitsProvider.GetEnableDelayedNameRemoval(ctx)\n    if err != nil {\n        return nil, fmt.Errorf(\"could not get 'enable delayed name removal' setting: %w\", err)\n    }\n    plan, err := e.planner.NewQueryPlan(ctx, qs,\n        types.NewInstantQueryTimeRange(time.Now()), // dummy time range for planning\n        enableDelayedNameRemoval,\n        NoopPlanningObserver{},\n    )\n    if err != nil {\n        return nil, err\n    }\n    return &promql.QueryPlan{\n        Root:     plan.Root.String(),\n        Metadata: map[string]string{\"engine\": \"mimir-streaming\"},\n    }, nil\n}\n```\n\n#### 3b. `pkg/streamingpromql/compat/fallback_engine.go` \u2014 `EngineWithFallback` (L20\u201328)\n\n`EngineWithFallback` wraps two `promql.QueryEngine` values (`preferred` and `fallback`). It must implement `ExplainQuery` and delegate to `preferred`, falling back to `fallback` on `NotSupportedError`:\n\n```go\n// ExplainQuery implements promql.QueryEngine.\nfunc (e EngineWithFallback) ExplainQuery(ctx context.Context, qs string) (*promql.QueryPlan, error) {\n    plan, err := e.preferred.ExplainQuery(ctx, qs)\n    if err == nil {\n        return plan, nil\n    }\n    notSupportedErr := NotSupportedError{}\n    if !errors.As(err, &notSupportedErr) {\n        return nil, err\n    }\n    logger := spanlogger.FromContext(ctx, e.logger)\n    level.Info(logger).Log(\"msg\", \"ExplainQuery falling back to Prometheus engine\", \"reason\", notSupportedErr.reason, \"expr\", qs)\n    return e.fallback.ExplainQuery(ctx, qs)\n}\n```\n\n#### 3c. `pkg/util/limiter/unlimited_memory_consumption_tracker.go` \u2014 `UnlimitedMemoryTrackerPromQLEngine` (L61\u201384)\n\nThis wrapper delegates `NewInstantQuery`/`NewRangeQuery` to `inner *promql.Engine`. Add:\n\n```go\n// ExplainQuery implements promql.QueryEngine.\nfunc (p UnlimitedMemoryTrackerPromQLEngine) ExplainQuery(ctx context.Context, qs string) (*promql.QueryPlan, error) {\n    return p.inner.ExplainQuery(ctx, qs)\n}\n```\n\n#### 3d. `pkg/frontend/querymiddleware/querysharding.go` \u2014 `querySharding` struct (L79\u201395)\n\nThe `engine promql.QueryEngine` field (L92) is used in `ExecuteQueryOnQueryable` (L146) and `newQuery` (L194). No struct change needed, but the `engine` passed in must satisfy the new interface. The middleware itself does not call `ExplainQuery`, so no body changes are required.\n\n#### 3e. `pkg/querier/querier.go` \u2014 `New(...)` (L186\u2013246)\n\nReturns `promql.QueryEngine` (L196). The switch at L215\u2013233 constructs either `UnlimitedMemoryTrackerPromQLEngine` or `EngineWithFallback` (both now implement `ExplainQuery`). No change needed to the function body.\n\n---\n\n### Step 4 \u2014 Thanos (`thanos` repo, `knowledgeId: aa5426d0-10b2-4a9c-992a-5c0e9bc87c59`)\n\n#### 4a. `pkg/api/query/engine.go` \u2014 `QueryFactory` (L76\u2013141)\n\n`QueryFactory` holds `prometheus *promql.Engine`, `thanosLocal *engine.Engine`, and `thanosDistributed *engine.DistributedEngine`. It implements the internal `queryCreator` interface (L53\u201374), **not** `promql.QueryEngine` directly. However, `promql.Engine` (the `prometheus` field) now has `ExplainQuery`, so the Prometheus fallback path is covered.\n\nThe `thanosLocal` and `thanosDistributed` are from `github.com/thanos-io/promql-engine/engine`, which is a **separate library** (not in this repo). Those types must also implement `ExplainQuery` if they are ever used as `promql.QueryEngine` directly. In the current code they are not \u2014 they are accessed via `MakeInstantQuery`/`MakeRangeQuery` methods, not the `promql.QueryEngine` interface. No change needed here unless the Thanos engine library is updated.\n\n#### 4b. `pkg/query/remote_engine.go` \u2014 `remoteEngine` (L117\u2013241)\n\n`remoteEngine` implements `api.RemoteEngine` (from `github.com/thanos-io/promql-engine/api`), **not** `promql.QueryEngine`. Its `NewInstantQuery`/`NewRangeQuery` methods (L243\u2013268) have a different signature (they take `api.RemoteQuery` instead of `storage.Queryable`). This type does **not** implement `promql.QueryEngine` and is not affected.\n\n#### 4c. `pkg/api/query/grpc.go` \u2014 `GRPCAPI` (L27\u201358)\n\n`GRPCAPI` holds a `queryCreator` (L32), not a `promql.QueryEngine`. It calls `makeInstantQuery`/`makeRangeQuery` on the factory. To expose `ExplainQuery` over gRPC, a new `Explain` RPC method would be added to the `querypb.QueryServer` proto and handled here. This is a **new endpoint**, not a breaking change to existing code.\n\n---\n\n### Step 5 \u2014 Grafana (`grafana` repo, `knowledgeId: e0a5c5ee-310a-4bff-ab29-ef18eaab0826`)\n\n**File: `pkg/tsdb/prometheus/prometheus.go`** (L16\u201382)\n\nThis is a **Go backend plugin** that delegates to `promlib`. It does **not** hold a `promql.QueryEngine` directly \u2014 it uses Grafana's plugin SDK to proxy HTTP requests to a Prometheus server. The `ExplainQuery` feature would be exposed as a new **resource endpoint** (HTTP proxy to `/api/v1/query/explain`) rather than a Go interface method. No `promql.QueryEngine` implementation change is needed here.\n\n**File: `packages/grafana-prometheus/src/datasource.ts`** (TypeScript, L74\u2013861)\n\nThis is the **frontend datasource** class. It communicates with Prometheus over HTTP. To surface `ExplainQuery`, a new method would call the new `/api/v1/query/explain` endpoint. This is a frontend addition, not a Go interface change.\n\n---\n\n### Step 6 \u2014 Test doubles and mock engines\n\nAny file that creates a struct implementing `promql.QueryEngine` for testing must add `ExplainQuery`. Key files:\n\n- **`web/api/v1/errors_test.go`** (`prometheus`) \u2014 constructs a test engine passed to `NewAPI`\n- **`pkg/streamingpromql/compat/fallback_engine_test.go`** (`mimir`) \u2014 tests `EngineWithFallback` directly\n- **`pkg/frontend/querymiddleware/querysharding_test_utils_test.go`** (`mimir`) \u2014 mock engine helpers\n- **`pkg/streamingpromql/engine_test.go`** (`mimir`) \u2014 tests the streaming engine directly\n\n---\n\n## 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| **prometheus** | `promql/engine.go` | **Interface definition** (`QueryEngine` at L124\u2013128); `Engine` struct (L340\u2013357) is the canonical implementation; add `QueryPlan` type and `ExplainQuery` to both |\n| **prometheus** | `web/api/v1/api.go` | `API` struct holds `QueryEngine promql.QueryEngine` (L226); `NewAPI` takes `qe promql.QueryEngine` (L266); new `explainQuery` HTTP handler wired here |\n| **prometheus** | `rules/manager.go` | `EngineQueryFunc(engine promql.QueryEngine, ...)` (L50) \u2014 takes the interface; callers must pass conforming engines |\n| **prometheus** | `promql/promqltest/test.go` | `NewTestEngine` (L90) returns `*promql.Engine`; test helpers that create mock `QueryEngine` must add `ExplainQuery` |\n| **prometheus** | `promql/engine_test.go` | Tests for `Engine`; must add test coverage for `ExplainQuery` |\n| **prometheus** | `web/api/v1/errors_test.go` | Constructs a mock `promql.QueryEngine` passed to `NewAPI`; must implement `ExplainQuery` |\n| **mimir** | `pkg/streamingpromql/engine.go` | `Engine` struct (L157\u2013180) implements `promql.QueryEngine` via `NewInstantQuery` (L191) and `NewRangeQuery` (L195); must add `ExplainQuery` using `e.planner.NewQueryPlan` |\n| **mimir** | `pkg",
+  "llm_condensed_answer": "SUMMARY: The promql.QueryEngine interface must be extended with ExplainQuery(ctx context.Context, qs string) (*QueryPlan, error) across all implementations. This requires adding the method to the canonical promql.Engine in Prometheus, Mimir's streaming and wrapper engines, and updating test mocks. Thanos and Grafana do not implement this interface directly, so they require only new endpoint wiring rather than interface changes.\n\nFILES:\n- prometheus/promql/engine.go \u2014 Defines the QueryEngine interface and canonical Engine implementation; must add QueryPlan type and ExplainQuery method\n- prometheus/web/api/v1/api.go \u2014 Holds QueryEngine field and registers HTTP handlers; must add new explainQuery endpoint\n- prometheus/rules/manager.go \u2014 Uses promql.QueryEngine interface; callers must pass conforming engines\n- prometheus/promql/promqltest/test.go \u2014 Returns promql.Engine for tests; test helpers must implement ExplainQuery\n- prometheus/web/api/v1/errors_test.go \u2014 Creates mock QueryEngine for API tests; must add ExplainQuery method\n- mimir/pkg/streamingpromql/engine.go \u2014 Implements promql.QueryEngine; must add ExplainQuery using planner.NewQueryPlan\n- mimir/pkg/streamingpromql/compat/fallback_engine.go \u2014 Wraps two promql.QueryEngine implementations; must delegate ExplainQuery with fallback logic\n- mimir/pkg/util/limiter/unlimited_memory_consumption_tracker.go \u2014 Wraps promql.Engine; must delegate ExplainQuery to inner engine\n- mimir/pkg/frontend/querymiddleware/querysharding.go \u2014 Holds promql.QueryEngine field; must receive conforming engine instances\n- mimir/pkg/querier/querier.go \u2014 Returns promql.QueryEngine; switch statement constructs engines that must implement ExplainQuery",
+  "cost": {
+    "input_tokens": 1017660,
+    "output_tokens": 9379,
+    "total_tokens": 1027039,
+    "cost_usd": 3.193665
+  },
+  "status": "success",
+  "latency_seconds": 201.07,
+  "tool_calls_count": 38,
+  "agent_steps": 15,
+  "tool_calls": [
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryEngine",
+        "channels": [
+          "classes",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"promql/engine.go\",\n        \"purpose\": \"The file implements the core PromQL engine, defining its public API, configuration, and lifecycle management. It parses, validates, and executes queries against storage, handling metrics, logging, and result generation.\",\n        \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n        \"repo_name\": \"prometheus\"\n      },\n      {\n        \"path\": \"pkg/logql/engine.go\",\n        \"purpose\": \"Implement...",
+      "latency_seconds": 0.458
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryEngine",
+        "channels": [
+          "functions",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"promql/promqltest/test.go\",\n        \"purpose\": \"promql/promqltest/test.go#chunk0: Provide utilities to parse, load, and execute PromQL test specifications.\\npromql/promqltest/test.go#chunk1: Implements test command parsing, data loading, evaluation, and result verification for PromQL test suite.\\npromql/promqltest/test.go#chunk2: Provide utilities and structures to compare histograms, manage test commands, and lazily load and query test d...",
+      "latency_seconds": 0.479
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePaths": [
+          "promql/engine.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n  \"files\": [\n    {\n      \"path\": \"promql/engine.go\",\n      \"purpose\": \"The file implements the core PromQL engine, defining its public API, configuration, and lifecycle management. It parses, validates, and executes queries against storage, handling metrics, logging, and result generation.\",\n      \"summary\": \"The file implements the core PromQL engine, defining its public API, configuration, and lifecycle manag...",
+      "latency_seconds": 0.737
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryEngine interface promql",
+        "channels": [
+          "purpose",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/streamingpromql/optimize/interface.go\",\n        \"purpose\": \"Defines interfaces for optimization passes in the streaming PromQL engine, allowing pluggable AST and query plan transformations to improve query performance and efficiency.\",\n        \"knowledge_id\": \"0e6dcaca-9001-4c25-a0ff-8fe71b7ea205\",\n        \"repo_name\": \"mimir\"\n      },\n      {\n        \"path\": \"web/ui/mantine-ui/src/promql/ast.ts\",\n        \"purpose\": \"Defines TypeScript ...",
+      "latency_seconds": 0.961
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryPlan",
+        "channels": [
+          "classes",
+          "functions",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/querier/plan/plan.go\",\n        \"purpose\": \"Provides JSON serialization and deserialization for Loki query plans, enabling storage and transmission of query execution plans\",\n        \"knowledge_id\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n        \"repo_name\": \"loki\"\n      },\n      {\n        \"path\": \"pkg/api/query/querypb/plan.go\",\n        \"purpose\": \"Provides a factory function to encode a remote query plan into a JSON-encoded protobuf m...",
+      "latency_seconds": 0.852
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePath": "promql/engine.go",
+        "fromLine": 80,
+        "toLine": 210
+      },
+      "result_preview": "# promql/engine.go\nLines: 80 - 210 of 4502\nMore: fromLine=211\n\n80 | type engineMetrics struct {\n81 | \tcurrentQueries            prometheus.Gauge\n82 | \tmaxConcurrentQueries      prometheus.Gauge\n83 | \tqueryLogEnabled           prometheus.Gauge\n84 | \tqueryLogFailures          prometheus.Counter\n85 | \tqueryQueueTime            prometheus.Observer\n86 | \tqueryQueueTimeHistogram   prometheus.Observer\n87 | \tqueryPrepareTime          prometheus.Observer\n88 | \tqueryPrepareTimeHistogram prometheus.Observe...",
+      "latency_seconds": 2.542
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePaths": [
+          "pkg/api/query/querypb/plan.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n  \"files\": [\n    {\n      \"path\": \"pkg/api/query/querypb/plan.go\",\n      \"purpose\": \"Provides a factory function to encode a remote query plan into a JSON-encoded protobuf message for transmission or storage. It acts as a bridge between the Thanos PromQL engine's logical plan representation and the gRPC/protobuf query plan format.\",\n      \"summary\": \"{\\\"Design Pattern (~L12-25)\\\":\\\"Factory pattern used to create...",
+      "latency_seconds": 0.398
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryEngine NewInstantQuery NewRangeQuery",
+        "channels": [
+          "purpose",
+          "imports"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/logql/engine.go\",\n        \"purpose\": \"Implements the LogQL query engine for Loki, providing query execution, evaluation, and result processing for log and sample queries with support for sharding, limits, and multi-variant queries\",\n        \"knowledge_id\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n        \"repo_name\": \"loki\"\n      },\n      {\n        \"path\": \"pkg/ruler/evaluator_local.go\",\n        \"purpose\": \"Provides a local query evaluat...",
+      "latency_seconds": 0.446
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "promql.QueryEngine",
+        "channels": [
+          "imports",
+          "purpose",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"promql.QueryEngine\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\"...",
+      "latency_seconds": 0.488
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NewInstantQuery NewRangeQuery",
+        "channels": [
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"promql/engine.go\",\n        \"purpose\": \"The file implements the core PromQL engine, defining its public API, configuration, and lifecycle management. It parses, validates, and executes queries against storage, handling metrics, logging, and result generation.\",\n        \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n        \"repo_name\": \"prometheus\"\n      },\n      {\n        \"path\": \"pkg/query/remote_engine.go\",\n        \"purpose\": \"...",
+      "latency_seconds": 0.492
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePaths": [
+          "pkg/store/storepb/query_hints.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n  \"files\": [\n    {\n      \"path\": \"pkg/store/storepb/query_hints.go\",\n      \"purpose\": \"Converts internal Thanos store query hints into human-readable PromQL query strings for debugging and visualization purposes.\",\n      \"summary\": \"{\\\"String Formatting (~L11-64)\\\":\\\"Uses fmt.Sprintf and strings.Join to construct PromQL query components, ensuring proper spacing and clause ordering\\\",\\\"Nil Safety (~L23-24, L38-3...",
+      "latency_seconds": 0.438
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePaths": [
+          "pkg/query/remote_engine.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n  \"files\": [\n    {\n      \"path\": \"pkg/query/remote_engine.go\",\n      \"purpose\": \"Implements a remote PromQL query engine client that executes queries against remote Thanos query endpoints, handling both instant and range queries with features like auto-downsampling, partial response handling, and query plan encoding.\",\n      \"summary\": \"{\\\"Design Pattern\\\":\\\"Factory pattern for creating remote endpoints with sh...",
+      "latency_seconds": 0.498
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePaths": [
+          "pkg/streamingpromql/engine.go",
+          "pkg/streamingpromql/compat/fallback_engine.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"0e6dcaca-9001-4c25-a0ff-8fe71b7ea205\",\n  \"files\": [\n    {\n      \"path\": \"pkg/streamingpromql/engine.go\",\n      \"purpose\": \"Implements the core query engine for Mimir's streaming PromQL engine, responsible for creating and executing queries, managing query lifecycle, and coordinating with query planners and node materializers.\",\n      \"summary\": \"{\\\"Design Pattern (~L92-117)\\\":\\\"Uses a node materializer registry pattern to map planning node types to ...",
+      "latency_seconds": 0.503
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "query frontend distributed PromQL evaluation engine",
+        "channels": [
+          "purpose"
+        ],
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/api/query/engine.go\",\n        \"purpose\": \"This file defines a query factory for creating Prometheus and Thanos PromQL queries, handling engine selection, fallback logic, and query mode (local/distributed) for the Thanos query API.\",\n        \"knowledge_id\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n        \"repo_name\": \"thanos\"\n      },\n      {\n        \"path\": \"docs/proposals-done/202301-distributed-query-execution.md\",\n        \"purpose\": ...",
+      "latency_seconds": 0.588
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePath": "pkg/query/remote_engine.go",
+        "fromLine": 34,
+        "toLine": 285
+      },
+      "result_preview": "# pkg/query/remote_engine.go\nLines: 34 - 285 of 536\nMore: fromLine=286\n\n34 | type RemoteEndpointsCreator func(\n35 | \treplicaLabels []string,\n36 | \tpartialResponse bool,\n37 | ) api.RemoteEndpoints\n38 | \n39 | func NewRemoteEndpointsCreator(\n40 | \tlogger log.Logger,\n41 | \tgetEndpoints func() []Client,\n42 | \tpartitionLabels []string,\n43 | \ttimeout time.Duration,\n44 | \tqueryDistributedWithOverlappingInterval bool,\n45 | \tautoDownsample bool,\n46 | ) RemoteEndpointsCreator {\n47 | \treturn func(\n48 | \t\tre...",
+      "latency_seconds": 2.004
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePath": "pkg/api/query/engine.go",
+        "fromLine": 1,
+        "toLine": 100
+      },
+      "result_preview": "# pkg/api/query/engine.go\nLines: 1 - 100 of 234\nMore: fromLine=101\n\n1 | // Copyright (c) The Thanos Authors.\n2 | // Licensed under the Apache License 2.0.\n3 | \n4 | // Copyright 2016 The Prometheus Authors\n5 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n6 | // you may not use this file except in compliance with the License.\n7 | // You may obtain a copy of the License at\n8 | //\n9 | //     http://www.apache.org/licenses/LICENSE-2.0\n10 | //\n11 | // Unless required by applicabl...",
+      "latency_seconds": 4.354
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePath": "pkg/streamingpromql/engine.go",
+        "fromLine": 141,
+        "toLine": 265
+      },
+      "result_preview": "# pkg/streamingpromql/engine.go\nLines: 141 - 265 of 394\nMore: fromLine=266\n\n141 | func DetermineLookbackDelta(opts promql.EngineOpts) time.Duration {\n142 | \tlookbackDelta := opts.LookbackDelta\n143 | \tif lookbackDelta == 0 {\n144 | \t\tlookbackDelta = defaultLookbackDelta\n145 | \t}\n146 | \n147 | \treturn lookbackDelta\n148 | }\n149 | \n150 | // QueryTracker is like promql.QueryTracker, but includes more information about the query.\n151 | type QueryTracker interface {\n152 | \tInsertWithDetails(ctx context.C...",
+      "latency_seconds": 4.677
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePath": "pkg/streamingpromql/compat/fallback_engine.go",
+        "fromLine": 1,
+        "toLine": 106
+      },
+      "result_preview": "# pkg/streamingpromql/compat/fallback_engine.go\nLines: 1 - 106 of 107\nMore: fromLine=107\n\n1 | // SPDX-License-Identifier: AGPL-3.0-only\n2 | \n3 | package compat\n4 | \n5 | import (\n6 | \t\"context\"\n7 | \t\"errors\"\n8 | \t\"time\"\n9 | \n10 | \t\"github.com/go-kit/log\"\n11 | \t\"github.com/go-kit/log/level\"\n12 | \t\"github.com/prometheus/client_golang/prometheus\"\n13 | \t\"github.com/prometheus/client_golang/prometheus/promauto\"\n14 | \t\"github.com/prometheus/prometheus/promql\"\n15 | \t\"github.com/prometheus/prometheus/sto...",
+      "latency_seconds": 1.618
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "prometheus QueryEngine datasource",
+        "channels": [
+          "purpose",
+          "keywords"
+        ],
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"public/app/plugins/datasource/prometheus/plugin.json\",\n        \"purpose\": \"Defines the Prometheus datasource plugin configuration for Grafana, including API routes, dashboards, and plugin metadata\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"public/app/plugins/datasource/prometheus/configuration/AzureAuthSettings.tsx\",\n        \"purpose\": \"Defines a React c...",
+      "latency_seconds": 0.603
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePath": "pkg/api/query/engine.go",
+        "fromLine": 100,
+        "toLine": 234
+      },
+      "result_preview": "# pkg/api/query/engine.go\nLines: 100 - 234 of 234\n\n100 | \t\t\t\tReg:    registry,\n101 | \t\t\t\t// TODO(bwplotka): Expose this as a flag: https://github.com/thanos-io/thanos/issues/703.\n102 | \t\t\t\tMaxSamples:    math.MaxInt32,\n103 | \t\t\t\tTimeout:       queryTimeout,\n104 | \t\t\t\tLookbackDelta: lookbackDelta,\n105 | \t\t\t\tNoStepSubqueryIntervalFn: func(int64) int64 {\n106 | \t\t\t\t\treturn evaluationInterval.Milliseconds()\n107 | \t\t\t\t},\n108 | \t\t\t\tEnableNegativeOffset: true,\n109 | \t\t\t\tEnableAtModifier:     true,\n110 |...",
+      "latency_seconds": 1.625
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/tsdb/prometheus/prometheus.go",
+          "packages/grafana-prometheus/src/datasource.ts"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/tsdb/prometheus/prometheus.go\",\n      \"purpose\": \"Provides a Grafana datasource plugin service for Prometheus, acting as a facade that delegates all backend operations (querying, health checks, resource calls, admission validation) to a shared promlib service, with specific Azure authentication configuration.\",\n      \"summary\": \"{\\\"Facade Pattern (~L16-58)\\\":\\\"Service struc...",
+      "latency_seconds": 0.398
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePaths": [
+          "pkg/querier/querier.go",
+          "pkg/streamingpromql/planning.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"0e6dcaca-9001-4c25-a0ff-8fe71b7ea205\",\n  \"files\": [\n    {\n      \"path\": \"pkg/querier/querier.go\",\n      \"purpose\": \"Implements the querier component for Mimir, responsible for orchestrating queries across ingesters and store-gateways, selecting query engines, enforcing tenant limits, and merging results for multi-tenant Prometheus-compatible monitoring. Provides tenant-specific query limit configuration and request metrics for the querier component,...",
+      "latency_seconds": 0.73
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "promql engine ruler evaluator",
+        "channels": [
+          "purpose",
+          "keywords"
+        ],
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"promql/engine.go\",\n        \"purpose\": \"The file implements the core PromQL engine, defining its public API, configuration, and lifecycle management. It parses, validates, and executes queries against storage, handling metrics, logging, and result generation.\",\n        \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n        \"repo_name\": \"prometheus\"\n      },\n      {\n        \"path\": \"promql/engine_test.go\",\n        \"purpose\": \"The fil...",
+      "latency_seconds": 0.585
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePaths": [
+          "web/api/v1/api.go",
+          "rules/manager.go",
+          "promql/promqltest/test.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n  \"files\": [\n    {\n      \"path\": \"web/api/v1/api.go\",\n      \"purpose\": \"The file implements the Prometheus\u00e2\u0080\u0091style HTTP API for query, remote read/write, target discovery, and TSDB administration. It wires storage, query engine, routers, and various retrievers to expose endpoints that parse requests, execute operations, and return JSON responses.\",\n      \"summary\": \"The file implements the Prometheus\u00e2\u0080\u0091style HT...",
+      "latency_seconds": 0.413
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePaths": [
+          "pkg/api/query/grpc.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n  \"files\": [\n    {\n      \"path\": \"pkg/api/query/grpc.go\",\n      \"purpose\": \"Implements the gRPC API layer for Prometheus Query (instant and range) in Thanos, bridging gRPC requests to the underlying PromQL engine execution. It handles query parameter parsing, timeout management, query execution, and result serialization into gRPC streaming responses.\",\n      \"summary\": \"{\\\"gRPC Streaming (~L137-181)\\\":\\\"Impleme...",
+      "latency_seconds": 0.409
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePath": "web/api/v1/api.go",
+        "fromLine": 64,
+        "toLine": 215
+      },
+      "result_preview": "# web/api/v1/api.go\nLines: 64 - 215 of 2314\nMore: fromLine=216\n\n64 | \n65 | type status string\n66 | \n67 | const (\n68 | \tstatusSuccess status = \"success\"\n69 | \tstatusError   status = \"error\"\n70 | \n71 | \t// Non-standard status code (originally introduced by nginx) for the case when a client closes\n72 | \t// the connection while the server is still processing the request.\n73 | \tstatusClientClosedConnection = 499\n74 | \n75 | \t// checkContextEveryNIterations is used in some tight loops to check if the c...",
+      "latency_seconds": 1.835
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePath": "rules/manager.go",
+        "fromLine": 45,
+        "toLine": 120
+      },
+      "result_preview": "# rules/manager.go\nLines: 45 - 120 of 636\nMore: fromLine=121\n\n45 | type QueryFunc func(ctx context.Context, q string, t time.Time) (promql.Vector, error)\n46 | \n47 | // EngineQueryFunc returns a new query function that executes instant queries against\n48 | // the given engine.\n49 | // It converts scalar into vector results.\n50 | func EngineQueryFunc(engine promql.QueryEngine, q storage.Queryable) QueryFunc {\n51 | \treturn func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {\n5...",
+      "latency_seconds": 1.507
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePath": "pkg/api/query/grpc.go",
+        "fromLine": 26,
+        "toLine": 100
+      },
+      "result_preview": "# pkg/api/query/grpc.go\nLines: 26 - 100 of 447\nMore: fromLine=101\n\n26 | \n27 | type GRPCAPI struct {\n28 | \tnow                   func() time.Time\n29 | \treplicaLabels         []string\n30 | \tqueryableCreate       query.QueryableCreator\n31 | \tremoteEndpointsCreate query.RemoteEndpointsCreator\n32 | \tqueryCreator          queryCreator\n33 | \tdefaultEngine         querypb.EngineType\n34 | \tlookbackDeltaCreate   func(int64) time.Duration\n35 | \tdefaultMaxResolution  time.Duration\n36 | }\n37 | \n38 | func New...",
+      "latency_seconds": 2.056
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePath": "web/api/v1/api.go",
+        "fromLine": 216,
+        "toLine": 380
+      },
+      "result_preview": "# web/api/v1/api.go\nLines: 216 - 380 of 2314\nMore: fromLine=381\n\n216 | \n217 | type QueryOpts interface {\n218 | \tEnablePerStepStats() bool\n219 | \tLookbackDelta() time.Duration\n220 | }\n221 | \n222 | // API can register a set of endpoints in a router and handle\n223 | // them using the provided storage and query engine.\n224 | type API struct {\n225 | \tQueryable         storage.SampleAndChunkQueryable\n226 | \tQueryEngine       promql.QueryEngine\n227 | \tExemplarQueryable storage.ExemplarQueryable\n228 | \n...",
+      "latency_seconds": 1.382
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePath": "pkg/querier/querier.go",
+        "fromLine": 184,
+        "toLine": 246
+      },
+      "result_preview": "# pkg/querier/querier.go\nLines: 184 - 246 of 972\nMore: fromLine=247\n\n184 | \n185 | // New builds a queryable and promql engine.\n186 | func New(\n187 | \tcfg Config,\n188 | \tlimits *validation.Overrides,\n189 | \tdistributor Distributor,\n190 | \tqueryables []TimeRangeQueryable,\n191 | \treg prometheus.Registerer,\n192 | \tlogger log.Logger,\n193 | \ttracker *activitytracker.ActivityTracker,\n194 | \tplanner *streamingpromql.QueryPlanner,\n195 | \tlimitsProvider streamingpromql.QueryLimitsProvider,\n196 | ) (storag...",
+      "latency_seconds": 2.122
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePath": "pkg/streamingpromql/engine.go",
+        "fromLine": 46,
+        "toLine": 140
+      },
+      "result_preview": "# pkg/streamingpromql/engine.go\nLines: 46 - 140 of 394\nMore: fromLine=141\n\n46 | \n47 | const defaultLookbackDelta = 5 * time.Minute // This should be the same value as github.com/prometheus/prometheus/promql.defaultLookbackDelta.\n48 | \n49 | func NewEngine(opts EngineOpts, metrics *stats.QueryMetrics, planner *QueryPlanner) (*Engine, error) {\n50 | \tvar cacheFactory *cache.CacheFactory\n51 | \tif opts.RangeVectorSplitting.Enabled {\n52 | \t\tvar err error\n53 | \t\tcacheFactory, err = cache.NewCacheFactory...",
+      "latency_seconds": 1.796
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePaths": [
+          "pkg/frontend/querymiddleware/querysharding.go",
+          "pkg/util/limiter/unlimited_memory_consumption_tracker.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"0e6dcaca-9001-4c25-a0ff-8fe71b7ea205\",\n  \"files\": [\n    {\n      \"path\": \"pkg/frontend/querymiddleware/querysharding.go\",\n      \"purpose\": \"Implements query sharding middleware for Grafana Mimir's frontend to optimize query performance by splitting shardable queries into parallel sub-queries executed across multiple shards, integrating with PromQL engine and handling result aggregation.\",\n      \"summary\": \"{\\\"Query Sharding Middleware (~L79-95)\\\":\\\"M...",
+      "latency_seconds": 0.392
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePaths": [
+          "pkg/queryfrontend/roundtrip.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n  \"files\": [\n    {\n      \"path\": \"pkg/queryfrontend/roundtrip.go\",\n      \"purpose\": \"This file implements the Thanos Query Frontend's tripperware, which routes incoming HTTP requests to specialized sub-tripperwares based on query type (range, instant, labels, series). It configures middleware chains for caching, splitting, sharding, and retrying queries, and handles tenant conversion.\",\n      \"summary\": \"{\\\"Des...",
+      "latency_seconds": 0.415
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePath": "pkg/util/limiter/unlimited_memory_consumption_tracker.go",
+        "fromLine": 54,
+        "toLine": 84
+      },
+      "result_preview": "# pkg/util/limiter/unlimited_memory_consumption_tracker.go\nLines: 54 - 84 of 85\nMore: fromLine=85\n\n54 | // UnlimitedMemoryTrackerPromQLEngine wraps promql.Engine so that queries always run\n55 | // with a MemoryConsumptionTracker in their context.\n56 | //\n57 | // The provided MemoryConsumptionTracker will enforce no limit on query memory consumption,\n58 | // but is still required as some querier components track memory consumption even\n59 | // when running in Prometheus' engine (eg. the ingester ...",
+      "latency_seconds": 1.239
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePath": "pkg/frontend/querymiddleware/querysharding.go",
+        "fromLine": 73,
+        "toLine": 200
+      },
+      "result_preview": "# pkg/frontend/querymiddleware/querysharding.go\nLines: 73 - 200 of 617\nMore: fromLine=201\n\n73 | // newQueryShardingMiddleware creates a middleware that will split queries by shard.\n74 | // It first looks at the query to determine if it is shardable or not.\n75 | // Then rewrite the query into a sharded query and use the PromQL engine to execute the query.\n76 | // Sub shard queries are embedded into a single vector selector and a modified `Queryable` (see shardedQueryable) is passed\n77 | // to the...",
+      "latency_seconds": 1.548
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "relativePath": "promql/promqltest/test.go",
+        "fromLine": 88,
+        "toLine": 103
+      },
+      "result_preview": "# promql/promqltest/test.go\nLines: 88 - 103 of 1841\nMore: fromLine=104\n\n88 | \n89 | // NewTestEngine creates a promql.Engine with enablePerStepStats, lookbackDelta and maxSamples, and returns it.\n90 | func NewTestEngine(tb testing.TB, enablePerStepStats bool, lookbackDelta time.Duration, maxSamples int) *promql.Engine {\n91 | \treturn NewTestEngineWithOpts(tb, promql.EngineOpts{\n92 | \t\tLogger:                   nil,\n93 | \t\tReg:                      nil,\n94 | \t\tMaxSamples:               maxSamples,\n...",
+      "latency_seconds": 2.338
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "0e6dcaca-9001-4c25-a0ff-8fe71b7ea205",
+        "relativePaths": [
+          "pkg/frontend/querymiddleware/spin_off_subqueries.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"0e6dcaca-9001-4c25-a0ff-8fe71b7ea205\",\n  \"files\": [\n    {\n      \"path\": \"pkg/frontend/querymiddleware/spin_off_subqueries.go\",\n      \"purpose\": \"Middleware that rewrites Prometheus instant queries to spin off subqueries as separate downstream queries, improving query performance by leveraging parallel execution and caching.\",\n      \"summary\": \"{\\\"Design Pattern (~L31-114)\\\":\\\"Middleware chain pattern that wraps a MetricsQueryHandler to intercept and...",
+      "latency_seconds": 0.937
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "relativePath": "pkg/api/query/grpc.go",
+        "fromLine": 360,
+        "toLine": 447
+      },
+      "result_preview": "# pkg/api/query/grpc.go\nLines: 360 - 447 of 447\n\n360 | func (g *GRPCAPI) getInstantQueryForEngine(\n361 | \tctx context.Context,\n362 | \trequest *querypb.QueryRequest,\n363 | \tqueryable storage.Queryable,\n364 | \tremoteEndpoints api.RemoteEndpoints,\n365 | \tmaxResolution int64,\n366 | ) (promql.Query, error) {\n367 | \tlookbackDelta := g.lookbackDeltaCreate(maxResolution * 1000)\n368 | \tif request.LookbackDeltaSeconds > 0 {\n369 | \t\tlookbackDelta = time.Duration(request.LookbackDeltaSeconds) * time.Second\n...",
+      "latency_seconds": 1.985
+    }
+  ],
+  "error": ""
+}

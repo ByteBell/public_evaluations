@@ -1,0 +1,451 @@
+{
+  "model": "openai/gpt-5.1-codex-mini",
+  "answer": "### 1. Architecture Overview\nThe readiness checks of Kubernetes Deployments are owned by environment-specific tooling with two major paths: Flux CLI (Flux v2) and Helm share a Go-based status waiter, while Argo CD leverages Lua-based resource customization health checks.\n\n- **Flux CLI readiness path**: `cmd/flux/readiness.go` defines core readiness helpers. When the CLI needs to verify a Deployment, it uses `isObjectReady` (lines 46\u2011113), which (a) checks per-object observed generations/Ready conditions to ensure responses correspond to the latest generation, and (b) delegates to `kstatus.Compute` via the helper `kstatusCompute` (lines 142\u2011149) to determine if the resource reports `CurrentStatus`. The method wraps this logic into wait.Condition functions (`isObjectReadyConditionFunc` and `isStaticObjectReadyConditionFunc`, lines 115\u2011140) so that higher-level commands (e.g., `flux install`, `flux check`) can poll until `CurrentStatus` is reached.\n\n- **Flux Deployment metadata helpers**: `cmd/flux/status.go` defines the `statusable` interface (lines 25\u201131) and `buildComponentObjectRefs` (lines 39\u201147). Callers use these to construct object references (`apps/v1` Deployment GroupKind) that are feed into the readiness polling engine.\n\n- **Helm readiness path**: `pkg/kube/statuswait.go` implements Helm\u2019s integration with `fluxcd/kstatus` polling. In `wait` (lines 172\u2011217) each resource is converted to `object.ObjMetadata` and fed into a watcher; Deployments are skipped when `.Spec.Paused == true` (lines 176\u2011182), so readiness detection aligns with Kubernetes semantics. The status observer cancels polling once all resources reach `kstatus.CurrentStatus` and logs non\u2011ready resources for easier debugging (lines 233\u2011272).\n\n- **Argo CD readiness path**: Under `resource_customizations/apps/Deployment`, the Lua health check/action scripts translate Deployment status/conditions into Argo\u2019s health model (Healthy/Progressing/Degraded) and provide actions for pause/resume/restart. This folder ensures Argo\u2019s UI/API can report readiness (by inspecting status.conditions and the spec), and actions used by Flux/Helm do not misinterpret paused rollouts.\n\nThese components interact indirectly via Kubernetes Deployment semantics: Flux\u2019s CLI readiness helper and Helm\u2019s waiter both rely on the same `kstatus` status computation (via `kstatusCompute` and the Flux CLI\u2019s condition checks) to judge \u201cready,\u201d while Argo CD builds its health assessments separately but also inspects Deployment `.spec` and `.status`.\n\n### 2. Detailed Analysis\n\n#### Flux CLI readiness helpers\n- `isObjectReady(obj, statusType)` in `cmd/flux/readiness.go` (lines 46\u2011113) references `object.GetStatusObservedGeneration` and `apimeta.FindStatusCondition` to ensure that the ready condition corresponds to the latest generation. If no `Ready` condition for the latest generation exists, it returns `false` (lines 56\u201194). After generation checks, it converts the resource to `unstructured.Unstructured` and calls `kstatus.Compute` (using `kstatusCompute`, lines 142\u2011149) \u2014 returning `CurrentStatus` only when all readiness criteria are met. This granular check is reused by `isObjectReadyConditionFunc` (lines 115\u2011125) for dynamic objects and `isStaticObjectReadyConditionFunc` (lines 128\u2011139) for objects that lack conditions.\n\n- `statusable` interface/factory in `cmd/flux/status.go` (lines 25\u201137) ensures Flux resources expose `GetGeneration`/`getObservedGeneration`, enabling `isObjectReady` to operate on any object that implements those methods. `buildComponentObjectRefs` (lines 39\u201147) assembles metadata (GroupKind `apps/Deployment`) for the Flux CLI\u2019s status command, enabling the polling engine to target cached Deployments.\n\n#### Helm readiness waiter\n- `statusWaiter.wait()` in `pkg/kube/statuswait.go` (lines 172\u2011217) iterates the `ResourceList`, calling `AsVersioned(resource)` to detect Deployments and skip `.Spec.Paused` ones (line 178\u2011181). Every resource is converted to `object.ObjMetadata` and passed to `fluxcd/kstatus/watch` (lines 172\u2011195). The observer logic (`statusObserver`, lines 233\u2011272) aggregates statuses and cancels once all resources achieve the `kstatus.CurrentStatus`. Non-ready resources are logged (lines 263\u2011270) to aid debugging, and aggregated errors (lines 201\u2011215) are returned if readiness is never reached.\n\n- Timeouts are handled via `contextWithTimeout` (lines 219\u2011231); zero durations are replaced with a default 30s to avoid immediate cancellation. `waitForDelete` and other wrappers orchestrate pre/post hook waiting (seen in metadata summary sections in `pkg/kube/statuswait.go`).\n\n#### Argo CD Deployment customizations\n- `resource_customizations/apps/Deployment/actions/*.lua` (discover/pause/resume/restart) mutate `.spec.paused` and add restart annotations, ensuring that the metadata Flux/Helm rely on (paused flag, annotations) are correctly set via Argo\u2019s UI actions.\n\n- These scripts live under `resource_customizations/apps/Deployment` (see folder traversal summary) and are included via `embed.go`, allowing Argo\u2019s binary to ship with these health/action definitions. For example, `actions/discovery.lua` determines action availability based on `spec.paused` (per the folder summary), enabling Argo to pause/resume deployments in the UI without breaking readiness checks.\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| `Knowledge 300e3464-c7b1-4d8b-954c-a9677f430faf` (Flux CLI) | `cmd/flux/readiness.go` | Contains readiness logic (`isObjectReady`, generation validation, `kstatusCompute`, wait.Condition builders) used by Flux commands that check Deployment readiness before reporting success. |\n| `Knowledge 300e3464-c7b1-4d8b-954c-a9677f430faf` (Flux CLI) | `cmd/flux/status.go` | Defines the `statusable` interface and `buildComponentObjectRefs` helper so Flux can gather Deployment metadata (GroupKind `apps/Deployment`) for readiness checks. |\n| `Knowledge d49f3ae3-415a-4215-8471-eedd5ad1829b` (Helm) | `pkg/kube/statuswait.go` | Implements Helm\u2019s integration with `fluxcd/kstatus`, including logic to skip paused Deployments and wait for `kstatus.CurrentStatus`, forming the deployment readiness path used in Helm\u2019s `install/upgrade` hooks. |\n| `Knowledge cceba948-304a-4f00-8ac6-4dd57dab816e` (Argo CD) | `resource_customizations/apps/Deployment/actions/discovery.lua` | Determines available actions (restart/pause/resume) by inspecting Deployment `.spec` and status, ensuring Argo\u2019s UI only exposes operations compatible with readiness requirements. |\n| `Knowledge cceba948-304a-4f00-8ac6-4dd57dab816e` (Argo CD) | `resource_customizations/apps/Deployment/actions/pause/action.lua` | Implements the pause action by setting `spec.paused`, which affects Helm/Flux readiness logic when these systems see Deployments with `.Spec.Paused == true`. |\n| `Knowledge cceba948-304a-4f00-8ac6-4dd57dab816e` (Argo CD) | `resource_customizations/apps/Deployment/actions/resume/action.lua` | Removes `spec.paused`, allowing readiness checks (Flux/Helm) to resume once the Deployment is active again. |\n| `Knowledge cceba948-304a-4f00-8ac6-4dd57dab816e` (Argo CD) | `resource_customizations/apps/Deployment/actions/restart/action.lua` | Adds restart annotations that trigger pod restarts; useful when readiness fails and a restart is required without changing replica counts. |\n| `Knowledge cceba948-304a-4d8b-954c-a9677f430faf`: (Flux CLI) | `cmd/flux/readiness.go` (already listed) | Reiterating to emphasize cross-reference between Flux and Helm readiness paths sharing `kstatus`. |\n| `Knowledge cceba948-304a-4f00-8ac6-4dd57dab816e` | `resource_customizations/embed.go` | Embeds all Lua customization files so Argo CD can serve these deployment readiness actions/health checks at runtime without external filesystem dependencies. |\n\n(Note: Additional files referenced implicitly\u2014like `resource_customizations/apps/Deployment/*`\u2014ensure Argo\u2019s readiness/actions are consistent with Deployment `.spec` mutations.)\n\n",
+  "cost": {
+    "input_tokens": 966788,
+    "output_tokens": 8677,
+    "total_tokens": 975465,
+    "cost_usd": 0.500748
+  },
+  "status": "success",
+  "latency_seconds": 141.66,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.086
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.354
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Deployment readiness",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"test/helpers/manifest.go\",\n        \"purpose\": \"Provides Kubernetes deployment management utilities for Cilium testing, including manifest deployment, namespace management, and lifecycle operations\"\n      },\n      {\n        \"path\": \"cmd/build/helmify/kustomize-for-helm.yaml\",\n        \"purpose\": \"This file is a Kustomize overlay manifest used as a template for generating a Helm chart. It defines Kubernetes resources (Service, CRDs, Deploymen...",
+      "latency_seconds": 0.61
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "progressDeadlineSeconds",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/controller/deployment/progress.go\",\n        \"purpose\": \"Manages rollout progress and status updates for Kubernetes deployments, including condition tracking, timeout handling, and requeuing stuck deployments to ensure reliable workload transitions.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/client-go/applyconfigurations/apps/v1/deploymentspec.go\",\n        \"purpose\": \"This file provides a declarative apply configuration for K...",
+      "latency_seconds": 0.592
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DeploymentConditionAvailable",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"DeploymentConditionAvailable\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagina...",
+      "latency_seconds": 0.54
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "IsDeploymentReady",
+        "channels": [
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"IsDeploymentReady\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"keywords\": {\n    \"data\": [],\n    \"...",
+      "latency_seconds": 0.555
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DeploymentSpec",
+        "channels": [
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/apps/v1/types.go\",\n        \"purpose\": \"addon-resizer/vendor/k8s.io/api/apps/v1/types.go#chunk0: Define the core API types for Kubernetes workload controllers (StatefulSet, Deployment, DaemonSet) for serialization and inter-component communication.\\naddon-resizer/vendor/k8s.io/api/apps/v1/types.go#chunk1: Define the core data structures for Kubernetes workload controllers (DaemonSet, ReplicaSet) and their rev...",
+      "latency_seconds": 0.539
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "progressDeadlineSeconds",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"progressDeadlineSeconds\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\"...",
+      "latency_seconds": 0.604
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "relativePaths": [
+          "cmd/flux/status.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"300e3464-c7b1-4d8b-954c-a9677f430faf\",\n  \"files\": [\n    {\n      \"path\": \"cmd/flux/status.go\",\n      \"purpose\": \"Provides interfaces to assess readiness of Kubernetes resources (statusable, oldConditions) and a helper to build object metadata references for Deployments, used by the Flux CLI status command.\",\n      \"summary\": \"{\\\"Status Interface\\\":\\\"Defines GetGeneration and getObservedGeneration methods alongside adapter...",
+      "latency_seconds": 0.114
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "relativePaths": [],
+        "relativePath": "cmd/flux/status.go",
+        "fromLine": 24,
+        "toLine": 50,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# cmd/flux/status.go\nLines: 24 - 50 of 50\n\n24 | \n25 | // statusable is used to see if a resource is considered ready in the usual way\n26 | type statusable interface {\n27 | \tadapter\n28 | \t// this is implemented by ObjectMeta\n29 | \tGetGeneration() int64\n30 | \tgetObservedGeneration() int64\n31 | }\n32 | \n33 | // oldConditions represents the deprecated API which is sunsetting.\n34 | type oldConditions interface {\n35 | \t// this is usually implemented by GOTK API objects because it's used by pkg/apis/met...",
+      "latency_seconds": 1.425
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "statusable",
+        "channels": [
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"statusable\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"keywords\": {\n    \"data\": [\n      {\n      ...",
+      "latency_seconds": 0.545
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Deployment ready",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/bases/helm-controller/kustomization.yaml\",\n        \"purpose\": \"Kustomization configuration for deploying the Helm Controller with CRDs, deployment, and patches\"\n      },\n      {\n        \"path\": \"manifests/bases/image-automation-controller/kustomization.yaml\",\n        \"purpose\": \"This kustomization.yaml declares the resources, transformers, and patches needed to deploy the FluxCD image-automation-controller into a Kubernetes clust...",
+      "latency_seconds": 0.615
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "relativePaths": [
+          "cmd/flux/readiness.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"300e3464-c7b1-4d8b-954c-a9677f430faf\",\n  \"files\": [\n    {\n      \"path\": \"cmd/flux/readiness.go\",\n      \"purpose\": \"Provides readiness checking utilities for Kubernetes objects, determining if objects are ready based on their status conditions and generation tracking\",\n      \"summary\": \"{\\\"objectStatusType\\\":\\\"Enum defining object status types (dynamic vs static) for readiness checking\\\",\\\"Ready condition checking\\\":\\\"Ver...",
+      "latency_seconds": 0.114
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "relativePaths": [],
+        "relativePath": "cmd/flux/readiness.go",
+        "fromLine": 34,
+        "toLine": 149,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# cmd/flux/readiness.go\nLines: 34 - 149 of 150\nMore: fromLine=150\n\n34 | // objectStatusType is the type of object in terms of status when computing the\n35 | // readiness of an object. Readiness check method depends on the type of object.\n36 | // For a dynamic object, Ready status condition is considered only for the\n37 | // latest generation of the object. For a static object that don't have any\n38 | // condition, the object generation is not considered.\n39 | type objectStatusType int\n40 | \n41 |...",
+      "latency_seconds": 1.378
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [
+          "pkg/kube/statuswait.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n  \"files\": [\n    {\n      \"path\": \"pkg/kube/statuswait.go\",\n      \"purpose\": \"Implements Kubernetes resource status monitoring and waiting logic for Helm, enabling synchronous deployment validation by polling resource states until they reach desired conditions (e.g., CurrentStatus or NotFoundStatus). It abstracts the fluxcd/kstatus polling engine to support hooks-only, job-aware, and...",
+      "latency_seconds": 0.119
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/kube/statuswait.go",
+        "fromLine": 172,
+        "toLine": 272,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pkg/kube/statuswait.go\nLines: 172 - 272 of 293\nMore: fromLine=273\n\n172 | func (w *statusWaiter) wait(ctx context.Context, resourceList ResourceList, sw watcher.StatusWatcher) error {\n173 | \tcancelCtx, cancel := context.WithCancel(ctx)\n174 | \tdefer cancel()\n175 | \tresources := []object.ObjMetadata{}\n176 | \tfor _, resource := range resourceList {\n177 | \t\tswitch value := AsVersioned(resource).(type) {\n178 | \t\tcase *appsv1.Deployment:\n179 | \t\t\tif value.Spec.Paused {\n180 | \t\t\t\tcontinue\n181 | \t\t\t}\n1...",
+      "latency_seconds": 0.438
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Deployment ready",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"resource_customizations/operator.knative.dev/KnativeServing/health.lua\",\n        \"purpose\": \"Implements custom health-check logic for KnativeServing custom resources by evaluating the status of specific conditions (Ready, InstallSucceeded, DependenciesInstalled, DeploymentsAvailable) in the resource's status.conditions array. Returns a structured health status object indicating Healthy, Progressing, or Degraded states.\"\n      },\n      {\n  ...",
+      "latency_seconds": 0.68
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Spec.Paused",
+        "channels": [
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"resource_customizations/argoproj.io/Rollout/health.lua\",\n        \"purpose\": \"This file implements health status evaluation logic for Argo Rollouts resources in Argo CD. It determines whether a Rollout is Healthy, Progressing, Suspended, or Degraded based on its spec, status, and conditions. It is used by Argo CD's health assessment system to visualize rollout state.\"\n      },\n      {\n        \"path\": \"resource_customizations/cluster.x-k8s....",
+      "latency_seconds": 0.561
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "resource_customizations/apps/Deployment/health.lua",
+        "channels": [
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[paths] 0 results for \\\"resource_customizations/apps/Deployment/health.lua\\\". Full paths are brittle \u00e2\u0080\u0094 the stored relative_path may differ by prefix or structure. Try searching with just the FILENAME (e.g. \\\"shared_informer.go\\\" instead of \\\"staging/src/k8s.io/client-go/tools/cache/sh...",
+      "latency_seconds": 0.176
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "resource_customizations/apps/Deployment",
+        "channels": [
+          "glob"
+        ],
+        "path": "",
+        "glob": "**/resource_customizations/apps/Deployment/**",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"glob\": {\n    \"data\": [\n      {\n        \"path\": \"resource_customizations/apps/Deployment/actions/action_test.yaml\",\n        \"purpose\": \"This file defines test cases for Kubernetes Deployment resource customizations in ArgoCD, specifically testing action discovery and execution for restart, pause, resume, and scale operations. It validates that the correct actions are available based on deployment state and that action execution produces expected YAML outputs.\"\n      },\n      {\n        \"path\"...",
+      "latency_seconds": 0.28
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "kstatus",
+        "channels": [
+          "keywords",
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"kstatus\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\"...",
+      "latency_seconds": 0.515
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "fluxcd",
+        "channels": [
+          "imports",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"fluxcd\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  },\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"resource_customizations/helm.toolkit.flux...",
+      "latency_seconds": 0.743
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"Argo CD is a comprehensive GitOps platform for Kubernetes that enables declarative, version-controlled application deployment and lifecycle management across multi-cluster environments. The architecture follows a layered, modular design with a core GitOps reconciliation engine at its center, surrounded by supporting subsystems for API management, user interfaces, manifest generation, and extensibility. It integrates gen...",
+      "latency_seconds": 0.135
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "folder",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "resource_customizations",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"folder\",\n  \"data\": {\n    \"purpose\": \"Provides embedded static resource customization files for Argo CD's application and cluster management subsystems, enabling zero-dependency runtime access to YAML/JSON manifests.\\nThis folder contains resource customizations for Kubernetes resources, providing health check logic and action plugins for Argo CD to assess resource health and enable operational management. It defines standardized health evaluation functions and test suites for v...",
+      "latency_seconds": 0.246
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "folder",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "level": 1,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "resource_customizations/apps",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"folder\",\n  \"data\": {\n    \"purpose\": \"Defines test cases for actions on Kubernetes DaemonSet resources, specifying input files and expected outputs to validate action behaviors like restarting.\\nDefines a table of actions available for DaemonSet resources in ArgoCD, specifically configuring a restart action with an associated icon for UI display, enabling resource management operations within the Kubernetes integration.\\nThis Lua script customizes Kubernetes DaemonSet resources ...",
+      "latency_seconds": 0.117
+    }
+  ],
+  "error": ""
+}

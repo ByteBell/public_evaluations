@@ -1,0 +1,301 @@
+{
+  "model": "stepfun/step-3.5-flash",
+  "answer": "Based on my exhaustive analysis of the Istio codebase, here is the complete analysis of how MutatingWebhookConfiguration is patched for CA bundle:\n\n## 1. Architecture Overview\n\nIstio implements a sophisticated webhook certificate patching system to ensure that `MutatingWebhookConfiguration` resources always have up-to-date CA bundles. The system follows an event-driven architecture with watchers, queues, and rate-limited retries:\n\n**Data Flow:**\n1. CA certificate bundle changes (via rotation or initial setup)\n2. `keycertbundle.Watcher` notifies all registered watchers\n3. `WebhookCertPatcher` receives notification and queues all relevant `MutatingWebhookConfiguration` resources\n4. Queue processes each webhook config, patching the CA bundle for matching webhooks\n5. Updates are applied to Kubernetes API server with conflict resolution\n\n**Key Components:**\n- **CA Bundle Watcher**: Thread-safe observer pattern for certificate updates\n- **WebhookCertPatcher**: Main reconciliation logic with revision filtering\n- **Rate-Limited Queue**: Handles conflicts between multiple Istiod instances\n- **Integration Points**: Bootstrap (sidecar injector) and multicluster controllers\n\n## 2. Detailed Analysis\n\n### Core Patching Logic (`pkg/webhooks/webhookpatch.go`)\n\n**WebhookCertPatcher Structure** (L45-58):\n```go\ntype WebhookCertPatcher struct {\n    revision    string          // Target revision to patch\n    webhookName string          // Webhook name suffix to match\n    queue       controllers.Queue\n    CABundleWatcher *keycertbundle.Watcher\n    webhooks    kclient.Client[*v1.MutatingWebhookConfiguration]\n}\n```\n\n**Patch Algorithm** (`patchMutatingWebhookConfig`, L119-168):\n1. Fetch the `MutatingWebhookConfiguration` by name\n2. **Revision validation**: Check `label.IoIstioRev.Name` label matches target revision (L127-135)\n3. Load current CA bundle from watcher via `util.LoadCABundle()` (L139)\n4. Iterate through webhooks, finding those with name suffix matching `webhookName` (L145-152)\n5. Compare existing CA bundle with new bundle using `bytes.Equal()` (L147)\n6. Update only if different to avoid unnecessary API calls (L147-150)\n7. Call `webhooks.Update(config)` to persist changes (L161)\n\n**Error Handling** (L40-43, L107-109):\n- `errWrongRevision`: Webhook belongs to different revision - skip permanently\n- `errNotFound`: Webhook config doesn't exist - skip permanently  \n- `errNoWebhookWithName`: Config exists but doesn't contain target webhook - skip permanently\n- Other errors trigger retry with rate limiting\n\n**Rate Limiting Strategy** (L78-87):\n```go\ncontrollers.WithRateLimiter(workqueue.NewTypedItemFastSlowRateLimiter[any](\n    100*time.Millisecond,  // Fast retries for first 5 attempts\n    1*time.Minute,         // Slow retries thereafter\n    5,                     // Threshold for switching\n))\n```\nThis prevents API server overload during conflicts while ensuring eventual consistency.\n\n### CA Bundle Management (`pilot/pkg/keycertbundle/watcher.go`)\n\n**Watcher Pattern** (L30-35):\n- Uses `sync.RWMutex` for thread-safe concurrent access\n- Maintains a map of watcher channels (`map[int32]chan struct{}`)\n- `AddWatcher()` (L43-53): Returns ID and notification channel\n- `RemoveWatcher()` (L55-64): Cleans up watcher\n- `SetAndNotify()` (L66-85): Updates bundle and broadcasts to all watchers\n\n**Bundle Structure** (L22-28):\n```go\ntype KeyCertBundle struct {\n    CertPem  []byte  // Server certificate\n    KeyPem   []byte  // Private key\n    CABundle []byte  // CA certificate bundle (patching target)\n    CRL      []byte  // Certificate revocation list\n}\n```\n\n### CA Bundle Validation (`pkg/webhooks/util/util.go`)\n\n**LoadCABundle** (L39-46):\n1. Retrieves current CA bundle from watcher\n2. Calls `VerifyCABundle()` to ensure validity\n3. Returns error as `ConfigError` with reason for monitoring\n\n**VerifyCABundle** (L48-60):\n- Decodes PEM block\n- Validates type is \"CERTIFICATE\"\n- Parses X509 certificate to ensure it's valid\n- Returns specific error messages for each failure mode\n\n### Integration Points\n\n**Sidecar Injector Bootstrap** (`pilot/pkg/bootstrap/sidecarinjector.go`):\n\nLines 93-106 show conditional patcher setup:\n```go\nif features.InjectionWebhookConfigName != \"\" {\n    s.addStartFunc(\"injection patcher\", func(stop <-chan struct{}) error {\n        patcher, err := webhooks.NewWebhookCertPatcher(\n            s.kubeClient, \n            args.Revision, \n            webhookName,  // \"sidecar-injector.istio.io\"\n            s.istiodCertBundleWatcher,\n        )\n        go patcher.Run(stop)\n        return nil\n    })\n}\n```\nThis patches the sidecar injection webhook when `InjectionWebhookConfigName` feature is enabled.\n\n**Multicluster Controller** (`pilot/pkg/serviceregistry/kube/controller/multicluster.go`):\n\nLines 266-283 set up patching for remote clusters:\n```go\nif shouldLead && !configCluster && m.caBundleWatcher != nil {\n    if features.InjectionWebhookConfigName != \"\" {\n        patcher, err := webhooks.NewWebhookCertPatcher(\n            client, \n            m.revision, \n            webhookName, \n            m.caBundleWatcher,\n        )\n        go patcher.Run(clusterStopCh)\n    }\n}\n```\nOnly the elected leader for a remote cluster patches webhooks, avoiding conflicts.\n\n### Monitoring and Metrics (`pkg/webhooks/monitoring.go`)\n\n**Metrics** (L29-44):\n- `webhook_patch_attempts_total`: Total patching attempts\n- `webhook_patch_retries_total`: Total retry attempts\n- `webhook_patch_failures_total`: Total failures (with reason label)\n\n**Failure Reasons** (L46-53):\n- `wrong_revision`: Webhook belongs to different revision\n- `load_ca_bundle_failure`: Failed to load CA bundle from watcher\n- `webhook_config_not_found`: MutatingWebhookConfiguration doesn't exist\n- `webhook_entry_not_found`: Config exists but doesn't contain target webhook\n- `webhook_update_failure`: API error during update\n\n### Test Coverage (`pkg/webhooks/webhookpatch_test.go`)\n\n**Test Scenarios** (L55-271):\n- Webhook config not found\n- Webhook entry not found in config\n- Successful patching\n- Prefix matching (webhook name suffix)\n- No revision label (skipped)\n- Wrong revision (skipped)\n- Multiple webhooks in same config (only matching one updated)\n\n**Queue Testing** (L273-302):\n- Immediate success\n- Conflict resolution after retries\n- Permanent failure (conflict forever)\n\n## 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| istio | pkg/webhooks/webhookpatch.go | **Core implementation**: WebhookCertPatcher struct, patchMutatingWebhookConfig method, CA bundle watcher integration, rate-limited queue |\n| istio | pkg/webhooks/webhookpatch_test.go | **Test coverage**: Validates patching logic, revision filtering, error handling, and queue behavior |\n| istio | pkg/webhooks/monitoring.go | **Observability**: Metrics for attempts, retries, failures with labeled reasons |\n| istio | pkg/webhooks/util/util.go | **CA bundle validation**: LoadCABundle and VerifyCABundle functions ensuring PEM-encoded valid certificates |\n| istio | pilot/pkg/bootstrap/sidecarinjector.go | **Integration**: Initializes WebhookCertPatcher for sidecar injection webhook in main Istiod |\n| istio | pilot/pkg/serviceregistry/kube/controller/multicluster.go | **Multicluster**: Sets up patching for remote clusters with leader election |\n| istio | pilot/pkg/keycertbundle/watcher.go | **Certificate management**: Thread-safe watcher pattern for CA bundle updates with observer notification |\n| istio | pkg/webhooks/validation/controller/controller.go | **Related component**: ValidatingWebhookConfiguration patching (similar pattern) |\n| istio | pkg/webhooks/validation/controller/controller_test.go | **Validation controller tests**: Tests webhook config updates based on CA changes |\n\n**Cross-Repo Dependencies:**\n- All files are within the same Istio repository (`knowledgeId: edd43087-bf39-42b6-85b0-ed3297ec760a`)\n- Uses Kubernetes client-go types from `k8s.io/api/admissionregistration/v1`\n- Uses Istio label constants from `istio.io/api/label`\n\n## Summary\n\nThe MutatingWebhookConfiguration patching system is a critical component for Istio's webhook TLS security. It ensures that when Istio's CA certificate rotates (or initially deploys), all relevant mutating webhook configurations are automatically updated with the new CA bundle. The system is designed for:\n\n- **Multi-Istiod safety**: Revision labels prevent cross-revision patching; rate limiting handles conflicts\n- **Observability**: Comprehensive metrics with failure reasons\n- **Validation**: CA bundles are verified as valid PEM certificates before patching\n- **Efficiency**: Only patches when CA bundle actually changes\n- **Scalability**: Queue-based processing with backoff handles high load\n- **Multi-cluster**: Leader election ensures only one Istiod patches per remote cluster",
+  "cost": {
+    "input_tokens": 1383469,
+    "output_tokens": 5748,
+    "total_tokens": 1389217,
+    "cost_usd": 0.140071
+  },
+  "status": "success",
+  "latency_seconds": 164.32,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.064
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.219
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "MutatingWebhookConfiguration",
+        "channels": [
+          "classes",
+          "functions",
+          "purpose",
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/types.go\",\n        \"purpose\": \"Defines the API types for Kubernetes admission webhook configurations, including validating and mutating webhooks, rules, and client configurations. This file provides the data structures used by the Kubernetes API server for admission control, enabling external webhooks to validate or mutate resources during API requests.\"\n      },\n      {\n        ...",
+      "latency_seconds": 4.717
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Istio CA bundle patch",
+        "channels": [
+          "purpose",
+          "functions",
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/webhooks/webhookpatch.go\",\n        \"purpose\": \"Manages webhook certificate patching for Istio webhook configurations, ensuring CA bundles are updated when certificates change\"\n      },\n      {\n        \"path\": \"pkg/webhooks/webhookpatch_test.go\",\n        \"purpose\": \"Tests webhook certificate patching functionality for Istio admission webhooks, verifying CA bundle updates across different revision and webhook scenarios\"\n      },\n      {\n ...",
+      "latency_seconds": 3.34
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "webhookpatch",
+        "channels": [
+          "classes",
+          "functions",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[classes] 0 results for \\\"webhookpatch\\\". Try a PARTIAL class name (e.g. \\\"Auth\\\" instead of \\\"AuthenticationServiceImpl\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"functions\": {\n    \"data\": [\n      {\n     ...",
+      "latency_seconds": 1.259
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "CA bundle injection webhook",
+        "channels": [
+          "purpose",
+          "functions",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"cmd/startupapicheck/pkg/check/api/api.go\",\n        \"purpose\": \"This file implements the 'api' subcommand for the cert-manager startupapicheck tool. It provides a command-line interface to verify that the cert-manager API is ready by polling the Kubernetes API server and checking that CRDs are installed and webhooks are reachable.\"\n      },\n      {\n        \"path\": \"deploy/charts/cert-manager/templates/rbac.yaml\",\n        \"purpose\": \"Defines ...",
+      "latency_seconds": 2.072
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pkg/webhooks/webhookpatch.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pkg/webhooks/webhookpatch.go\",\n      \"purpose\": \"Manages webhook certificate patching for Istio webhook configurations, ensuring CA bundles are updated when certificates change\",\n      \"summary\": \"{\\\"Rate Limiter\\\":\\\"Uses fast-slow rate limiter with 5 quick retries then slows down to prevent API server overload\\\",\\\"Revision Validation\\\":\\\"Ensures we...",
+      "latency_seconds": 0.141
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pkg/webhooks/webhookpatch.go"
+      },
+      "result_preview": "# pkg/webhooks/webhookpatch.go\nLines: 1 - 186 of 186\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under the License is distributed on an \"AS IS\" BASIS,\n1...",
+      "latency_seconds": 1.363
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pkg/webhooks/webhookpatch_test.go",
+          "pkg/webhooks/monitoring.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pkg/webhooks/webhookpatch_test.go\",\n      \"purpose\": \"Tests webhook certificate patching functionality for Istio admission webhooks, verifying CA bundle updates across different revision and webhook scenarios\",\n      \"summary\": \"{\\\"Test Scenarios\\\":\\\"Comprehensive test coverage for webhook patching including revision matching, webhook discovery, and...",
+      "latency_seconds": 0.181
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pkg/webhooks/webhookpatch_test.go"
+      },
+      "result_preview": "# pkg/webhooks/webhookpatch_test.go\nLines: 1 - 302 of 302\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under the License is distributed on an \"AS IS\" BAS...",
+      "latency_seconds": 1.136
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pkg/webhooks/monitoring.go"
+      },
+      "result_preview": "# pkg/webhooks/monitoring.go\nLines: 1 - 73 of 73\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under the License is distributed on an \"AS IS\" BASIS,\n11 | ...",
+      "latency_seconds": 0.443
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NewWebhookCertPatcher",
+        "channels": [
+          "functions",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/webhooks/webhookpatch.go\",\n        \"purpose\": \"Manages webhook certificate patching for Istio webhook configurations, ensuring CA bundles are updated when certificates change\"\n      }\n    ],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 1,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    }\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"p...",
+      "latency_seconds": 0.486
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "WebhookCertPatcher",
+        "channels": [
+          "classes",
+          "functions",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/webhooks/webhookpatch.go\",\n        \"purpose\": \"Manages webhook certificate patching for Istio webhook configurations, ensuring CA bundles are updated when certificates change\"\n      }\n    ],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 1,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    }\n  },\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/webhooks/webhookpa...",
+      "latency_seconds": 1.98
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "istio.io/istio/pkg/webhooks",
+        "channels": [
+          "imports"
+        ]
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pilot/pkg/bootstrap/sidecarinjector.go\",\n        \"purpose\": \"The file initializes and registers the Istio sidecar injection mutating webhook, selecting configuration from local files or a ConfigMap, and optionally patches its TLS certificate based on feature flags.\"\n      },\n      {\n        \"path\": \"pilot/pkg/bootstrap/validation.go\",\n        \"purpose\": \"Provides the bootstrap logic for Istio Pilot to start the configuration validation serv...",
+      "latency_seconds": 2.774
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/bootstrap/sidecarinjector.go",
+          "pilot/pkg/serviceregistry/kube/controller/multicluster.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/bootstrap/sidecarinjector.go\",\n      \"purpose\": \"The file initializes and registers the Istio sidecar injection mutating webhook, selecting configuration from local files or a ConfigMap, and optionally patches its TLS certificate based on feature flags.\",\n      \"summary\": \"{\\\"Webhook Initialization\\\":\\\"Creates the mutating webhook using in...",
+      "latency_seconds": 0.433
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pilot/pkg/bootstrap/sidecarinjector.go"
+      },
+      "result_preview": "# pilot/pkg/bootstrap/sidecarinjector.go\nLines: 1 - 122 of 122\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under the License is distributed on an \"AS IS...",
+      "latency_seconds": 0.463
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pilot/pkg/serviceregistry/kube/controller/multicluster.go",
+        "fromLine": 1,
+        "toLine": 200
+      },
+      "result_preview": "# pilot/pkg/serviceregistry/kube/controller/multicluster.go\nLines: 1 - 200 of 366\nMore: fromLine=201\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under t...",
+      "latency_seconds": 0.795
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pilot/pkg/serviceregistry/kube/controller/multicluster.go",
+        "fromLine": 200,
+        "toLine": 366
+      },
+      "result_preview": "# pilot/pkg/serviceregistry/kube/controller/multicluster.go\nLines: 200 - 366 of 366\n\n200 | \t\t\tgo configStore.Run(clusterStopCh)\n201 | \t\t}\n202 | \t}\n203 | \n204 | \t// run after WorkloadHandler is added\n205 | \tif cluster.Action == multicluster.Update {\n206 | \t\t// For updates, wait for sync then atomically replace the registry.\n207 | \t\t// This ensures zero service disruption during credential rotation.\n208 | \t\tgo func() {\n209 | \t\t\t// Wait for the new cluster to sync\n210 | \t\t\t<-cluster.SyncedCh\n211 | ...",
+      "latency_seconds": 1.111
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "keycertbundle.Watcher",
+        "channels": [
+          "classes",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[classes] 0 results for \\\"keycertbundle.Watcher\\\". Try a PARTIAL class name (e.g. \\\"Auth\\\" instead of \\\"AuthenticationServiceImpl\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    ...",
+      "latency_seconds": 0.56
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "pilot/pkg/keycertbundle",
+        "channels": [
+          "paths"
+        ]
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"pilot/pkg/keycertbundle/watcher.go\",\n        \"purpose\": \"Manages certificate and key bundles for istiod, providing thread-safe access and notification to watchers when certificates are updated\"\n      },\n      {\n        \"path\": \"pilot/pkg/keycertbundle/watcher_test.go\",\n        \"purpose\": \"Unit tests for the keycertbundle watcher component, verifying notification behavior and file-based initialization\"\n      }\n    ],\n    \"pagination\": {\n      ...",
+      "latency_seconds": 0.581
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/keycertbundle/watcher.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/keycertbundle/watcher.go\",\n      \"purpose\": \"Manages certificate and key bundles for istiod, providing thread-safe access and notification to watchers when certificates are updated\",\n      \"summary\": \"{\\\"Thread Safety\\\":\\\"Uses RWMutex to provide concurrent read access and exclusive write access to certificate bundle\\\",\\\"Observer Pattern\\\":...",
+      "latency_seconds": 0.118
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pilot/pkg/keycertbundle/watcher.go"
+      },
+      "result_preview": "# pilot/pkg/keycertbundle/watcher.go\nLines: 1 - 142 of 142\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under the License is distributed on an \"AS IS\" BA...",
+      "latency_seconds": 0.429
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "LoadCABundle",
+        "channels": [
+          "functions",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/webhooks/util/util.go\",\n        \"purpose\": \"Provides utilities for loading and verifying CA bundles used by Istio webhooks. Defines a ConfigError type for enriched error reporting and functions to retrieve a CA bundle from a watcher and ensure it is a valid PEM-encoded X509 certificate. Other webhook components import this package to obtain trusted CA data.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/apiserver/pkg/server/dyn...",
+      "latency_seconds": 2.21
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pkg/webhooks/util/util.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pkg/webhooks/util/util.go\",\n      \"purpose\": \"Provides utilities for loading and verifying CA bundles used by Istio webhooks. Defines a ConfigError type for enriched error reporting and functions to retrieve a CA bundle from a watcher and ensure it is a valid PEM-encoded X509 certificate. Other webhook components import this package to obtain truste...",
+      "latency_seconds": 0.127
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pkg/webhooks/util/util.go"
+      },
+      "result_preview": "# pkg/webhooks/util/util.go\nLines: 1 - 61 of 61\n\n1 | // Copyright Istio Authors\n2 | //\n3 | // Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | // you may not use this file except in compliance with the License.\n5 | // You may obtain a copy of the License at\n6 | //\n7 | //     http://www.apache.org/licenses/LICENSE-2.0\n8 | //\n9 | // Unless required by applicable law or agreed to in writing, software\n10 | // distributed under the License is distributed on an \"AS IS\" BASIS,\n11 | /...",
+      "latency_seconds": 0.456
+    }
+  ],
+  "error": ""
+}

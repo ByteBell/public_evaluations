@@ -1,0 +1,470 @@
+{
+  "model": "openai/gpt-5.1-codex-mini",
+  "answer": "### 1. Architecture Overview\n\nThe Kubernetes informer stack centres on `SharedInformer` (`staging/src/k8s.io/client-go/tools/cache/shared_informer.go`, lines 40\u2011238). This interface exposes lifecycle management (start/stop), event handler registration, cache inspection, and error/transform hooks; its implementation (`sharedIndexInformer` starting around line 416) wires together a LIST/Watch loop, cache store (`Indexer`/`Store`), and shared processor/listener machinery to distribute events to registered handlers while maintaining resync schedules. Informer consumers (e.g., OpenTelemetry receiver components) instantiate `SharedInformer`s via factory helpers (`cache.NewSharedInformer`, `NewSharedIndexInformer`, etc.) and rely on `HasSynced`/`WaitForCacheSync` (provided in the same file around lines 357\u2011415) to ensure caches are seeded before acting.\n\nAdding `WaitForCacheSync(ctx context.Context) bool` to the interface obliges every consumer and wrapper (custom factories, resource watchers, informer providers) to surface a context-aware synchronization primitive. In downstream repos, SharedInformer instances are created and interacted with via helpers that expect the existing interface (e.g., `k8sconfig.NewNodeSharedInformer`, the `resourceWatcher` and informer provider helpers, kubeletstatsreceiver scraper). All these components must now implement or forward the new context-aware wait method when wrapping or embedding the interface.\n\n### 2. Detailed Analysis\n\n#### SharedInformer definition and behavior\n- The `SharedInformer` interface is defined at `staging/src/k8s.io/client-go/tools/cache/shared_informer.go` lines 40\u2011238. It currently exposes methods for adding/removing handlers, starting (`Run`, `RunWithContext`), synchronization (`HasSynced`, `HasStarted`), store/index access, error hooks, and lifecycle status. There is no context-aware cache-sync method yet. Implementations rely on `sharedIndexInformer` (line 416 onwards) which maintains the controller, store, transformer, and error handlers. This is the canonical contract all consumers implement or wrap.  \n  *(Source: shared_informer.go sections around lines 40\u2011238 and the `sharedIndexInformer` implementation starting at line 416.)*\n\n- Wait helpers (`WaitForCacheSync`, `WaitForNamedCacheSync`, etc.) are implemented in the same file (lines 357\u2011415), expecting functions that map informers to `HasSynced`. They currently do not accept `context.Context`. The new requirement means this shared helper or the interface must provide a `WaitForCacheSync(ctx context.Context)` method to expose context cancellation.\n\n#### Downstream consumers wrapping SharedInformer\n\n- `internal/k8sconfig/config.go` defines `NewNodeSharedInformer`, returning a `cache.SharedInformer` (lines 191\u2011211). It relies on `cache.NewSharedInformer` (client-go) and does not wrap or extend the interface but returns it directly to callers. Consumers using this helper will now expect the interface to expose the new method; no additional wrapping is needed.  \n  *(Source: internal/k8sconfig/config.go lines 191\u2011211)*\n\n- `processor/k8sattributesprocessor/internal/kube/informer.go` centralizes informer creation for Pods, Namespaces, deployments, etc., returning `cache.SharedInformer`. While these functions do not wrap the interface, any custom structures or tests (e.g., the fake informers in `processor/k8sattributesprocessor/internal/kube/informer_test.go`) that implement `cache.SharedInformer` must add the new method to their implementations to satisfy the interface and any compile-time checks.  \n  *(Sources: informer.go section summaries around lines 52\u2011265; tests at informer_test.go lines 20\u2011276.)*\n\n- `receiver/k8sclusterreceiver/watcher.go` uses a `sharedInformer` interface (line 48) and orchestrates multiple informers, starts them, and waits for initial cache sync via `waitForInitialInformerSync` (lines 388\u2011400). That helper likely relies on the existing `HasSynced`-based `WaitForCacheSync`. The new method must be surfaced wherever the watcher waits for synchronizations: either by calling the new context-aware method on each informer or adapting its existing sync loop.\n\n- `receiver/k8sclusterreceiver/watcher_test.go` and the kubelet stats scraper (`receiver/kubeletstatsreceiver/scraper.go` lines 103\u2011226) also instantiate informers and, in tests, implement fake versions. They must implement the new method to satisfy the interface and any helper functions that expect the context-aware wait.\n\n#### Impact of the new method\n\n- **Custom informers/factories**: Any generated informer wrappers (e.g., code under `pkg/client/informers/externalversions/...` in multiple repos such as cert-manager, Argo CD, Cilium, vertical-pod-autoscaler) either embed or return `cache.SharedInformer`. If they wrap the interface (e.g., to add logging or metrics), they must now implement `WaitForCacheSync(ctx context.Context)` and forward it to the underlying informer.\n\n- **Tests with fake informers**: Files like `processor/k8sattributesprocessor/internal/kube/informer_test.go` create fake informer implementations, which now must stub the new method.\n\n- **Synchronization helpers**: Any helper that waits for informers to sync (e.g., `resourceWatcher.waitForInitialInformerSync`) may prefer to call the new method directly instead of relying on global `WaitForCacheSync` helper; this might require passing contexts through to propagate cancellation/timeouts.\n\n### 3. Relevant Files\n\n| Repo (knowledgeId) | File Path | Why |\n|-------------------|-----------|-----|\n| `861aece6-9526-4522-8e22-4699961b1c9c` | `staging/src/k8s.io/client-go/tools/cache/shared_informer.go` | Defines the `SharedInformer` interface and helper synchronization functions; the new `WaitForCacheSync(ctx context.Context)` method must be added here and implemented by `sharedIndexInformer`. |\n| `11013c10-9fdc-4638-8651-c1f2abb23c81` | `internal/k8sconfig/config.go` | Creates `cache.SharedInformer` for node resources; consumers rely on the interface and may need to expose the new context-aware sync method. |\n| `11013c10-9fdc-4638-8651-c1f2abb23c81` | `processor/k8sattributesprocessor/internal/kube/informer.go` | Provides enriched informer factories returning `cache.SharedInformer`; any wrappers or tests must implement the new method. |\n| `11013c10-9fdc-4638-8651-c1f2abb23c81` | `processor/k8sattributesprocessor/internal/kube/informer_test.go` | Contains fake informer implementations for testing; they must now satisfy the extended interface with `WaitForCacheSync(ctx context.Context)`. |\n| `11013c10-9fdc-4638-8651-c1f2abb23c81` | `receiver/k8sclusterreceiver/watcher.go` | Manages informer lifecycles and waits for cache sync; needs to call or forward the new context-aware sync method and update helper logic accordingly. |\n| `11013c10-9fdc-4638-8651-c1f2abb23c81` | `receiver/k8sclusterreceiver/watcher_test.go` | Tests informer-based sync and metadata flows; any fake informers or watchers must include the new method. |\n| `11013c10-9fdc-4638-8651-c1f2abb23c81` | `receiver/kubeletstatsreceiver/scraper.go` | Uses informers (with cache sync) for node capacity data; if the scraper or its helpers wrap `SharedInformer`, they must support the new method to allow context-aware waits. |\n\n**Note**: Additional generated informer files across other repositories (cert-manager, Argo CD, Cilium, etc.) that return or wrap `cache.SharedInformer` are implicitly affected because they must satisfy the modified interface. Every fake informer or wrapper built on top of `SharedInformer` in any repo (identified via the earlier `graph_search` results) needs the new method; above we listed the key files that most directly interface with the shared informer.",
+  "cost": {
+    "input_tokens": 1347533,
+    "output_tokens": 13584,
+    "total_tokens": 1361117,
+    "cost_usd": 0.364051
+  },
+  "status": "success",
+  "latency_seconds": 173.29,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.093
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.242
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/client-go/tools/cache/shared_informer.go\",\n        \"purpose\": \"Provides the shared informer implementation used by Kubernetes controllers to watch resources, cache objects, and distribute change notifications to multiple handlers efficiently. It defines interfaces, structs, and the core processing loop that synchronizes the local cache with the API server and supports resync periods.\"\n      },\n      {\n        \"pa...",
+      "latency_seconds": 0.637
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer interface",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"staging/src/k8s.io/apiextensions-apiserver/examples/client-go/pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n        \"purpose\": \"Provides internal interfaces for the client-go informer factory to avoid import cycles. It defines the SharedInformerFactory interface and supporting types for creating and managing informers in a decoupled manner.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/client-go/dy...",
+      "latency_seconds": 0.541
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "WaitForCacheSync",
+        "channels": [
+          "functions",
+          "keywords",
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/client-go/tools/cache/shared_informer.go\",\n        \"purpose\": \"Provides the shared informer implementation used by Kubernetes controllers to watch resources, cache objects, and distribute change notifications to multiple handlers efficiently. It defines interfaces, structs, and the core processing loop that synchronizes the local cache with the API server and supports resync periods.\"\n      },\n      {\n        \"...",
+      "latency_seconds": 0.683
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "staging/src/k8s.io/client-go/tools/cache/shared_informer.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/tools/cache/shared_informer.go\",\n      \"purpose\": \"staging/src/k8s.io/client-go/tools/cache/shared_informer.go#chunk0: This chunk defines the core interfaces, structs, and functions for SharedInformers in Kubernetes client-go, enabling cached, eventually consistent access to API object collections with event notification...",
+      "latency_seconds": 0.139
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [],
+        "relativePath": "staging/src/k8s.io/client-go/tools/cache/shared_informer.go",
+        "fromLine": 40,
+        "toLine": 238,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# staging/src/k8s.io/client-go/tools/cache/shared_informer.go\nLines: 40 - 238 of 1160\nMore: fromLine=239\n\n40 | \n41 | // SharedInformer provides eventually consistent linkage of its\n42 | // clients to the authoritative state of a given collection of\n43 | // objects.  An object is identified by its API group, kind/resource,\n44 | // namespace (if any), and name; the `ObjectMeta.UID` is not part of\n45 | // an object's ID as far as this contract is concerned.  One\n46 | // SharedInformer provides link...",
+      "latency_seconds": 1.75
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "level": 1,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"The repository is a layered, code\u00e2\u0080\u0091generated, type\u00e2\u0080\u0091safe Kubernetes platform. At its core lies the API machinery that defines versioned schemas, runtime schemes, and serialization. Built on top of this, auto\u00e2\u0080\u0091generated client libraries, informers, and listers provide declarative, event\u00e2\u0080\u0091driven access to resources. Admission control, validation, and webhook frameworks enforce security and policy using CEL expressions...",
+      "latency_seconds": 0.176
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "0bf65098-3076-481c-940a-c65298663392",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"p...",
+      "latency_seconds": 0.688
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"internal/k8sconfig/config.go\",\n        \"purpose\": \"This file provides Kubernetes client configuration and initialization utilities for the OpenTelemetry Collector Contrib project. It abstracts authentication mechanisms (none, service account, kubeconfig, TLS) and exposes factory functions to create Kubernetes API clients (core, dynamic, OpenShift quota) with consistent configuration. It also provides a helper to create a SharedInformer for ...",
+      "latency_seconds": 0.646
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"p...",
+      "latency_seconds": 0.629
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"p...",
+      "latency_seconds": 0.598
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "35e89bea-571d-4ea9-9cbc-21cf45f4c6bc",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"p...",
+      "latency_seconds": 0.6
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"p...",
+      "latency_seconds": 0.612
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923db2a28",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"p...",
+      "latency_seconds": 0.625
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"classes\": {\n    \"data\": [\n      {\n...",
+      "latency_seconds": 0.662
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "cache.SharedInformer",
+        "channels": [
+          "keywords",
+          "imports",
+          "functions",
+          "classes"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"cluster-autoscaler/loop/trigger.go\",\n        \"purpose\": \"This file implements the loop trigger mechanism for the Cluster Autoscaler, determining when to start a new autoscaling iteration based on recent scaling activity, provisioning request processing, and unschedulable pod events. It acts as the scheduler's decision gate, combining time-based and event-driven triggers to optimize responsiveness and throughput.\"\n      },\n      {\n        \"...",
+      "latency_seconds": 0.554
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer interface {",
+        "channels": [
+          "classes",
+          "functions",
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/github.com/json-iterator/go/reflect_dynamic.go\",\n        \"purpose\": \"Provides dynamic JSON encoding and decoding for Go's interface{} and reflect2 types, enabling runtime type resolution for serialization in the jsoniter library.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/client-go/tools/cache/shared_informer.go\",\n        \"purpose\": \"Provides the shared informer implementation used by Kubernetes cont...",
+      "latency_seconds": 1.229
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "internal/k8sconfig/config.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"internal/k8sconfig/config.go\",\n      \"purpose\": \"This file provides Kubernetes client configuration and initialization utilities for the OpenTelemetry Collector Contrib project. It abstracts authentication mechanisms (none, service account, kubeconfig, TLS) and exposes factory functions to create Kubernetes API clients (core, dynamic, OpenShift quot...",
+      "latency_seconds": 0.118
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [],
+        "relativePath": "internal/k8sconfig/config.go",
+        "fromLine": 191,
+        "toLine": 211,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# internal/k8sconfig/config.go\nLines: 191 - 211 of 212\nMore: fromLine=212\n\n191 | func NewNodeSharedInformer(client k8s.Interface, nodeName string, watchSyncPeriod time.Duration) cache.SharedInformer {\n192 | \tinformer := cache.NewSharedInformer(\n193 | \t\t&cache.ListWatch{\n194 | \t\t\tListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {\n195 | \t\t\t\tif nodeName != \"\" {\n196 | \t\t\t\t\topts.FieldSelector = fields.OneTermEqualSelector(\"metadata.name\", nodeName).String()\n197 | \t\t\t\t}\n198 | \t\t\t\treturn...",
+      "latency_seconds": 1.478
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "processor/k8sattributesprocessor/internal/kube/informer.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"processor/k8sattributesprocessor/internal/kube/informer.go\",\n      \"purpose\": \"This file implements Kubernetes informer providers for watching and syncing various Kubernetes resources (Pods, Namespaces, ReplicaSets, Deployments, StatefulSets, DaemonSets, Jobs) using client-go's SharedInformer framework. It centralizes informer creation logic with su...",
+      "latency_seconds": 0.111
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "processor/k8sattributesprocessor/internal/kube/informer_test.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"processor/k8sattributesprocessor/internal/kube/informer_test.go\",\n      \"purpose\": \"This file contains unit tests for Kubernetes informer factory functions in the k8sattributesprocessor, verifying correct instantiation of shared informers for various Kubernetes resources (Pods, Deployments, StatefulSets, DaemonSets, Jobs, ReplicaSets) and namespace-...",
+      "latency_seconds": 0.113
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/k8sclusterreceiver/watcher.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/k8sclusterreceiver/watcher.go\",\n      \"purpose\": \"This file implements a Kubernetes resource watcher that observes cluster resources (Pods, Nodes, Deployments, etc.) via informers and synchronizes metadata updates to configured consumers. It handles initial cache synchronization, event handling (add/update/delete), and metadata export to bo...",
+      "latency_seconds": 0.114
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/k8sclusterreceiver/watcher_test.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/k8sclusterreceiver/watcher_test.go\",\n      \"purpose\": \"Unit test file for the k8sclusterreceiver's resourceWatcher component, verifying metadata synchronization, informer factory setup, and Kubernetes resource metadata extraction logic. It tests entity event generation for pod lifecycle changes and validates metadata mapping for various Kub...",
+      "latency_seconds": 0.107
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "receiver/kubeletstatsreceiver/scraper.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 1000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"receiver/kubeletstatsreceiver/scraper.go\",\n      \"purpose\": \"This file implements a Kubernetes metrics scraper for the kubeletstatsreceiver, responsible for collecting node, pod, and container metrics from the kubelet API endpoints (/stats/summary and /pods) and transforming them into OpenTelemetry metrics. It handles metadata enrichment, PVC label ...",
+      "latency_seconds": 0.111
+    }
+  ],
+  "error": ""
+}

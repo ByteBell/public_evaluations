@@ -1,0 +1,309 @@
+{
+  "model": "x-ai/grok-code-fast-1",
+  "answer": "### 1. Architecture Overview\nThe Grafana Loki datasource is implemented as a built-in (core) plugin within Grafana, following the backend plugin architecture. The request/data flow starts from the Grafana frontend, which sends a query request to the Grafana API server. The API server routes the request to the appropriate datasource instance. For the Loki standalone datasource, this is handled by the `Datasource` struct in `pkg/tsdb/loki/standalone/datasource.go`, which acts as a thin adapter delegating to the core `Service` in `pkg/tsdb/loki/loki.go`. The `Service` orchestrates query parsing, execution against the Loki API (via `pkg/tsdb/loki/api.go`), response processing (via `pkg/tsdb/loki/frame.go`), and health checks (via `pkg/tsdb/loki/healthcheck.go`). Results are formatted into Grafana data frames and returned upstream.\n\nThe `QueryData` method is part of the `backend.QueryDataHandler` interface (defined in the external Grafana Plugin SDK), implemented by all datasources. The proposed change adds a `stream bool` parameter to enable streaming query support, likely for handling large or real-time data responses from Loki. This affects API compatibility because it alters the interface signature, requiring updates to all implementations, callers, and related infrastructure across the plugin system, middleware, and testing frameworks.\n\n### 2. Detailed Analysis\n- **Current Signature and Delegation**: In `pkg/tsdb/loki/standalone/datasource.go`, the `QueryData` method currently has the signature `func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error)` and delegates to `d.Service.QueryData(ctx, req)`. In `pkg/tsdb/loki/loki.go`, the `Service.QueryData` method has the same signature and calls the internal `queryData` function with parsed parameters. The `queryData` function handles query execution, API calls, and response aggregation.\n\n- **Proposed Changes**: \n  - Update `Datasource.QueryData` to `func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest, stream bool) (*backend.QueryDataResponse, error)` and pass `stream` to `d.Service.QueryData(ctx, req, stream)`.\n  - Update `Service.QueryData` to `func (s *Service) QueryData(ctx context.Context, req *backend.QueryDataRequest, stream bool) (*backend.QueryDataResponse, error)` and pass `stream` to `queryData(ctx, req, dsInfo, responseOpts, tracer, logger, runInParallel, logQLScopes, stream)`.\n  - Update the `queryData` function to `func queryData(ctx context.Context, req *backend.QueryDataRequest, dsInfo *datasourceInfo, responseOpts ResponseOpts, tracer trace.Tracer, plog log.Logger, runInParallel bool, logQLScopes bool, stream bool) (*backend.QueryDataResponse, error)`. The `stream` parameter would likely control whether to use streaming API calls (e.g., via `pkg/tsdb/loki/api.go`) or adjust response handling in `pkg/tsdb/loki/frame.go` for chunked data.\n\n- **Data Flow Impact**: The `stream` parameter flows from the datasource interface through the service layer to the API execution. If `stream` is `true`, it may enable WebSocket-based or chunked responses from Loki, affecting how `pkg/tsdb/loki/api.go` constructs HTTP requests and how `pkg/tsdb/loki/frame.go` processes results. This could integrate with Grafana's streaming features (e.g., via `backend.StreamHandler`).\n\n- **Compatibility Impact**: This is a breaking change to the `backend.QueryDataHandler` interface. All datasources (built-in like Prometheus, Elasticsearch, Tempo, etc., and external plugins) must update their `QueryData` implementations. Callers in the plugin system (e.g., `pkg/aggregator/apiserver/plugin/query.go`, `pkg/plugins/backendplugin/coreplugin/core_plugin.go`) must pass the `stream` value (likely derived from request context or configuration). Middleware (e.g., caching, tracing) and tests must be updated. The protobuf definitions in the Plugin SDK may need changes for gRPC plugins.\n\n- **Cross-Repo Impact**: No direct cross-repo dependencies, as this is within Grafana. However, external plugins (not in this codebase) would break unless updated to match the new interface.\n\n### 3. Relevant Files\nThe following table lists EVERY relevant file identified across all repos and layers (DB, backend, frontend, config, infra). Files are grouped by category for clarity, but all are included. The change requires updating signatures in implementations and calls in callers. Files with \"QueryData\" functions are primarily affected, as are related API, middleware, and test files.\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| grafana | pkg/tsdb/loki/standalone/datasource.go | Defines the Loki standalone datasource's QueryData method (signature change required; delegates to Service). |\n| grafana | pkg/tsdb/loki/loki.go | Defines the Service.QueryData method and queryData function (signature changes required; orchestrates query execution). |\n| grafana | pkg/tsdb/loki/api.go | Handles Loki API calls (may need updates for streaming if stream parameter affects request construction). |\n| grafana | pkg/tsdb/loki/frame.go | Processes query responses into data frames (may need updates for streaming response handling). |\n| grafana | pkg/tsdb/loki/healthcheck.go | Health check implementation (unrelated to QueryData, but part of datasource). |\n| grafana | pkg/tsdb/loki/healthcheck_test.go | Tests for health check (unrelated to QueryData). |\n| grafana | pkg/aggregator/apiserver/plugin/query.go | Calls QueryData on plugins (caller; must pass stream parameter). |\n| grafana | pkg/aggregator/apiserver/plugin/query_test.go | Tests for query handler (must update for new signature). |\n| grafana | pkg/api/ds_query.go | API endpoint for datasource queries (calls QueryData; must pass stream). |\n| grafana | pkg/api/ds_query_test.go | Tests for ds_query (must update). |\n| grafana | pkg/api/plugins_test.go | Plugin API tests (may reference QueryData). |\n| grafana | pkg/apis/datasource/v0alpha1/query.go | API types for datasource queries (may define request structures). |\n| grafana | pkg/apis/datasource/v0alpha1/query_test.go | Tests for query types. |\n| grafana | pkg/expr/query_convert.go | Converts query structures (may interact with QueryData). |\n| grafana | pkg/expr/service_test.go | Expression service tests. |\n| grafana | pkg/plugins/backendplugin/coreplugin/core_plugin.go | Core plugin wrapper for QueryData (caller; must pass stream). |\n| grafana | pkg/plugins/backendplugin/grpcplugin/client_proto.go | gRPC client proto handling. |\n| grafana | pkg/plugins/backendplugin/grpcplugin/client_v2.go | gRPC client QueryData implementation (signature change required). |\n| grafana | pkg/plugins/backendplugin/grpcplugin/grpc_plugin.go | gRPC plugin wrapper. |\n| grafana | pkg/plugins/instrumentationutils/request_status.go | Request status utilities (may handle QueryData responses). |\n| grafana | pkg/plugins/instrumentationutils/request_status_test.go | Tests for request status. |\n| grafana | pkg/plugins/manager/client/client.go | Plugin client wrapper (calls QueryData; must pass stream). |\n| grafana | pkg/plugins/manager/client/client_test.go | Tests for client. |\n| grafana | pkg/plugins/manager/pluginfakes/fakes.go | Fake plugin implementations (QueryData signature change required). |\n| grafana | pkg/plugins/plugins.go | Plugin definitions. |\n| grafana | pkg/aggregator/apiserver/plugin/fakes/client.go | Fake client for tests (QueryData signature change required). |\n| grafana | pkg/promlib/querydata/request.go | Prometheus datasource QueryData implementation (signature change required for compatibility). |\n| grafana | pkg/promlib/querydata/response_test.go | Tests for response handling. |\n| grafana | pkg/promlib/querydata/framing_test.go | Tests for framing. |\n| grafana | pkg/promlib/library.go | Prometheus service. |\n| grafana | pkg/promlib/instrumentation/instrumentation.go | Instrumentation for queries. |\n| grafana | pkg/promlib/instrumentation/instrumentation_test.go | Tests for instrumentation. |\n| grafana | pkg/tsdb/elasticsearch/querydata_test.go | Elasticsearch query tests. |\n| grafana | pkg/services/caching/service.go | Caching service (wraps QueryData calls; must pass stream). |\n| grafana | pkg/services/caching/service_test.go | Tests for caching. |\n| grafana | pkg/services/query/query.go | Query service (calls QueryData; must pass stream). |\n| grafana | pkg/services/ngalert/api/lotex_prom.go | Alerting API for datasources. |\n| grafana | pkg/services/ngalert/api/lotex_ruler.go | Ruler API. |\n| grafana | pkg/services/ngalert/api/util_test.go | Tests for API utils. |\n| grafana | pkg/services/ngalert/eval/eval.go | Alert evaluation (calls QueryData; must pass stream). |\n| grafana | pkg/services/ngalert/eval/eval_test.go | Tests for eval. |\n| grafana | pkg/services/ngalert/schedule/recording_rule.go | Recording rules (calls QueryData; must pass stream). |\n| grafana | pkg/services/ngalert/prom/query.go | Prom query helpers. |\n| grafana | pkg/services/ngalert/store/range_to_instant.go | Query optimization. |\n| grafana | pkg/services/publicdashboards/service/query.go | Public dashboards query (calls QueryData; must pass stream). |\n| grafana | pkg/services/publicdashboards/service/query_test.go | Tests for query. |\n| grafana | pkg/registry/apis/datasource/noop.go | No-op REST storage. |\n| grafana | pkg/registry/apis/datasource/queryconvert.go | Query conversion (calls QueryData; must pass stream). |\n| grafana | pkg/registry/apis/datasource/queryconvert_test.go | Tests for conversion. |\n| grafana | pkg/registry/apis/datasource/sub_query.go | Sub-query handling (calls QueryData; must pass stream). |\n| grafana | pkg/registry/apis/datasource/sub_query_test.go | Tests for sub-query. |\n| grafana | pkg/registry/apis/query/client/plugin.go | Query client (calls QueryData; must pass stream). |\n| grafana | pkg/registry/apis/query/query.go | Query REST handler (calls QueryData; must pass stream). |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/caching_middleware.go | Caching middleware (wraps QueryData; must pass stream). |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/caching_middleware_test.go | Tests for caching middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/clear_auth_headers_middleware.go | Auth headers middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/contextual_logger_middleware.go | Logger middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/cookies_middleware.go | Cookies middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/forward_id_middleware.go | ID forwarding middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/grafana_request_id_header_middleware.go | Request ID middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/httpclient_middleware.go | HTTP client middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/logger_middleware.go | Logger middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go | Metrics middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware.go | OAuth middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware_test.go | Tests for OAuth middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/tracing_header_middleware.go | Tracing headers middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/tracing_middleware.go | Tracing middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/tracing_middleware_test.go | Tests for tracing middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware.go | Alerting headers middleware. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware_test.go | Tests for alerting headers. |\n| grafana | pkg/services/pluginsintegration/clientmiddleware/user_header_middleware.go | User header middleware. |\n| grafana | pkg/tsdb/tempo/standalone/datasource.go | Tempo datasource (similar pattern; QueryData signature change required). |\n| grafana | pkg/tsdb/parca/standalone/datasource.go | Parca datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/parca/plugin.go | Parca plugin. |\n| grafana | pkg/tsdb/parca/service.go | Parca service. |\n| grafana | pkg/tsdb/cloud-monitoring/standalone/datasource.go | Cloud Monitoring datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/graphite/standalone/datasource.go | Graphite datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/grafana-pyroscope-datasource/standalone/datasource.go | Pyroscope datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/jaeger/standalone/datasource.go | Jaeger datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/opentsdb/standalone/datasource.go | OpenTSDB datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/grafana-testdata-datasource/standalone/datasource.go | Test data datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/zipkin/standalone/datasource.go | Zipkin datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/elasticsearch/standalone/datasource.go | Elasticsearch datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/azuremonitor/standalone/datasource.go | Azure Monitor datasource (similar; QueryData change). |\n| grafana | pkg/tsdb/cloudwatch/cloudwatch.go | CloudWatch datasource. |\n| grafana | pkg/tsdb/cloud-monitoring/cloudmonitoring.go | Cloud Monitoring service. |\n| grafana | pkg/tsdb/elasticsearch/elasticsearch.go | Elasticsearch service. |\n| grafana | pkg/tsdb/jaeger/jaeger.go | Jaeger service. |\n| grafana | pkg/tsdb/tempo/tempo.go | Tempo service. |\n| grafana | pkg/tests/api/loki/loki_test.go | Loki datasource tests (must update for signature). |\n| grafana | apps/alerting/historian/pkg/app/notification/lokireader.go | Loki reader for alerting. |\n| grafana | apps/alerting/historian/pkg/app/notification/lokireader_test.go | Tests for Loki reader. |\n| grafana | apps/alerting/historian/pkg/app/config/config.go | Config for Loki integration. |\n| grafana | apps/alerting/historian/pkg/app/config/config_test.go | Tests for config. |\n| grafana | apps/alerting/historian/pkg/app/notification/notification.go | Notification handler. |\n| grafana | apps/dashvalidator/pkg/cache/provider.go | Cache provider for datasources. |\n| grafana | apps/provisioning/pkg/loki/client.go | Loki client for provisioning. |\n| grafana | apps/provisioning/pkg/loki/client_test.go | Tests for client. |\n| grafana | pkg/services/ngalert/api/lotex_prom.go | Lotex API. |\n| grafana | pkg/services/ngalert/api/lotex_ruler.go | Lotex ruler. |\n| grafana | pkg/services/ngalert/api/util_test.go | API utils tests. |\n| grafana | pkg/services/ngalert/prom/query.go | Prom query. |\n| grafana | pkg/services/ngalert/store/range_to_instant.go | Range to instant. |\n| grafana | pkg/logql/bench/grafana-datasource.yaml | Benchmark config. |\n| grafana | operator/docs/user-guides/howto_connect_grafana.md | Docs for connecting Grafana. |\n| grafana | docs/sources/setup/install/helm/reference.md | Helm reference. |\n| grafana | docs/sources/setup/migrate/ssd-to-distributed/_index.md | Migration docs. |\n| grafana | production/helm/loki/src/dashboards/loki-operational.json | Dashboard config. |\n| grafana | operator/api/loki/v1beta1/lokistack_types_test.go | Operator tests. |\n| grafana | operator/bundle/community/manifests/loki-operator.clusterserviceversion.yaml | Operator manifest. |\n| grafana | pkg/storage/store_test.go | Storage tests. |\n| grafana | README.md | Loki README. |\n| grafana | AGENTS.md | Agents guide. |\n| loki | clients/cmd/docker-driver/README.md | Docker driver docs. |\n| loki | clients/cmd/docker-driver/config.go | Config. |\n| loki | clients/cmd/docker-driver/config.json | Config JSON. |\n| loki | clients/cmd/docker-driver/driver.go | Driver. |\n| loki | clients/cmd/docker-driver/loki.go | Loki integration. |\n| loki | clients/cmd/docker-driver/loki_test.go | Tests. |\n| loki | clients/cmd/docker-driver/main.go | Main. |\n| loki | clients/cmd/fluent-bit/README.md | Fluent Bit docs. |\n| loki | clients/cmd/fluent-bit/config.go | Config. |\n| loki | clients/cmd/fluent-bit/config_test.go | Tests. |\n| loki | docs/sources/setup-grafana/configure-security/audit-grafana.md | Audit docs. |\n| loki | docs/sources/setup/migrate/ssd-to-distributed/_index.md | Migration docs. |\n| loki | docs/sources/setup/install/helm/reference.md | Helm reference. |\n| loki | operator/api/loki/v1beta1/lokistack_types_test.go | Operator tests. |\n| loki | operator/bundle/community/manifests/loki-operator.clusterserviceversion.yaml | Operator manifest. |\n| loki | pkg/logql/bench/grafana-datasource.yaml | Benchmark config. |\n| loki | pkg/storage/store_test.go | Storage tests. |\n| loki | production/helm/loki/src/dashboards/loki-operational.json | Dashboard. |\n| loki | README.md | README. |",
+  "cost": {
+    "input_tokens": 727294,
+    "output_tokens": 12929,
+    "total_tokens": 740223,
+    "cost_usd": 0.164852
+  },
+  "status": "success",
+  "latency_seconds": 119.11,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.085
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"keyPatterns\":[\"Declarative Configuration (Kustomization Schema)\",\"Filter-Based Pipeline (Reader-Filter-Writer)\",\"Plugin Architecture (Built-in, Exec, KRM Function)\",\"Base/Overlay Composition with Component Reuse\",\"Resource Identity Management (ResId/GVKN)\",\"Event Sourcing / Provenance Tracking\",\"Static Site Generation (Hugo + Docsy)\",\"Golden F...",
+      "latency_seconds": 0.184
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryData",
+        "channels": [
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/aggregator/apiserver/plugin/fakes/client.go\",\n        \"purpose\": \"Provides a fake implementation of the Grafana plugin client interface for testing purposes, allowing unit tests to simulate backend plugin behavior without actual network calls or real plugin implementations.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/aggregator/apiserver/plugin/...",
+      "latency_seconds": 0.317
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Loki",
+        "channels": [
+          "purpose",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"AGENTS.md\",\n        \"purpose\": \"Development guide for Loki project providing build, test, and code style instructions\",\n        \"knowledge_id\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n        \"repo_name\": \"loki\"\n      },\n      {\n        \"path\": \"README.md\",\n        \"purpose\": \"Main documentation and entry point for Grafana Loki, a horizontally-scalable log aggregation system inspired by Prometheus\",\n        \"knowledge_id\": \"318cc2a0-5cf1-43...",
+      "latency_seconds": 0.86
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Loki datasource",
+        "channels": [
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"apps/dashvalidator/pkg/cache/provider.go\",\n        \"purpose\": \"Defines a generic interface for fetching available metrics from various datasource types (Prometheus, Loki, Mimir, etc.) and a result structure for caching. It provides a contract for datasource-specific provider implementations.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"devenv/datasources_d...",
+      "latency_seconds": 0.52
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryData",
+        "channels": [
+          "functions"
+        ],
+        "path": "pkg/tsdb/loki"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/tsdb/loki/loki.go\",\n        \"purpose\": \"This file implements the Grafana Loki datasource plugin backend service, handling query execution, resource calls, and instance management for the Loki time-series database. It serves as the primary entry point for the plugin's backend logic, coordinating between Grafana's plugin SDK and the Loki AP\u00e2\u0080\u00a6\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafan...",
+      "latency_seconds": 0.444
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/tsdb/loki/standalone/datasource.go",
+          "pkg/tsdb/loki/loki.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/tsdb/loki/standalone/datasource.go\",\n      \"purpose\": \"Provides a standalone Grafana datasource implementation for Loki, acting as a thin adapter that delegates all core functionality (querying, health checks, resource calls) to the underlying loki.Service. It serves as the entry point for the Grafana plugin lifecycle.\",\n      \"summary\": \"{\\\"Des...",
+      "latency_seconds": 0.147
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/tsdb/loki/standalone/datasource.go",
+        "fromLine": 30,
+        "toLine": 32
+      },
+      "result_preview": "# pkg/tsdb/loki/standalone/datasource.go\nLines: 30 - 32 of 41\nMore: fromLine=33\n\n30 | func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {\n31 | \treturn d.Service.QueryData(ctx, req)\n32 | }",
+      "latency_seconds": 1.392
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryData",
+        "channels": [
+          "classes"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"apps/provisioning/pkg/loki/client.go\",\n        \"purpose\": \"Provides a client for interacting with the Grafana Loki log aggregation system, enabling pushing log streams and querying logs via the Loki HTTP API. It handles authentication, request construction, and response parsing.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"packages/grafana-runtime/src/serv...",
+      "latency_seconds": 0.309
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/tsdb/loki/loki.go",
+        "fromLine": 182,
+        "toLine": 196
+      },
+      "result_preview": "# pkg/tsdb/loki/loki.go\nLines: 182 - 196 of 314\nMore: fromLine=197\n\n182 | func (s *Service) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {\n183 | \tdsInfo, err := s.getDSInfo(ctx, req.PluginContext)\n184 | \t_, fromAlert := req.Headers[fromAlertHeaderName]\n185 | \tlogger := s.logger.FromContext(ctx).With(\"fromAlert\", fromAlert)\n186 | \tif err != nil {\n187 | \t\tlogger.Debug(\"Failed to get data source info\", \"err\", err)\n188 | \t\treturn nil, err\n189 | \t}...",
+      "latency_seconds": 1.706
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/tsdb/loki/loki.go",
+        "fromLine": 198,
+        "toLine": 210
+      },
+      "result_preview": "# pkg/tsdb/loki/loki.go\nLines: 198 - 210 of 314\nMore: fromLine=211\n\n198 | func queryData(ctx context.Context, req *backend.QueryDataRequest, dsInfo *datasourceInfo, responseOpts ResponseOpts, tracer trace.Tracer, plog log.Logger, runInParallel bool, logQLScopes bool) (*backend.QueryDataResponse, error) {\n199 | \tresult := backend.NewQueryDataResponse()\n200 | \n201 | \tapi := newLokiAPI(dsInfo.HTTPClient, dsInfo.URL, plog, tracer)\n202 | \n203 | \tstart := time.Now()\n204 | \tqueries, err := parseQuery(r...",
+      "latency_seconds": 0.455
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryDataHandler",
+        "channels": [
+          "imports",
+          "classes"
+        ]
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"QueryDataHandler\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": ...",
+      "latency_seconds": 0.483
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/aggregator/apiserver/plugin/query.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/aggregator/apiserver/plugin/query.go\",\n      \"purpose\": \"Implements an HTTP handler for processing query data requests in Grafana's aggregator API server, validating datasource references and forwarding queries to plugin clients while integrating tracing and error handling.\",\n      \"summary\": \"{\\\"PluginHandler (~L20)\\\":\\\"Struct providing plugin ...",
+      "latency_seconds": 0.123
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/aggregator/apiserver/plugin/query.go",
+        "fromLine": 70,
+        "toLine": 89
+      },
+      "result_preview": "# pkg/aggregator/apiserver/plugin/query.go\nLines: 70 - 89 of 90\nMore: fromLine=90\n\n70 | \t\t\treturn\n71 | \t\t}\n72 | \n73 | \t\tctx = backend.WithGrafanaConfig(ctx, pluginContext.GrafanaConfig)\n74 | \t\tspan.AddEvent(\"QueryData start\", grafanasemconv.GrafanaDatasourceRequestQueryCount(len(queries)))\n75 | \t\trsp, err := h.client.QueryData(ctx, &backend.QueryDataRequest{\n76 | \t\t\tQueries:       queries,\n77 | \t\t\tPluginContext: pluginContext,\n78 | \t\t})\n79 | \t\tif err != nil {\n80 | \t\t\tresponder.Error(w, req, err)...",
+      "latency_seconds": 1.542
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/aggregator/apiserver/plugin/fakes/client.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/aggregator/apiserver/plugin/fakes/client.go\",\n      \"purpose\": \"Provides a fake implementation of the Grafana plugin client interface for testing purposes, allowing unit tests to simulate backend plugin behavior without actual network calls or real plugin implementations.\",\n      \"summary\": \"{\\\"Design Pattern (~L10-38)\\\":\\\"Implements the fake cl...",
+      "latency_seconds": 0.124
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/aggregator/apiserver/plugin/fakes/client.go",
+        "fromLine": 16,
+        "toLine": 22
+      },
+      "result_preview": "# pkg/aggregator/apiserver/plugin/fakes/client.go\nLines: 16 - 22 of 39\nMore: fromLine=23\n\n16 | func (pc *FakePluginClient) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {\n17 | \tif pc.QueryDataHandlerFunc != nil {\n18 | \t\treturn pc.QueryDataHandlerFunc(ctx, req)\n19 | \t}\n20 | \n21 | \treturn nil, errors.New(\"QueryDataHandlerFunc not implemented\")\n22 | }",
+      "latency_seconds": 0.432
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/plugins/backendplugin/grpcplugin/client_v2.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/plugins/backendplugin/grpcplugin/client_v2.go\",\n      \"purpose\": \"Provides a gRPC client implementation for Grafana backend plugins, enabling communication between the Grafana server and plugin processes via the pluginv2 protocol. It handles diagnostics, resource calls, data queries, streaming, admission control, and object conversion.\",\n      \"...",
+      "latency_seconds": 0.122
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/plugins/backendplugin/grpcplugin/client_v2.go",
+        "fromLine": 163,
+        "toLine": 175
+      },
+      "result_preview": "# pkg/plugins/backendplugin/grpcplugin/client_v2.go\nLines: 163 - 175 of 407\nMore: fromLine=176\n\n163 | func (c *ClientV2) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {\n164 | \tif c.DataClient == nil {\n165 | \t\treturn nil, plugins.ErrMethodNotImplemented\n166 | \t}\n167 | \n168 | \tprotoReq := backend.ToProto().QueryDataRequest(req)\n169 | \tprotoResp, err := c.DataClient.QueryData(ctx, protoReq)\n170 | \n171 | \tif err != nil {\n172 | \t\tif status.Code(err)...",
+      "latency_seconds": 0.75
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "DataSourceInstance",
+        "channels": [
+          "classes"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"packages/grafana-runtime/src/utils/qscheck.ts\",\n        \"purpose\": \"Provides utilities to verify that a set of Grafana data sources are compatible with the Query Service by checking OAuth enablement, Azure authentication mode, and allowed data source types.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"public/app/features/datasources/api.ts\",\n        \"purpo...",
+      "latency_seconds": 0.218
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/plugins/backendplugin/coreplugin/core_plugin.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/plugins/backendplugin/coreplugin/core_plugin.go\",\n      \"purpose\": \"This file defines the corePlugin struct and its associated factory function to create built-in backend plugins for Grafana, implementing the backendplugin.Plugin interface with handlers for health checks, data queries, streaming, admission, and conversion operations.\",\n      \"su...",
+      "latency_seconds": 0.121
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/plugins/backendplugin/coreplugin/core_plugin.go",
+        "fromLine": 92,
+        "toLine": 99
+      },
+      "result_preview": "# pkg/plugins/backendplugin/coreplugin/core_plugin.go\nLines: 92 - 99 of 166\nMore: fromLine=100\n\n92 | func (cp *corePlugin) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {\n93 | \tif cp.QueryDataHandler != nil {\n94 | \t\tctx = backend.WithGrafanaConfig(ctx, req.PluginContext.GrafanaConfig)\n95 | \t\treturn cp.QueryDataHandler.QueryData(ctx, req)\n96 | \t}\n97 | \n98 | \treturn nil, plugins.ErrMethodNotImplemented\n99 | }",
+      "latency_seconds": 0.433
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "",
+        "channels": [
+          "similar"
+        ],
+        "similarTo": {
+          "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+          "relativePath": "pkg/tsdb/loki/standalone/datasource.go"
+        }
+      },
+      "result_preview": "MCP error -32602: Input validation error: Invalid arguments for tool graph_search: [\n  {\n    \"code\": \"too_small\",\n    \"minimum\": 1,\n    \"type\": \"string\",\n    \"inclusive\": true,\n    \"exact\": false,\n    \"message\": \"String must contain at least 1 character(s)\",\n    \"path\": [\n      \"query\"\n    ]\n  }\n]",
+      "latency_seconds": 0.038
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryData",
+        "channels": [
+          "similar"
+        ],
+        "similarTo": {
+          "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+          "relativePath": "pkg/tsdb/loki/standalone/datasource.go"
+        }
+      },
+      "result_preview": "{\n  \"similar\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/tsdb/parca/plugin.go\",\n        \"purpose\": \"Implements a Grafana datasource plugin for querying Parca application performance profiles, handling query execution, health checks, and resource calls to integrate Parca data into Grafana dashboards.\",\n        \"similarity_score\": 19,\n        \"shared_keywords\": 19,\n        \"sample_keywords\": [\n          \"plugin\",\n          \"grafana\",\n          \"resource_management\",\n          \"check_health\",\n  ...",
+      "latency_seconds": 0.372
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryData",
+        "channels": [
+          "functions"
+        ],
+        "page": 2
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/promlib/instrumentation/instrumentation.go\",\n        \"purpose\": \"Provides instrumentation utilities for tracking Prometheus backend plugin requests in Grafana, focusing on metrics collection for query data endpoints with error source categorization.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/promlib/instrumentation/instrumentation_test.go\",\n   ...",
+      "latency_seconds": 0.394
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "QueryData",
+        "channels": [
+          "functions"
+        ],
+        "page": 3
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/services/pluginsintegration/clientmiddleware/caching_middleware_test.go\",\n        \"purpose\": \"Unit tests for the caching middleware that intercepts plugin client calls (QueryData, CallResource) to integrate with Grafana's caching service, handling cache hits/misses and conditional caching based on feature flags.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"p...",
+      "latency_seconds": 0.34
+    }
+  ],
+  "error": "",
+  "llm_condensed_answer": "SUMMARY: The QueryData method signature must be updated to include a new stream parameter, affecting the Loki datasource and all other datasources to maintain compatibility with the Grafana plugin interface. This change propagates through the service layer to API calls and response handling, requiring updates to callers, middleware, and tests across the Grafana codebase.\n\nFILES:\n- grafana/pkg/tsdb/loki/standalone/datasource.go \u2014 Updates the Loki standalone datasource's QueryData method signature to accept the stream parameter.\n- grafana/pkg/tsdb/loki/loki.go \u2014 Updates the Service.QueryData method and internal queryData function to handle the stream parameter.\n- grafana/pkg/tsdb/loki/api.go \u2014 May require updates to handle streaming API calls based on the stream parameter.\n- grafana/pkg/tsdb/loki/frame.go \u2014 May require updates for processing streaming responses into data frames.\n- grafana/pkg/aggregator/apiserver/plugin/query.go \u2014 Updates the caller to pass the stream parameter to QueryData.\n- grafana/pkg/api/ds_query.go \u2014 Updates the API endpoint to pass the stream parameter to QueryData.\n- grafana/pkg/plugins/backendplugin/coreplugin/core_plugin.go \u2014 Updates the core plugin wrapper to pass the stream parameter.\n- grafana/pkg/plugins/backendplugin/grpcplugin/client_v2.go \u2014 Updates the gRPC client implementation to handle the new signature.\n- grafana/pkg/plugins/manager/client/client.go \u2014 Updates the plugin client wrapper to pass the stream parameter.\n- grafana/pkg/services/caching/service.go \u2014 Updates the caching service to pass the stream parameter to QueryData.\n- grafana/pkg/services/query/query.go \u2014 Updates the query service to pass the stream parameter to QueryData.\n- grafana/pkg/services/ngalert/eval/eval.go \u2014 Updates alert evaluation to pass the stream parameter to QueryData.\n- grafana/pkg/services/publicdashboards/service/query.go \u2014 Updates public dashboards query to pass the stream parameter to QueryData.\n- grafana/pkg/registry/apis/datasource/queryconvert.go \u2014 Updates query conversion to pass the stream parameter to QueryData.\n- grafana/pkg/registry/apis/datasource/sub_query.go \u2014 Updates sub-query handling to pass the stream parameter to QueryData.\n- grafana/pkg/registry/apis/query/client/plugin.go \u2014 Updates the query client to pass the stream parameter to QueryData.\n- grafana/pkg/registry/apis/query/query.go \u2014 Updates the query REST handler to pass the stream parameter to QueryData.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/caching_middleware.go \u2014 Updates caching middleware to pass the stream parameter to QueryData.\n- grafana/pkg/tsdb/tempo/standalone/datasource.go \u2014 Updates the Tempo datasource signature for compatibility.\n- grafana/pkg/tsdb/parca/standalone/datasource.go \u2014 Updates the Parca datasource signature for compatibility.\n- grafana/pkg/tsdb/cloud-monitoring/standalone/datasource.go \u2014 Updates the Cloud Monitoring datasource signature for compatibility.\n- grafana/pkg/tsdb/graphite/standalone/datasource.go \u2014 Updates the Graphite datasource signature for compatibility.\n- grafana/pkg/tsdb/grafana-pyroscope-datasource/standalone/datasource.go \u2014 Updates the Pyroscope datasource signature for compatibility.\n- grafana/pkg/tsdb/jaeger/standalone/datasource.go \u2014 Updates the Jaeger datasource signature for compatibility.\n- grafana/pkg/tsdb/opentsdb/standalone/datasource.go \u2014 Updates the OpenTSDB datasource signature for compatibility.\n- grafana/pkg/tsdb/grafana-testdata-datasource/standalone/datasource.go \u2014 Updates the Test data datasource signature for compatibility.\n- grafana/pkg/tsdb/zipkin/standalone/datasource.go \u2014 Updates the Zipkin datasource signature for compatibility.\n- grafana/pkg/tsdb/elasticsearch/standalone/datasource.go \u2014 Updates the Elasticsearch datasource signature for compatibility.\n- grafana/pkg/tsdb/azuremonitor/standalone/datasource.go \u2014 Updates the Azure Monitor datasource signature for compatibility.\n- grafana/pkg/promlib/querydata/request.go \u2014 Updates the Prometheus datasource QueryData implementation for compatibility.\n- grafana/pkg/tsdb/elasticsearch/querydata_test.go \u2014 Updates tests for Elasticsearch query data.\n- grafana/pkg/aggregator/apiserver/plugin/query_test.go \u2014 Updates tests for the plugin query handler.\n- grafana/pkg/api/ds_query_test.go \u2014 Updates tests for the datasource query API.\n- grafana/pkg/api/plugins_test.go \u2014 Updates tests for plugin API.\n- grafana/pkg/expr/query_convert.go \u2014 Updates query conversion logic that may interact with QueryData.\n- grafana/pkg/expr/service_test.go \u2014 Updates tests for the expression service.\n- grafana/pkg/plugins/backendplugin/grpcplugin/client_proto.go \u2014 Updates gRPC client proto handling.\n- grafana/pkg/plugins/backendplugin/grpcplugin/grpc_plugin.go \u2014 Updates gRPC plugin wrapper.\n- grafana/pkg/plugins/instrumentationutils/request_status.go \u2014 Updates request status utilities for QueryData responses.\n- grafana/pkg/plugins/instrumentationutils/request_status_test.go \u2014 Updates tests for request status.\n- grafana/pkg/plugins/manager/client/client_test.go \u2014 Updates tests for the plugin client.\n- grafana/pkg/plugins/manager/pluginfakes/fakes.go \u2014 Updates fake plugin implementations for the new signature.\n- grafana/pkg/plugins/plugins.go \u2014 Updates plugin definitions.\n- grafana/pkg/aggregator/apiserver/plugin/fakes/client.go \u2014 Updates fake client for tests.\n- grafana/pkg/promlib/querydata/response_test.go \u2014 Updates tests for Prometheus response handling.\n- grafana/pkg/promlib/querydata/framing_test.go \u2014 Updates tests for Prometheus framing.\n- grafana/pkg/promlib/library.go \u2014 Updates Prometheus service.\n- grafana/pkg/promlib/instrumentation/instrumentation.go \u2014 Updates instrumentation for Prometheus queries.\n- grafana/pkg/promlib/instrumentation/instrumentation_test.go \u2014 Updates tests for instrumentation.\n- grafana/pkg/services/caching/service_test.go \u2014 Updates tests for caching service.\n- grafana/pkg/services/ngalert/api/lotex_prom.go \u2014 Updates Lotex API for alerting.\n- grafana/pkg/services/ngalert/api/lotex_ruler.go \u2014 Updates Lotex ruler API.\n- grafana/pkg/services/ngalert/api/util_test.go \u2014 Updates tests for API utils.\n- grafana/pkg/services/ngalert/eval/eval_test.go \u2014 Updates tests for alert evaluation.\n- grafana/pkg/services/ngalert/schedule/recording_rule.go \u2014 Updates recording rules to pass the stream parameter.\n- grafana/pkg/services/ngalert/prom/query.go \u2014 Updates Prom query helpers.\n- grafana/pkg/services/ngalert/store/range_to_instant.go \u2014 Updates query optimization logic.\n- grafana/pkg/services/publicdashboards/service/query_test.go \u2014 Updates tests for public dashboards query.\n- grafana/pkg/registry/apis/datasource/noop.go \u2014 Updates no-op REST storage.\n- grafana/pkg/registry/apis/datasource/queryconvert_test.go \u2014 Updates tests for query conversion.\n- grafana/pkg/registry/apis/datasource/sub_query_test.go \u2014 Updates tests for sub-query handling.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/caching_middleware_test.go \u2014 Updates tests for caching middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/clear_auth_headers_middleware.go \u2014 Updates auth headers middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/contextual_logger_middleware.go \u2014 Updates logger middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/cookies_middleware.go \u2014 Updates cookies middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/forward_id_middleware.go \u2014 Updates ID forwarding middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/grafana_request_id_header_middleware.go \u2014 Updates request ID middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/httpclient_middleware.go \u2014 Updates HTTP client middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/logger_middleware.go \u2014 Updates logger middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go \u2014 Updates metrics middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware.go \u2014 Updates OAuth middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware_test.go \u2014 Updates tests for OAuth middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/tracing_header_middleware.go \u2014 Updates tracing headers middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/tracing_middleware.go \u2014 Updates tracing middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/tracing_middleware_test.go \u2014 Updates tests for tracing middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware.go \u2014 Updates alerting headers middleware.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware_test.go \u2014 Updates tests for alerting headers.\n- grafana/pkg/services/pluginsintegration/clientmiddleware/user_header_middleware.go \u2014 Updates user header middleware.\n- grafana/pkg/tsdb/cloudwatch/cloudwatch.go \u2014 Updates CloudWatch datasource service.\n- grafana/pkg/tsdb/cloud-monitoring/cloudmonitoring.go \u2014 Updates Cloud Monitoring service.\n- grafana/pkg/tsdb/elasticsearch/elasticsearch.go \u2014 Updates Elasticsearch service.\n- grafana/pkg/tsdb/jaeger/jaeger.go \u2014 Updates Jaeger service.\n- grafana/pkg/tsdb/tempo/tempo.go \u2014 Updates Tempo service.\n- grafana/pkg/tests/api/loki/loki_test.go \u2014 Updates Loki datasource tests.\n- grafana/apps/alerting/historian/pkg/app/notification/lokireader.go \u2014 Updates Loki reader for alerting.\n- grafana/apps/alerting/historian/pkg/app/notification/lokireader_test.go \u2014 Updates tests for Loki reader.\n- grafana/apps/alerting/historian/pkg/app/config/config.go \u2014 Updates config for Loki integration.\n- grafana/apps/alerting/historian/pkg/app/config/config_test.go \u2014 Updates tests for config.\n- grafana/apps/alerting/historian/pkg/app/notification/notification.go \u2014 Updates notification handler.\n- grafana/apps/dashvalidator/pkg/cache/provider.go \u2014 Updates cache provider for datasources.\n- grafana/apps/provisioning/pkg/loki/client.go \u2014 Updates Loki client for provisioning.\n- grafana/apps/provisioning/pkg/loki/client_test.go \u2014 Updates tests for client.\n- grafana/pkg/logql/bench/grafana-datasource.yaml \u2014 Updates benchmark config.\n- grafana/operator/docs/user-guides/howto_connect_grafana.md \u2014 Updates docs for connecting Grafana.\n- grafana/docs/sources/setup/install/helm/reference.md \u2014 Updates Helm reference docs.\n- grafana/docs/sources/setup/migrate/ssd-to-distributed/_index.md \u2014 Updates migration docs.\n- grafana/production/helm/loki/src/dashboards/loki-operational.json \u2014 Updates dashboard config.\n- grafana/operator/api/loki/v1beta1/lokistack_types_test.go \u2014 Updates operator tests.\n- grafana/operator/bundle/community/manifests/loki-operator.clusterserviceversion.yaml \u2014 Updates operator manifest.\n- grafana/pkg/storage/store_test.go \u2014 Updates storage tests.\n- grafana/README.md \u2014 Updates Loki README.\n- grafana/AGENTS.md \u2014 Updates Agents guide.\n- loki/clients/cmd/docker-driver/README.md \u2014 Updates Docker driver docs.\n- loki/clients/cmd/docker-driver/config.go \u2014 Updates config.\n- loki/clients/cmd/docker-driver/config.json \u2014 Updates config JSON.\n- loki/clients/cmd/docker-driver/driver.go \u2014 Updates driver.\n- loki/clients/cmd/docker-driver/loki.go \u2014 Updates Loki integration.\n- loki/clients/cmd/docker-driver/loki_test.go \u2014 Updates tests.\n- loki/clients/cmd/docker-driver/main.go \u2014 Updates main.\n- loki/clients/cmd/fluent-bit/README.md \u2014 Updates Fluent Bit docs.\n- loki/clients/cmd/fluent-bit/config.go \u2014 Updates config.\n- loki/clients/cmd/fluent-bit/config_test.go \u2014 Updates tests.\n- loki/docs/sources/setup-grafana/configure-security/audit-grafana.md \u2014 Updates audit docs.\n- loki/docs/sources/setup/migrate/ssd-to-distributed/_index.md \u2014 Updates migration docs.\n- loki/docs/sources/setup/install/helm/reference.md \u2014 Updates Helm reference docs.\n- loki/operator/api/loki/v1beta1/lokistack_types_test.go \u2014 Updates operator tests.\n- loki/operator/bundle/community/manifests/loki-operator.clusterserviceversion.yaml \u2014 Updates operator manifest.\n- loki/pkg/logql/bench/grafana-datasource.yaml \u2014 Updates benchmark config.\n- loki/pkg/storage/store_test.go \u2014 Updates storage tests.\n- loki/production/helm/loki/src/dashboards/loki-operational.json \u2014 Updates dashboard.\n- loki/README.md \u2014 Updates README."
+}

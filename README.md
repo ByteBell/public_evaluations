@@ -2,7 +2,7 @@
 
 No existing benchmark tests whether an LLM + MCP tool can trace the ripple effects of a breaking code change across multiple repositories. We built our own.
 
-We assembled **82,894 source files** across **25 Kubernetes and observability repositories**, wrote **100 cross-repo impact questions**, and ran them against **8 LLMs** via the ByteBell MCP knowledge graph — consuming **646 million tokens** (~$94 USD total).
+We assembled **82,894 source files** across **25 Kubernetes and observability repositories**, wrote **100 cross-repo impact questions**, and ran them against **11 LLMs** via the ByteBell MCP knowledge graph — consuming over **1.7 billion tokens** (~$350 USD total).
 
 ## Setup
 
@@ -36,14 +36,14 @@ Edit `models.json` to configure which models to evaluate and their pricing.
 
 ## Datasets
 
-### KubeCluster40 — 40 Cross-Repository Impact Questions
+### KubeCluster40 — 45 Cross-Repository Impact Questions
 
-The primary dataset lives in `results/KubeCluster40/` and contains **40 questions** across two categories:
+The primary dataset lives in `results/KubeCluster40/` and contains **45 questions** across two categories:
 
 | Prefix | Count | Description |
 |--------|:-----:|-------------|
-| **OBS** | 30 | Observability — interface/function changes in Prometheus, OpenTelemetry Collector, Thanos, Grafana, Jaeger, Loki, Mimir, and Tempo that ripple across the observability stack |
-| **MIXED** | 10 | Mixed infrastructure — breaking changes to shared Kubernetes interfaces (e.g. `SharedInformer`, `Querier`) that affect both infrastructure tools and observability platforms |
+| **OBS** | 34 | Observability — interface/function changes in Prometheus, OpenTelemetry Collector, Thanos, Grafana, Jaeger, Loki, Mimir, and Tempo that ripple across the observability stack |
+| **MIXED** | 11 | Mixed infrastructure — breaking changes to shared Kubernetes interfaces (e.g. `SharedInformer`, `Querier`) that affect both infrastructure tools and observability platforms |
 
 Each question asks: *"If you add/modify method X on interface Y in repo Z, which files across repos A, B, C, D would need to implement or adapt to this change?"*
 
@@ -53,17 +53,19 @@ Each `question_<ID>/` folder contains:
 
 ```
 question_MIXED_TC001/
-  question.json                       # The question text
-  anthropic_claude-haiku-4.5.json     # Claude Haiku's answer + tool calls + cost
-  deepseek_deepseek-chat-v3.1.json    # DeepSeek's answer
-  google_gemini-3-flash-preview.json  # Gemini Flash's answer
-  openai_gpt-5.1-codex-max.json      # GPT-5.1 Codex Max's answer
-  openai_gpt-5.1-codex-mini.json     # GPT-5.1 Codex Mini's answer
-  x-ai_grok-code-fast-1.json         # Grok Code's answer
-  xiaomi_mimo-v2-flash.json           # MiMo's answer
-  claude_opus_aicopilot.json          # Claude Opus (via AICopilot) answer
-  evaluation.json                     # Model metadata + relevance scores
-  analysis.json                       # LLM judge comparative scores
+  question.json                                # The question text
+  anthropic_claude-haiku-4.5.json              # Claude Haiku's answer + tool calls + cost
+  deepseek_deepseek-chat-v3.1.json             # DeepSeek's answer
+  google_gemini-3-flash-preview.json           # Gemini Flash's answer
+  openai_gpt-5.1-codex-max.json               # GPT-5.1 Codex Max's answer
+  openai_gpt-5.1-codex-mini.json              # GPT-5.1 Codex Mini's answer
+  x-ai_grok-code-fast-1.json                  # Grok Code's answer
+  xiaomi_mimo-v2-flash.json                   # MiMo's answer
+  claude_opus_aicopilot.json                   # Claude Opus (via AICopilot) answer
+  claude_opus_4.6_direct_data_access.json      # Ground truth (direct repo access via Claude Code)
+  ground_truth.json                            # Copy of above, used as reference by the judge
+  evaluation.json                              # Model metadata + relevance scores
+  analysis.json                                # LLM judge comparative scores
 ```
 
 ### Model Answer Files
@@ -115,7 +117,7 @@ This condensation happens in two places:
 
 ### Scoring Criteria
 
-The LLM judge (`judge_model` in `models.json`, currently `google/gemini-3.1-pro-preview`) scores each model using a **60/30/10** weighted criteria:
+The LLM judge (`judge_model` in `models.json`, currently `anthropic/claude-haiku-4.5`) scores each model using a **60/30/10** weighted criteria:
 
 | Weight | Criteria | What It Measures |
 |:------:|----------|------------------|
@@ -130,16 +132,19 @@ Each model is scored **independently** as a percentage accuracy (0-100%). Scores
 After evaluation, `analysis_summary.json` contains the final leaderboard with accuracy vs. cost:
 
 ```
-Model                                         |   Avg % |     Cost $ |      %/$ | Judged
-----------------------------------------------+---------+------------+----------+-------
-openai/gpt-5.1-codex-max                      |   78.8% | $  43.7883 |     1.80 |     40
-anthropic/claude-haiku-4.5                    |   77.2% | $  17.2828 |     4.47 |     16
-google/gemini-3-flash-preview                 |   72.1% | $  12.4790 |     5.78 |     40
-deepseek/deepseek-chat-v3.1                   |   63.1% | $   3.0286 |    20.84 |     40
-x-ai/grok-code-fast-1                         |   48.5% | $   5.4157 |     8.96 |     40
-claude-opus-4.6/aicopilot                       |   44.8% | $   0.0000 |     0.00 |     40
-openai/gpt-5.1-codex-mini                     |   44.1% | $   9.6812 |     4.56 |     40
-xiaomi/mimo-v2-flash                          |   43.6% | $   3.8807 |    11.24 |     40
+Model                                                  |   Avg % |     Cost $ |    %/$ | Judged
+---------------------------------------------------------+---------+------------+--------+-------
+anthropic/claude-sonnet-4.6 + ByteBell MCP               |   77.4% | $ 159.3442 |   0.49 |     45
+anthropic/claude-haiku-4.5 + ByteBell MCP                |   70.2% | $  52.2822 |   1.34 |     55
+openai/gpt-5.1-codex-max + ByteBell MCP                 |   70.0% | $  50.1175 |   1.40 |     45
+openai/gpt-5.2-codex + ByteBell MCP                     |   66.3% | $   7.8490 |   8.45 |      3
+google/gemini-3-flash-preview + ByteBell MCP             |   62.2% | $  13.9109 |   4.47 |     45
+deepseek/deepseek-chat-v3.1 + ByteBell MCP              |   57.8% | $   3.5141 |  16.44 |     45
+x-ai/grok-code-fast-1 + ByteBell MCP                    |   56.8% | $   6.1030 |   9.31 |     45
+xiaomi/mimo-v2-flash + ByteBell MCP                     |   55.5% | $   4.4196 |  12.56 |     45
+openai/gpt-5.1-codex-mini + ByteBell MCP                |   53.5% | $  11.4772 |   4.66 |     45
+minimax/minimax-m2.5 + ByteBell MCP                     |   52.5% | $  11.7227 |   4.48 |     43
+claude-opus-4/aicopilot (no MCP)                        |   32.7% | $   0.0000 |      — |     40
 ```
 
 Key metrics per model:
@@ -147,6 +152,38 @@ Key metrics per model:
 - **Cost $** — total USD spent across all questions (input + output tokens)
 - **%/$** — accuracy percentage per dollar spent (higher = more accuracy per dollar)
 - **Judged** — number of questions where the model produced a scoreable answer
+
+### Ground Truth Generation (`claude_opus_4.6_direct_data_access.json`)
+
+The other models in this benchmark answer questions by calling MCP tools to search a knowledge graph. To establish a **ground truth baseline**, we took a fundamentally different approach — giving the model direct access to the raw source code.
+
+We opened **Claude Code** (Anthropic's CLI agent) on a machine with all 25 repositories cloned locally in `dataset/kubeCluster/`. Claude Code had full filesystem access to all 82,894 source files. For each of the 45 questions, we asked it to search the actual codebases using `grep`, `glob`, and file reads to identify every affected file, then write a structured answer with:
+
+- An **architecture overview** explaining the interface/type and its implementations
+- A **detailed analysis** with specific file paths, line numbers, and code patterns
+- An **expected_files** array listing every affected file with its repo, path, and reason for inclusion
+
+This produces `claude_opus_4.6_direct_data_access.json` in each question folder — one per question, 45 total. These files are then copied to `ground_truth.json` and used as the **authoritative reference** when the LLM judge scores other models.
+
+**Key difference from MCP-based models:** The MCP models search a pre-built knowledge graph with limited context windows. The ground truth was generated with direct access to every file in every repo — no knowledge graph abstraction, no token limits on search results, no tool call overhead. This makes it as close to a human expert's answer as an automated process can get.
+
+**Ground truth file format:**
+
+```json
+{
+  "model": "anthropic/claude-opus-4.6-direct-data-access",
+  "answer": "## Architecture Overview\n...",
+  "llm_condensed_answer": "SUMMARY: ...\nFILES:\n- repo/path — reason\n...",
+  "expected_files": [
+    {"repo": "prometheus", "files": ["storage/interface.go"], "reason": "Querier interface definition"},
+    {"repo": "thanos", "files": ["pkg/query/querier.go"], "reason": "Thanos querier Select() implementation"}
+  ],
+  "cost": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0},
+  "status": "success"
+}
+```
+
+Cost fields are zero because the generation happened locally via Claude Code, not through the OpenRouter API.
 
 ### Evaluation Pipeline
 

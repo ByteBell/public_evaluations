@@ -1,0 +1,372 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "answer": "I now have comprehensive evidence from all six repositories. Let me compile the complete analysis.\n\n---\n\n## 1. Architecture Overview\n\nThe proposed change \u2014 replacing `metav1.ObjectMeta.Labels` from `map[string]string` to a new named type `LabelMap` with accessor methods \u2014 is a **source-level breaking change** that propagates through every layer of every Kubernetes operator. Here is why:\n\n`metav1.ObjectMeta` is embedded in **every** Kubernetes resource struct (`corev1.Pod`, `corev1.Secret`, `appsv1.Deployment`, etc.). Every operator in this analysis:\n\n1. **Reads** `.Labels` directly as a `map[string]string` (range loops, index access `labels[key]`, nil checks)\n2. **Writes** `.Labels` by assigning `map[string]string` literals or calling `make(map[string]string)`\n3. **Passes** `.Labels` to functions that accept `map[string]string`\n4. **Compares** `.Labels` values with `==` or via `for k, v := range`\n\nIf `Labels` becomes `LabelMap` (a named type), all of the above patterns break at compile time unless `LabelMap` is implicitly convertible to `map[string]string` \u2014 which Go does not allow for named types with accessor methods. Every call site must be updated to use the new accessor API.\n\nThe **data flow** of the breakage is:\n```\nmetav1.ObjectMeta.Labels (LabelMap)\n  \u2192 embedded in every k8s resource type\n    \u2192 read/written in every operator's controller, manifest builder, reconciler, test helper\n      \u2192 passed to label selectors, Prometheus metrics, template engines, informer caches\n```\n\n---\n\n## 2. Detailed Analysis\n\n### ArgoCD (`cceba948-304a-4f00-8ac6-4dd57dab816e`)\n\n**`util/kube/kube.go`** \u2014 `SetAppInstanceLabel`, `GetAppInstanceLabel`, `RemoveLabel`\nThese functions call `target.SetLabels(labels)` and `un.SetLabels(labels)` where `labels` is a `map[string]string` built via `make(map[string]string)` and populated with `labels[key] = val`. The `SetLabels()` method on `Unstructured` accepts `map[string]string`; if the underlying `ObjectMeta.Labels` is now `LabelMap`, the `SetLabels` signature itself would need to change, breaking all callers.\n\n**`controller/cache/info.go`** \u2014 `populateNodeInfo`\nReads `node.Labels` (a `map[string]string`) to extract node topology labels. Direct map indexing `node.Labels[\"topology.kubernetes.io/zone\"]` would break.\n\n**`util/db/secrets.go`** \u2014 Secret type labeling\nUses `common.LabelKeySecretType` to set labels on `corev1.Secret` objects. Assigns `map[string]string` literals to `secret.Labels`.\n\n**`util/argo/resource_tracking.go`** \u2014 `SetAppInstance`, `GetAppName`\nReads and writes `ObjectMeta.Labels` to track application instance associations. Uses `labels[key]` map indexing.\n\n**`applicationset/utils/selector.go`** \u2014 `LabelSelectorAsSelector`\nConverts `metav1.LabelSelector.MatchLabels` (which is `map[string]string`) into executable selectors. If `MatchLabels` changes type, this conversion breaks.\n\n**`controller/clusterinfoupdater.go`** \u2014 Cluster label management\nReads and writes cluster secret labels as `map[string]string`.\n\n**`applicationset/generators/cluster.go`** \u2014 Cluster secret label filtering\nIterates over `secret.Labels` to match cluster secrets.\n\n**`applicationset/metrics/metrics.go`** \u2014 Prometheus label metrics\nIterates `app.Labels` (ApplicationSet labels) to expose them as Prometheus gauge labels.\n\n**`cmd/util/app.go`** \u2014 CLI label parsing\nCalls `parseLabels()` returning `map[string]string`, then assigns to `app.ObjectMeta.Labels`.\n\n**`gitops-engine/pkg/sync/sync_context.go`** \u2014 Sync context\nReads resource labels during sync to determine hook types and wave ordering.\n\n---\n\n### cert-manager (`5c4b66d9-0f53-433d-92f1-fc923dbb2a28`)\n\n**`pkg/issuer/acme/http/pod.go`** \u2014 `podLabels()` function (line 36\u201349)\nReturns `map[string]string{cmacme.DomainLabelKey: domainHash, ...}` and passes it to `labels.NewRequirement`. The `getPodsForChallenge` function (line 83\u201391) iterates `for key, val := range podLabels` \u2014 a direct range over `map[string]string`. If `podLabels` returns `LabelMap`, the range loop breaks.\n\n**`pkg/controller/acmeorders/selectors/labels.go`** \u2014 `labelSelector.Matches()` (line 35\u201352)\nDirectly indexes `meta.Labels[k]` (line 43) where `meta` is `metav1.ObjectMeta`. This is the most direct breakage: `meta.Labels[k]` requires `Labels` to be a map type supporting index access.\n\n**`internal/informers/transformers.go`** \u2014 `partialMetadataRemoveAll()` (line 38)\nAssigns `partialMeta.Labels = nil`. If `Labels` is `LabelMap`, assigning `nil` to it may not compile depending on the type definition.\n\n**`internal/informers/core_filteredsecrets.go`** \u2014 Label-based secret filtering\nUses `secret.Labels` to distinguish cert-manager-managed secrets from others.\n\n**`pkg/issuer/acme/http/ingress.go`** \u2014 Ingress label merging\nMerges `map[string]string` labels into ingress `ObjectMeta.Labels` during HTTP-01 challenge solving.\n\n**`pkg/issuer/acme/http/service.go`** \u2014 Service label-based discovery\nUses label selectors built from `map[string]string` to find challenge solver services.\n\n**`pkg/issuer/acme/http/httproute.go`** \u2014 HTTPRoute label management\nSets labels on HTTPRoute resources for challenge solving.\n\n**`test/unit/gen/objectmeta.go`** \u2014 `ObjectMetaModifier` type\nDefines `type ObjectMetaModifier func(*metav1.ObjectMeta)` and generates `ObjectMeta` with `Labels: map[string]string{...}` literal assignments. All test generators break.\n\n**`test/unit/gen/certificate.go`** \u2014 Certificate test generators\nUses `ObjectMetaModifier` to set labels on Certificate resources.\n\n**`pkg/client/applyconfigurations/acme/v1/acmechallengesolverhttp01ingresspodobjectmeta.go`** \u2014 Generated apply config\nHas `Labels map[string]string` field in the apply configuration struct. If the source type changes, the generated code must be regenerated.\n\n**`pkg/client/applyconfigurations/certmanager/v1/certificatesecrettemplate.go`** \u2014 Secret template labels\nDefines `Labels map[string]string` for setting labels on certificate secrets.\n\n**`internal/controller/issuers/apply.go`** \u2014 Server-side apply for issuers\nSerializes `ObjectMeta` including `Labels` for SSA patches.\n\n---\n\n### External Secrets (`df9200e3-5480-4b75-9de1-40ee66ad6456`)\n\n**`pkg/controllers/externalsecret/externalsecret_controller_template.go`** \u2014 `setMetadata()` (lines 111\u2013158)\nThis is the most critical file. It directly:\n- Checks `if secret.Labels == nil` (line 114) \u2014 nil check on `LabelMap` may not work\n- Assigns `secret.Labels = make(map[string]string)` (line 115) \u2014 cannot assign `map[string]string` to `LabelMap`\n- Calls `delete(secret.ObjectMeta.Labels, key)` (line 128) \u2014 `delete` builtin requires a map type\n- Calls `esutils.MergeStringMap(secret.ObjectMeta.Labels, es.ObjectMeta.Labels)` (line 140) \u2014 passes `LabelMap` where `map[string]string` is expected\n\n**`providers/v1/kubernetes/metadata.go`** \u2014 Label merge policies\nImplements `MergeSourceMetadata` and `MergeTargetMetadata` that accept and return `map[string]string` for labels. Passes these to `secret.Labels` assignments.\n\n**`runtime/template/v2/template.go`** \u2014 Template engine label setting\nDynamically sets labels on Kubernetes objects via unstructured conversion. Reads `secret.Labels` as `map[string]string` for template rendering.\n\n**`pkg/controllers/externalsecret/externalsecret_controller_test.go`** \u2014 Controller tests\nCreates `corev1.Secret` objects with `Labels: map[string]string{...}` literal assignments in test fixtures.\n\n**`pkg/controllers/commontest/common.go`** \u2014 Test utilities\nInspects `ObjectMeta` labels in test assertions.\n\n**`providers/v1/kubernetes/client.go`** \u2014 Kubernetes provider client\nReads and writes `secret.Labels` for push operations.\n\n---\n\n### Loki Operator (`318cc2a0-5cf1-43bd-b606-1b77f6e724cd`)\n\n**`operator/internal/manifests/var.go`** \u2014 `commonLabels()`, `componentInstanceLabels()`, `ComponentLabels()` (lines 163\u2013192)\nReturns `map[string]string` literals and uses `labels.Merge(commonLabels(stackName), map[string]string{...})`. The `labels.Merge` function from `k8s.io/apimachinery/pkg/labels` accepts `Labels` (which is `map[string]string`). If `ObjectMeta.Labels` changes type, the merge result cannot be assigned back.\n\n**`operator/internal/handlers/lokistack_enable_zone_awareness.go`** \u2014 `getAvailabilityZone()` (line 71\u201382)\nAccepts `nodeLabels map[string]string` (line 71) and indexes it with `nodeLabels[key]`. The caller passes `node.Labels` directly \u2014 this breaks if `node.Labels` is `LabelMap`.\n\n**`operator/internal/controller/loki/lokistack_zone_labeling_controller.go`** \u2014 `eventPodHasLabel()`\nChecks for label presence on pods using `pod.Labels[key]` map indexing.\n\n**`operator/internal/manifests/distributor_test.go`** \u2014 Selector label tests\nAsserts `deployment.Spec.Selector.MatchLabels` equals `deployment.Spec.Template.Labels` \u2014 both are `map[string]string` comparisons.\n\n---\n\n### OpenTelemetry Operator (`809b2635-0808-42d8-a5a8-0eee31698cfd`)\n\n**`internal/manifests/manifestutils/labels.go`** \u2014 `Labels()` function (lines 29\u201363)\nThe function signature is `func Labels(instance metav1.ObjectMeta, ...) map[string]string`. It directly accesses `instance.Labels` (line 33: `if instance.Labels != nil`) and iterates `for k, v := range instance.Labels` (line 34). Both the nil check and range loop break if `Labels` is `LabelMap`.\n\n**`internal/manifests/mutate.go`** \u2014 `MutateFuncFor()` (lines 61\u2013195)\nCalls `existing.GetLabels()` and `existing.SetLabels(existingLabels)` where `existingLabels` is `map[string]string`. The `mergeWithOverride(&existingLabels, desired.GetLabels())` call uses `mergo.Merge` on `map[string]string` pointers \u2014 breaks if `GetLabels()` returns `LabelMap`.\n\n**`internal/instrumentation/sdk.go`** \u2014 `addParentResourceLabels()` (lines 596\u2013670)\nTraverses owner references and reads `pod.Labels` as `map[string]string` to build resource attribute maps. Passes `pod.Labels` to functions expecting `map[string]string`.\n\n**`cmd/operator-opamp-bridge/internal/operator/client.go`** \u2014 `hasLabel()` / `hasReportingLabel()`\nChecks `collector.Labels[LabelManagedBy]` and `collector.Labels[LabelReportingNode]` \u2014 direct map indexing on `ObjectMeta.Labels`.\n\n**`internal/manifests/collector/service.go`**, **`deployment.go`**, **`daemonset.go`**, **`statefulset.go`**, **`configmap.go`** \u2014 Manifest builders\nAll call `Labels(instance.ObjectMeta, ...)` and assign the returned `map[string]string` to `ObjectMeta.Labels` of the generated resource.\n\n**`internal/manifests/manifestutils/labels_test.go`** \u2014 Label unit tests\nAsserts label maps with `assert.Equal(t, map[string]string{...}, result)` \u2014 type mismatch if result is `LabelMap`.\n\n---\n\n### Thanos/Prometheus (`aa5426d0-10b2-4a9c-992a-5c0e9bc87c59`)\n\nWhile Thanos uses Prometheus-native label types (`labels.Labels`, `model.LabelSet`) for its internal time-series labels, it also manages Kubernetes resources and would be affected through:\n\n**`pkg/block/metadata/meta.go`** \u2014 Block metadata with external labels\nUses `labels.Labels` (Prometheus type) but also reads Kubernetes resource `ObjectMeta.Labels`.\n\n**`operator/internal/controller/loki/certrotation_controller.go`** (Loki) \u2014 Certificate rotation\nReads `LokiStack.Labels` to propagate labels to generated cert-manager `Certificate` resources.\n\n---\n\n## 3. Relevant Files\n\n| Repo | File Path | Why Breaks |\n|------|-----------|------------|\n| **argo-cd** | `util/kube/kube.go` | `SetAppInstanceLabel`, `GetAppInstanceLabel`, `RemoveLabel` \u2014 all use `map[string]string` for `SetLabels()`/range/index on `ObjectMeta.Labels` |\n| **argo-cd** | `controller/cache/info.go` | `populateNodeInfo` reads `node.Labels[key]` directly as map index |\n| **argo-cd** | `util/db/secrets.go` | Assigns `map[string]string` literals to `secret.Labels` for secret type labeling |\n| **argo-cd** | `util/argo/resource_tracking.go` | Reads/writes `ObjectMeta.Labels` for app instance tracking via map indexing |\n| **argo-cd** | `applicationset/utils/selector.go` | Converts `metav1.LabelSelector.MatchLabels` (`map[string]string`) to selectors |\n| **argo-cd** | `applicationset/generators/cluster.go` | Iterates `secret.Labels` to match cluster secrets |\n| **argo-cd** | `applicationset/metrics/metrics.go` | Iterates `app.Labels` to expose Prometheus gauge labels |\n| **argo-cd** | `cmd/util/app.go` | Parses CLI labels into `map[string]string`, assigns to `app.ObjectMeta.Labels` |\n| **argo-cd** | `controller/clusterinfoupdater.go` | Reads/writes cluster secret labels as `map[string]string` |\n| **argo-cd** | `controller/clusterinfoupdater_test.go` | Test assertions on `secret.Labels` as `map[string]string` |\n| **argo-cd** | `controller/cache/info_test.go` | Tests label extraction from Kubernetes resources |\n| **argo-cd** | `util/argo/resource_tracking_test.go` | Tests label-based resource tracking |\n| **argo-cd** | `gitops-engine/pkg/sync/sync_context.go` | Reads resource labels during sync for hook/wave ordering |\n| **argo-cd** | `gitops-engine/pkg/cache/references.go` | Reads owner reference labels from resources |\n| **argo-cd** | `applicationset/generators/generator_spec_processor.go` | Applies label selectors to generated ApplicationSet parameters |\n| **argo-cd** | `applicationset/utils/createOrUpdate.go` | Reconc",
+  "llm_condensed_answer": "SUMMARY: Changing ObjectMeta.Labels from map[string]string to a named LabelMap type is a source-level breaking change affecting all operators. Every direct map access (indexing, range loops, nil checks, assignments, and delete calls) and function signatures expecting map[string]string would fail to compile. The breakage propagates through all controllers, manifest builders, and test code that read or write Kubernetes resource labels.\n\nFILES:\n- argo-cd/util/kube/kube.go \u2014 Uses map[string]string for SetLabels/GetLabels/RemoveLabel operations on ObjectMeta.Labels\n- argo-cd/controller/cache/info.go \u2014 Direct map indexing node.Labels[key] to extract topology labels\n- argo-cd/util/db/secrets.go \u2014 Assigns map[string]string literals to secret.Labels for secret type labeling\n- argo-cd/util/argo/resource_tracking.go \u2014 Reads/writes ObjectMeta.Labels via map indexing for app instance tracking\n- argo-cd/applicationset/utils/selector.go \u2014 Converts metav1.LabelSelector.MatchLabels (map[string]string) to selectors\n- argo-cd/applicationset/generators/cluster.go \u2014 Iterates secret.Labels to match cluster secrets\n- argo-cd/applicationset/metrics/metrics.go \u2014 Iterates app.Labels to expose Prometheus gauge labels\n- argo-cd/cmd/util/app.go \u2014 Parses CLI labels into map[string]string and assigns to app.ObjectMeta.Labels\n- argo-cd/controller/clusterinfoupdater.go \u2014 Reads/writes cluster secret labels as map[string]string\n- argo-cd/gitops-engine/pkg/sync/sync_context.go \u2014 Reads resource labels during sync for hook/wave ordering\n- cert-manager/pkg/issuer/acme/http/pod.go \u2014 Returns map[string]string for podLabels and ranges over it\n- cert-manager/pkg/controller/acmeorders/selectors/labels.go \u2014 Directly indexes meta.Labels[k] for label matching\n- cert-manager/internal/informers/transformers.go \u2014 Assigns nil to partialMeta.Labels\n- cert-manager/internal/informers/core_filteredsecrets.go \u2014 Uses secret.Labels for label-based secret filtering\n- cert-manager/pkg/issuer/acme/http/ingress.go \u2014 Merges map[string]string labels into ingress ObjectMeta.Labels\n- cert-manager/pkg/issuer/acme/http/service.go \u2014 Uses label selectors built from map[string]string for service discovery\n- cert-manager/pkg/issuer/acme/http/httproute.go \u2014 Sets labels on HTTPRoute resources\n- cert-manager/test/unit/gen/objectmeta.go \u2014 Generates ObjectMeta with Labels: map[string]string{...} literals\n- cert-manager/pkg/client/applyconfigurations/acme/v1/acmechallengesolverhttp01ingresspodobjectmeta.go \u2014 Generated apply config with Labels map[string]string field\n- cert-manager/pkg/client/applyconfigurations/certmanager/v1/certificatesecrettemplate.go \u2014 Defines Labels map[string]string for secret templates\n- cert-manager/internal/controller/issuers/apply.go \u2014 Serializes ObjectMeta including Labels for server-side apply patches\n- external-secrets/pkg/controllers/externalsecret/externalsecret_controller_template.go \u2014 Nil checks, make(map[string]string) assignment, delete() call, and MergeStringMap() on secret.Labels\n- external-secrets/providers/v1/kubernetes/metadata.go \u2014 Implements label merge functions accepting/returning map[string]string\n- external-secrets/runtime/template/v2/template.go \u2014 Reads secret.Labels as map[string]string for template rendering\n- external-secrets/pkg/controllers/externalsecret/externalsecret_controller_test.go \u2014 Creates secrets with Labels: map[string]string{...} literals in tests\n- external-secrets/pkg/controllers/commontest/common.go \u2014 Inspects ObjectMeta labels in test assertions\n- external-secrets/providers/v1/kubernetes/client.go \u2014 Reads and writes secret.Labels for push operations\n- loki-operator/operator/internal/manifests/var.go \u2014 Returns map[string]string literals and merges with labels.Merge()\n- loki-operator/operator/internal/handlers/lokistack_enable_zone_awareness.go \u2014 Accepts nodeLabels map[string]string and indexes it\n- loki-operator/operator/internal/controller/loki/lokistack_zone_labeling_controller.go \u2014 Checks pod.Labels[key] for label presence\n- loki-operator/operator/internal/manifests/distributor_test.go \u2014 Asserts map[string]string equality for selector labels\n- opentelemetry-operator/internal/manifests/manifestutils/labels.go \u2014 Nil check and range loop over instance.Labels in Labels() function\n- opentelemetry-operator/internal/manifests/mutate.go \u2014 Calls GetLabels/SetLabels with map[string]string and uses mergo.Merge on maps\n- opentelemetry-operator/internal/instrumentation/sdk.go \u2014 Reads pod.Labels as map[string]string to build resource attributes\n- opentelemetry-operator/cmd/operator-opamp-bridge/internal/operator/client.go \u2014 Direct map indexing collector.Labels[LabelManagedBy]\n- opentelemetry-operator/internal/manifests/collector/service.go \u2014 Calls Labels() and assigns returned map[string]string to ObjectMeta.Labels\n- opentelemetry-operator/internal/manifests/collector/deployment.go \u2014 Calls Labels() and assigns returned map[string]string to ObjectMeta.Labels\n- opentelemetry-operator/internal/manifests/collector/daemonset.go \u2014 Calls Labels() and assigns returned map[string]string to ObjectMeta.Labels\n- opentelemetry-operator/internal/manifests/collector/statefulset.go \u2014 Calls Labels() and assigns returned map[string]string to ObjectMeta.Labels\n- opentelemetry-operator/internal/manifests/collector/configmap.go \u2014 Calls Labels() and assigns returned map[string]string to ObjectMeta.Labels\n- opentelemetry-operator/internal/manifests/manifestutils/labels_test.go \u2014 Asserts label maps with assert.Equal(t, map[string]string{...}, result)\n- thanos/operator/internal/controller/loki/certrotation_controller.go \u2014 Reads LokiStack.Labels to propagate to cert-manager Certificate resources",
+  "cost": {
+    "input_tokens": 980560,
+    "output_tokens": 8317,
+    "total_tokens": 988877,
+    "cost_usd": 3.066435
+  },
+  "status": "success",
+  "latency_seconds": 182.08,
+  "tool_calls_count": 26,
+  "agent_steps": 7,
+  "tool_calls": [
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Labels ObjectMeta",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"ui/src/app/applications/components/applications-list/application-table-row.tsx\",\n        \"purpose\": \"Renders a single row in the applications list table, displaying key application metadata (project, name, source, destination), health/sync status, and action buttons (sync, refresh, delete). It handles navigation, external links, and favorite toggling while integrating with Argo UI components and application utilities.\",\n        \"knowledge_...",
+      "latency_seconds": 1.581
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Labels ObjectMeta",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"internal/informers/transformers.go\",\n        \"purpose\": \"This file implements a cache transformer function for Kubernetes PartialObjectMetadata objects, specifically to strip sensitive or unnecessary metadata (labels, annotations, managed fields) to reduce memory footprint and avoid unintended data exposure in informer caches.\",\n        \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n        \"repo_name\": \"cert-manager\"\n      },\n   ...",
+      "latency_seconds": 1.188
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Labels ObjectMeta",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"apis/externalsecrets/v1beta1/generic_store.go\",\n        \"purpose\": \"Provides a common interface for interacting with both namespaced SecretStore and cluster-scoped ClusterSecretStore resources, enabling generic operations across different store types in the External Secrets Operator.\",\n        \"knowledge_id\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n        \"repo_name\": \"external-secrets\"\n      },\n      {\n        \"path\": \"providers/v1/aws/p...",
+      "latency_seconds": 1.198
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Labels ObjectMeta",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/logql/log/metrics_extraction.go\",\n        \"purpose\": \"Provides log line extraction and sample processing for metrics extraction in LogQL, enabling conversion of log lines into Prometheus-compatible samples with labels and values\",\n        \"knowledge_id\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n        \"repo_name\": \"loki\"\n      },\n      {\n        \"path\": \"pkg/logql/log/consolidated_variant_extractor_test.go\",\n        \"purpose\": \"Tests t...",
+      "latency_seconds": 1.21
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Labels ObjectMeta",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/collector/upgrade/v0_19_0_test.go\",\n        \"purpose\": \"Unit test file for the OpenTelemetry Collector upgrade logic targeting version 0.19.0. It validates that specific configuration migrations (removing queued_retry processor, migrating resource type, migrating resource labels) are correctly applied during an upgrade from version 0.18.0.\",\n        \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n        \"repo_name\": \"opentelem...",
+      "latency_seconds": 1.241
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Labels ObjectMeta",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "aa5426d0-10b2-4a9c-992a-5c0e9bc87c59",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"internal/cortex/util/metrics_helper.go\",\n        \"purpose\": \"Provides utilities for aggregating, managing, and collecting Prometheus metrics across multiple user registries in a multi-tenant environment, enabling efficient metric gathering and summation without counter resets.\",\n        \"knowledge_id\": \"aa5426d0-10b2-4a9c-992a-5c0e9bc87c59\",\n        \"repo_name\": \"thanos\"\n      },\n      {\n        \"path\": \"pkg/targets/targetspb/custom.go\",\n ...",
+      "latency_seconds": 1.225
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta Labels map string",
+        "channels": [
+          "semantic",
+          "functions"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"server/extension/extension.go\",\n        \"purpose\": \"This file implements Argo CD's extension proxy system, enabling third-party services to extend Argo CD's UI and functionality via HTTP reverse proxying. It manages extension configuration parsing, RBAC authorization, cluster-aware routing, and request/response transformation, acting as a secure gateway between Argo CD users and external extension backends.\",\n        \"knowledge_id\": \"cceba...",
+      "latency_seconds": 1.913
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta Labels map string",
+        "channels": [
+          "semantic",
+          "functions"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"test/e2e/suite/conformance/import.go\",\n        \"purpose\": \"This file serves as the entry point for the cert-manager conformance test suite, organizing and importing all conformance test packages to ensure they are registered and executed as part of the test framework.\",\n        \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n        \"repo_name\": \"cert-manager\"\n      },\n      {\n        \"path\": \"pkg/apis/acme/v1/types_issuer.go\",\n   ...",
+      "latency_seconds": 1.888
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta Labels map string",
+        "channels": [
+          "semantic",
+          "functions"
+        ],
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/controllers/secretstore/common_test.go\",\n        \"purpose\": \"Test suite for SecretStore controller logic, validating provider configuration, finalizer management, and deletion flows across namespace and cluster-scoped stores\",\n        \"knowledge_id\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n        \"repo_name\": \"external-secrets\"\n      },\n      {\n        \"path\": \"apis/externalsecrets/v1/externalsecret_types.go\",\n        \"purpose\": \"Defi...",
+      "latency_seconds": 1.748
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta Labels map string",
+        "channels": [
+          "semantic",
+          "functions"
+        ],
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"README.md\",\n        \"purpose\": \"This README.md serves as the primary documentation file for the OpenTelemetry Operator project, providing installation instructions, configuration examples, and usage guides for deploying and managing OpenTelemetry Collectors and auto-instrumentation in Kubernetes environments. README.md for the OpenTelemetry Operator project, providing project overview, documentation for resource attribute calculation, and ...",
+      "latency_seconds": 1.905
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "metav1 ObjectMeta labels selector",
+        "channels": [
+          "imports",
+          "semantic"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"server/application/deepinformer.go\",\n        \"purpose\": \"Provides deep copy wrappers for Kubernetes listers and clientsets in ArgoCD to ensure immutability of cached application objects, preventing mutations in concurrent access scenarios within the application controller.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        \"path\": \"util/webhook/webhook_test.go\",\n        ...",
+      "latency_seconds": 1.669
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "metav1 ObjectMeta labels selector",
+        "channels": [
+          "imports",
+          "semantic"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/client/applyconfigurations/certmanager/v1/vaultkubernetesauth.go\",\n        \"purpose\": \"Provides a declarative apply configuration builder for the VaultKubernetesAuth type, used in server-side apply operations for cert-manager's Vault issuer configuration. It enables programmatic construction of Kubernetes resource configurations for Vault authentication using Kubernetes ServiceAccount tokens.\",\n        \"knowledge_id\": \"5c4b66d9-0f53-433...",
+      "latency_seconds": 1.634
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "util/kube/kube.go",
+          "controller/cache/info.go",
+          "util/db/secrets.go",
+          "util/argo/resource_tracking.go",
+          "applicationset/utils/selector.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"util/kube/kube.go\",\n      \"purpose\": \"This file provides Kubernetes resource name validation and application instance label/annotation management utilities for Argo CD. It ensures resources comply with Kubernetes naming conventions and properly propagates application instance identifiers to unstructured Kubernetes objects, including special handling for Deployment, Job, and rel...",
+      "latency_seconds": 0.666
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "pkg/issuer/acme/http/pod.go",
+          "pkg/issuer/acme/http/ingress.go",
+          "pkg/issuer/acme/http/service.go",
+          "internal/informers/transformers.go",
+          "pkg/controller/acmeorders/selectors/labels.go",
+          "test/unit/gen/objectmeta.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"pkg/issuer/acme/http/pod.go\",\n      \"purpose\": \"Manages the lifecycle of HTTP-01 challenge solver pods for the ACME protocol in cert-manager. It creates, lists, and cleans up pods used to solve HTTP-01 challenges, ensuring only one pod exists per challenge and merging pod templates from challenge specifications.\",\n      \"summary\": \"{\\\"Label-based Pod Identification (~L36-49)\\\":...",
+      "latency_seconds": 0.667
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePaths": [
+          "pkg/controllers/externalsecret/externalsecret_controller_template.go",
+          "providers/v1/kubernetes/metadata.go",
+          "runtime/template/v2/template.go",
+          "pkg/controllers/commontest/common.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controllers/externalsecret/externalsecret_controller_template.go\",\n      \"purpose\": \"Applies template processing to ExternalSecret resources, merging template data, metadata, and existing secret data according to specified merge policies\",\n      \"summary\": \"{\\\"Template Processing\\\":\\\"Applies template processing to ExternalSecret resources, merging template data, metadata, a...",
+      "latency_seconds": 0.667
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePaths": [
+          "internal/manifests/manifestutils/labels.go",
+          "internal/manifests/mutate.go",
+          "internal/instrumentation/sdk.go",
+          "cmd/operator-opamp-bridge/internal/operator/client.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n  \"files\": [\n    {\n      \"path\": \"internal/manifests/manifestutils/labels.go\",\n      \"purpose\": \"Provides utility functions for generating and managing Kubernetes labels for OpenTelemetry Operator resources, including filtering, version extraction, and label merging for components like Collectors and Target Allocators.\",\n      \"summary\": \"{\\\"Label Filtering Pattern (~L18-26)\\\":\\\"Uses regex compilation to filter...",
+      "latency_seconds": 2.014
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/kube/kube.go",
+        "fromLine": 1,
+        "toLine": 200
+      },
+      "result_preview": "# util/kube/kube.go\nLines: 1 - 200 of 200\n\n1 | package kube\n2 | \n3 | import (\n4 | \t\"fmt\"\n5 | \t\"regexp\"\n6 | \n7 | \t\"github.com/argoproj/gitops-engine/pkg/utils/kube\"\n8 | \t\"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured\"\n9 | \t\"k8s.io/apimachinery/pkg/runtime/schema\"\n10 | \n11 | \t\"github.com/argoproj/argo-cd/v3/common\"\n12 | )\n13 | \n14 | var resourceNamePattern = regexp.MustCompile(\"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$\")\n15 | \n16 | // IsValidResourceName returns true if given string a valid Kubernetes r...",
+      "latency_seconds": 1.749
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "pkg/issuer/acme/http/pod.go",
+        "fromLine": 36,
+        "toLine": 170
+      },
+      "result_preview": "# pkg/issuer/acme/http/pod.go\nLines: 36 - 170 of 328\nMore: fromLine=171\n\n36 | func podLabels(ch *cmacme.Challenge) map[string]string {\n37 | \tdomainHash := fmt.Sprintf(\"%d\", adler32.Checksum([]byte(ch.Spec.DNSName)))\n38 | \ttokenHash := fmt.Sprintf(\"%d\", adler32.Checksum([]byte(ch.Spec.Token)))\n39 | \tsolverIdent := \"true\"\n40 | \treturn map[string]string{\n41 | \t\t// TODO: we need to support domains longer than 63 characters\n42 | \t\t// this value should probably be hashed, and then the full plain text\n...",
+      "latency_seconds": 1.73
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePath": "internal/manifests/manifestutils/labels.go",
+        "fromLine": 1,
+        "toLine": 102
+      },
+      "result_preview": "# internal/manifests/manifestutils/labels.go\nLines: 1 - 102 of 103\nMore: fromLine=103\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package manifestutils\n5 | \n6 | import (\n7 | \t\"maps\"\n8 | \t\"regexp\"\n9 | \t\"strings\"\n10 | \n11 | \t\"github.com/go-logr/logr\"\n12 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n13 | \n14 | \t\"github.com/open-telemetry/opentelemetry-operator/apis/v1alpha1\"\n15 | \t\"github.com/open-telemetry/opentelemetry-operator/internal/namin...",
+      "latency_seconds": 1.752
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePath": "pkg/controllers/externalsecret/externalsecret_controller_template.go",
+        "fromLine": 40,
+        "toLine": 158
+      },
+      "result_preview": "# pkg/controllers/externalsecret/externalsecret_controller_template.go\nLines: 40 - 158 of 160\nMore: fromLine=159\n\n40 | func (r *Reconciler) ApplyTemplate(ctx context.Context, es *esv1.ExternalSecret, secret *v1.Secret, dataMap map[string][]byte) error {\n41 | \t// update metadata (labels, annotations, finalizers) of the secret\n42 | \tif err := setMetadata(secret, es); err != nil {\n43 | \t\treturn err\n44 | \t}\n45 | \n46 | \t// we only keep existing keys if creation policy is Merge, otherwise we clear the...",
+      "latency_seconds": 1.724
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "relativePaths": [
+          "operator/internal/manifests/var.go",
+          "operator/internal/handlers/lokistack_enable_zone_awareness.go",
+          "operator/internal/controller/loki/lokistack_zone_labeling_controller.go",
+          "operator/internal/manifests/distributor_test.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n  \"files\": [\n    {\n      \"path\": \"operator/internal/manifests/var.go\",\n      \"purpose\": \"Provides utility functions and constants for generating Kubernetes manifests for LokiStack components, including naming conventions, labels, annotations, and TLS configuration\",\n      \"summary\": \"{\\\"Constants\\\":\\\"Defines port numbers, environment variables, and file paths for LokiStack components\\\",\\\"TLS Configuration\\\":\\\"P...",
+      "latency_seconds": 0.711
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "pkg/controller/acmeorders/selectors/labels.go",
+        "fromLine": 1,
+        "toLine": 53
+      },
+      "result_preview": "# pkg/controller/acmeorders/selectors/labels.go\nLines: 1 - 53 of 53\n\n1 | /*\n2 | Copyright 2020 The cert-manager Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS...",
+      "latency_seconds": 2.268
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "internal/informers/transformers.go",
+        "fromLine": 1,
+        "toLine": 40
+      },
+      "result_preview": "# internal/informers/transformers.go\nLines: 1 - 40 of 41\nMore: fromLine=41\n\n1 | /*\n2 | Copyright 2023 The cert-manager Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on...",
+      "latency_seconds": 2.268
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "relativePath": "operator/internal/manifests/var.go",
+        "fromLine": 140,
+        "toLine": 200
+      },
+      "result_preview": "# operator/internal/manifests/var.go\nLines: 140 - 200 of 614\nMore: fromLine=201\n\n140 | func commonAnnotations(opts Options) map[string]string {\n141 | \ta := map[string]string{\n142 | \t\tAnnotationLokiConfigHash:         opts.ConfigSHA1,\n143 | \t\tAnnotationCertRotationRequiredAt: opts.CertRotationRequiredAt,\n144 | \t}\n145 | \n146 | \tif opts.ObjectStorage.SecretSHA1 != \"\" {\n147 | \t\ta[AnnotationLokiObjectStoreHash] = opts.ObjectStorage.SecretSHA1\n148 | \t}\n149 | \tif opts.ObjectStorage.OpenShift.CloudCrede...",
+      "latency_seconds": 2.157
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "relativePath": "operator/internal/handlers/lokistack_enable_zone_awareness.go",
+        "fromLine": 1,
+        "toLine": 82
+      },
+      "result_preview": "# operator/internal/handlers/lokistack_enable_zone_awareness.go\nLines: 1 - 82 of 84\nMore: fromLine=83\n\n1 | package handlers\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"encoding/json\"\n6 | \t\"strings\"\n7 | \n8 | \t\"github.com/ViaQ/logerr/v2/kverrors\"\n9 | \t\"github.com/go-logr/logr\"\n10 | \tcorev1 \"k8s.io/api/core/v1\"\n11 | \t\"k8s.io/apimachinery/pkg/api/errors\"\n12 | \t\"k8s.io/apimachinery/pkg/types\"\n13 | \t\"sigs.k8s.io/controller-runtime/pkg/client\"\n14 | \n15 | \tlokiv1 \"github.com/grafana/loki/operator/api/loki/v1...",
+      "latency_seconds": 2.158
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePath": "internal/manifests/mutate.go",
+        "fromLine": 39,
+        "toLine": 200
+      },
+      "result_preview": "# internal/manifests/mutate.go\nLines: 39 - 200 of 444\nMore: fromLine=201\n\n39 | // MutateFuncFor returns a mutate function based on the\n40 | // existing resource's concrete type. It supports currently\n41 | // only the following types or else panics:\n42 | // - ConfigMap\n43 | // - Service\n44 | // - ServiceAccount\n45 | // - ClusterRole\n46 | // - ClusterRoleBinding\n47 | // - Role\n48 | // - RoleBinding\n49 | // - Deployment\n50 | // - DaemonSet\n51 | // - StatefulSet\n52 | // - ServiceMonitor\n53 | // - In...",
+      "latency_seconds": 4.542
+    }
+  ],
+  "error": ""
+}

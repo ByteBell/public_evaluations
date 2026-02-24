@@ -1,0 +1,329 @@
+{
+  "model": "stepfun/step-3.5-flash",
+  "answer": "Based on my comprehensive analysis of the knowledge graph across multiple repositories, I'll provide a detailed report on how Cilium, Istio, and the autoscaler (Karpenter) process PodSpec NodeSelector.\n\n# Architecture Overview\n\nThe processing of `PodSpec.NodeSelector` flows through multiple layers in the Kubernetes ecosystem:\n\n1. **Admission Control**: The Kubernetes API server uses admission plugins to validate and potentially mutate pod specifications before they are persisted. The `PodNodeSelector` plugin enforces namespace-level constraints and cluster-wide whitelists.\n\n2. **Scheduling**: The kube-scheduler evaluates node selector requirements against node labels to determine pod placement. This involves:\n   - Parsing `pod.Spec.NodeSelector` and `pod.Spec.Affinity.NodeAffinity`\n   - Converting to efficient internal representations\n   - Filtering nodes that don't match required selectors\n   - Scoring nodes based on preferred affinity terms\n\n3. **Component-Specific Processing**:\n   - **Cilium**: Uses NodeSelector to filter which nodes should receive Envoy configuration via `CiliumEnvoyConfig` resources\n   - **Istio**: Extracts node selectors from service annotations for traffic routing and respects node selectors in pilot deployment\n   - **Karpenter**: Extends NodeSelector with `minValues` for flexible scheduling and uses it extensively in node provisioning decisions\n\n# Detailed Analysis\n\n## 1. Kubernetes Core Scheduler\n\n### Node Affinity Plugin\n**File**: `pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go`\n\nThe `NodeAffinity` plugin is a core scheduler component that enforces node affinity rules:\n\n- **PreFilter Phase** (L159-209): Extracts required node affinity from pod spec using `nodeaffinity.GetRequiredNodeAffinity(pod)`. This combines both `pod.Spec.NodeSelector` and `pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution` into a unified `RequiredNodeAffinity` structure. It can also identify when affinity specifies exact node names via `ObjectNameField`, returning a filtered node set.\n\n- **Filter Phase** (L218-239): Checks if each candidate node matches the required node affinity. Uses `s.requiredNodeSelectorAndAffinity.Match(node)` to evaluate both label selectors and field selectors.\n\n- **PreScore/Score Phases** (L242-307): Handles preferred node affinity terms, computing scores based on matching weights.\n\n### Helper Utilities\n**File**: `staging/src/k8s.io/component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go`\n\nProvides the foundational parsing and matching logic:\n\n- `GetRequiredNodeAffinity` (L306-319): Creates a `RequiredNodeAffinity` struct containing:\n  - `labelSelector`: From `pod.Spec.NodeSelector` (simple label map)\n  - `nodeSelector`: From `pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution` (wrapped in `LazyErrorNodeSelector`)\n\n- `RequiredNodeAffinity.Match` (L323-333): Evaluates both label selector and node selector against a node's labels and fields.\n\n## 2. Cilium\n\n### Envoy Config Reflection with NodeSelector\n**File**: `pkg/ciliumenvoyconfig/k8s_reflector.go`\n\nCilium processes NodeSelector in the context of `CiliumEnvoyConfig` (CEC) resources:\n\n- **Transform Function** (L95-190): When reflecting CEC resources into the internal state database:\n  - Extracts `spec.NodeSelector` from the CEC object (L112-124)\n  - Converts it to a `labels.Selector` using `slim_metav1.LabelSelectorAsSelector`\n  - Fetches local node labels via `getLocalNodeLabels(txn)`\n  - Evaluates `selector.Matches(labels.Set(localNodeLabels))` to determine if the CEC applies to the local node\n  - Stores both the selector and the `SelectsLocalNode` boolean in the `CEC` struct\n\nThis allows Cilium to selectively apply Envoy configuration only to nodes matching the specified selector.\n\n### Host Policies Documentation\n**File**: `Documentation/security/policy/host.rst`\n\nDocuments that Cilium's `CiliumClusterwideNetworkPolicy` supports a `NodeSelector` field to scope host-level firewall policies to specific nodes.\n\n## 3. Istio\n\n### Service Registry Node Selector Handling\n**File**: `pilot/pkg/serviceregistry/kube/controller/util.go`\n\nIstio processes node selectors primarily for service traffic routing:\n\n- `getNodeSelectorsForService` (L127-137): Parses the `traffic.istio.io/nodeSelector` annotation from Kubernetes Service objects. The annotation contains JSON-encoded node selector key-value pairs. This is used to determine which nodes should receive traffic for a service.\n\n### Pilot Deployment NodeSelector\n**File**: `releasenotes/notes/36110.yaml`\n\nDocuments that the Istio operator respects `values.pilot.nodeSelector` configuration, allowing users to control which nodes the istiod control plane runs on.\n\n### Sidecar Injection\n**File**: `pkg/kube/inject/webhook.go` (referenced in search results)\n\nThe sidecar injection webhook processes pod specifications and may need to handle or preserve existing node selectors during mutation.\n\n## 4. Karpenter (Autoscaler)\n\n### Enhanced NodeSelector with minValues\n**File**: `pkg/apis/v1/nodeclaim.go`\n\nKarpenter extends the standard Kubernetes NodeSelector with a `NodeSelectorRequirementWithMinValues` (L90-123):\n\n```go\ntype NodeSelectorRequirementWithMinValues struct {\n    Key string\n    Operator v1.NodeSelectorOperator  // In, NotIn, Gt, Lt, Gte, Lte, Exists, DoesNotExist\n    Values []string\n    MinValues *int  // Minimum number of unique values required (flexibility)\n}\n```\n\nThe `MinValues` field enables flexible scheduling - a node only needs to match a subset of the specified values (at least `minValues`), rather than requiring all values.\n\n### Scheduling Requirement Abstraction\n**File**: `pkg/scheduling/requirement.go`\n\nProvides an efficient internal representation for scheduling constraints:\n\n- `Requirement` struct (L36-43): Canonicalizes node selector requirements with:\n  - `values`: Set of allowed values\n  - `gte`/`lte`: Bounds for numeric comparisons\n  - `MinValues`: Flexibility constraint\n  - `complement`: Handles `NotIn` and `DoesNotExist` efficiently\n\n- `NewRequirementWithFlexibility` (L48-102): Constructs requirements, canonicalizing operators (GT\u2192GTE+1, LT\u2192LTE-1) and handling the `minValues` flexibility.\n\n- `Intersection` (L173-206) and `HasIntersection` (L212-246): Set-based operations to determine if two requirements can be satisfied simultaneously.\n\n### Core Scheduling Engine\n**File**: `pkg/controllers/provisioning/scheduling/scheduler.go`\n\nThe scheduler uses these abstractions to make node provisioning decisions:\n\n- **PodData** (L186-192): Caches pod requirements including node selector constraints to avoid recomputation.\n- **Scheduler_Solve** (L381-436): Main scheduling loop that:\n  - Extracts pod requirements (including node selectors)\n  - Attempts to match against existing nodes, in-flight node claims, or new node claims\n  - Uses preference relaxation when hard constraints fail\n- **Scheduler_addToNewNodeClaim** (L591-680): When creating new nodes, filters instance types based on whether they match the pod's node selector requirements.\n\n### NodeClaim Lifecycle\n**File**: `pkg/controllers/provisioning/provisioner.go`\n\nOrchestrates the provisioning workflow: batches unschedulable pods, creates NodeClaims with appropriate constraints, and binds pods to the provisioned capacity.\n\n## 5. Admission Control\n\n### PodNodeSelector Plugin\n**File**: `plugin/pkg/admission/podnodeselector/admission.go`\n\nEnforces node selector constraints at admission time:\n\n- **Admit** (L101-125): \n  - Retrieves namespace-level node selector\n  - Checks for conflicts between namespace and pod node selectors using `labels.Conflicts`\n  - Merges namespace selector with pod selector (namespace defaults, pod overrides)\n  - Calls Validate for whitelist checking\n\n- **Validate** (L128-157):\n  - Ensures merged node selector is a subset of the cluster-wide whitelist for that namespace\n  - Prevents pods from requesting nodes outside allowed constraints\n\nThis provides a safety net before pods enter the scheduling queue.\n\n## Cross-Component Interactions\n\nThe flow of `PodSpec.NodeSelector` through the system:\n\n1. **API Server** \u2192 Admission plugins validate/mutate the pod spec\n2. **Scheduler** \u2192 Parses and evaluates node selector against node labels\n3. **Karpenter** \u2192 Extracts node selector from unschedulable pods to determine instance type requirements\n4. **Cilium** \u2192 Uses node selector in CiliumEnvoyConfig to target specific nodes\n5. **Istio** \u2192 Reads node selectors from service annotations for traffic routing\n\nAll three components (Cilium, Istio, Karpenter) rely on the same underlying Kubernetes node selector semantics but apply them in different contexts:\n- **Karpenter**: For determining *what kind of node* to provision\n- **Cilium**: For determining *which nodes* should receive specific configuration\n- **Istio**: For determining *which nodes* should handle specific traffic\n\n# Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| Kubernetes Core | `pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go` | Core scheduler plugin that filters and scores nodes based on PodSpec.NodeSelector and nodeAffinity |\n| Kubernetes Core | `staging/src/k8s.io/component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go` | Provides RequiredNodeAffinity abstraction that combines nodeSelector and nodeAffinity for scheduling decisions |\n| Kubernetes Core | `plugin/pkg/admission/podnodeselector/admission.go` | Admission controller that enforces namespace-level node selector constraints and whitelists |\n| Cilium | `pkg/ciliumenvoyconfig/k8s_reflector.go` | Reflects CiliumEnvoyConfig resources, applying NodeSelector to filter which nodes receive Envoy configuration (L95-190) |\n| Cilium | `Documentation/security/policy/host.rst` | Documents CiliumClusterwideNetworkPolicy NodeSelector usage for host-level policies |\n| Cilium | `pkg/api/node/util.go` | Validates deprecated node labels in NodeSelector contexts |\n| Istio | `pilot/pkg/serviceregistry/kube/controller/util.go` | Extracts node selectors from service annotations for traffic routing (getNodeSelectorsForService, L127-137) |\n| Istio | `releasenotes/notes/36110.yaml` | Documents that istiod respects values.pilot.nodeSelector |\n| Karpenter | `pkg/apis/v1/nodeclaim.go` | Defines NodeSelectorRequirementWithMinValues extending standard NodeSelector with flexibility (L90-123) |\n| Karpenter | `pkg/scheduling/requirement.go` | Provides efficient Requirement representation with canonicalization, intersection, and minValues support |\n| Karpenter | `pkg/controllers/provisioning/scheduling/scheduler.go` | Core scheduling engine that evaluates pod node selectors against instance types and existing nodes |\n| Karpenter | `pkg/controllers/provisioning/provisioner.go` | Orchestrates node provisioning based on unschedulable pods with node selector constraints |\n| Kubernetes Core | `pkg/apis/core/v1/helper/helpers.go` | Helper utilities for node selector validation and manipulation |\n| Kubernetes Core | `pkg/apis/core/helper/helpers_test.go` | Tests for node selector handling in core API |\n| Kubernetes Core | `pkg/apis/node/validation/validation.go` | Validates RuntimeClass scheduling constraints including node selectors |\n| Kubernetes Core | `staging/src/k8s.io/client-go/applyconfigurations/core/v1/nodeselector.go` | Declarative apply configuration builder for NodeSelector |\n| Kubernetes Core | `staging/src/k8s.io/client-go/applyconfigurations/core/v1/nodeselectorrequirement.go` | Builder for NodeSelectorRequirement |\n| Kubernetes Core | `staging/src/k8s.io/client-go/applyconfigurations/core/v1/nodeselectorterm.go` | Builder for NodeSelectorTerm |\n\nThis analysis covers all major components that process PodSpec NodeSelector across the repositories, from low-level parsing and validation to high-level scheduling and component-specific usage.",
+  "cost": {
+    "input_tokens": 1774779,
+    "output_tokens": 8070,
+    "total_tokens": 1782849,
+    "cost_usd": 0.179899
+  },
+  "status": "success",
+  "latency_seconds": 199.07,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.083
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.201
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "imports",
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"Documentation/security/policy/host.rst\",\n        \"purpose\": \"This file provides the Cilium documentation for Host Policies, describing their purpose, configuration, examples, troubleshooting steps, and known issues. It explains how Host Policies extend CiliumClusterwideNetworkPolicy with a NodeSelector, the required Helm flags, and operational considerations such as DNS proxy impact and upgrade procedures. The document serves as a reference...",
+      "latency_seconds": 1.088
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "PodSpec NodeSelector scheduling",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"cluster-autoscaler/utils/utils_test.go\",\n        \"purpose\": \"Provides utilities for comparing and sanitizing Kubernetes PodSpecs, specifically to determine semantic equivalence (ignoring non-essential fields like volume names and environment variables) and to strip out auto-generated or transient fields for comparison or caching purposes in cluster autoscaling logic.\"\n      },\n      {\n        \"path\": \"pkg/scheduling/requirement.go\",\n       ...",
+      "latency_seconds": 2.256
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector PodSpec Cilium",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ],
+        "path": "pkg"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/act/act.go\",\n        \"purpose\": \"Provides Active Connection Tracking (ACT) metrics for Cilium by reading the ACT BPF map, exposing Prometheus gauges for new, active, and failed connections per zone/service, handling cleanup of stale entries, overflow removal, and persisting failed connection counters.\"\n      },\n      {\n        \"path\": \"pkg/act/act_test.go\",\n        \"purpose\": \"Provides unit tests for the Active Connection Tracker (ACT) ...",
+      "latency_seconds": 1.23
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector Istio pilot",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"releasenotes/notes/36110.yaml\",\n        \"purpose\": \"Defines a release note entry for a feature enhancement in the installation area, specifically documenting that istiod deployment now respects the `values.pilot.nodeSelector` configuration.\"\n      },\n      {\n        \"path\": \"istioctl/pkg/writer/pilot/status_test.go\",\n        \"purpose\": \"Test suite for XdsStatusWriter that validates printing of Istio control plane status information across m...",
+      "latency_seconds": 1.253
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector Karpenter scheduler nodeclaim",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"kwok/charts/crds/karpenter.sh_nodeclaims.yaml\",\n        \"purpose\": \"Defines the Kubernetes CustomResourceDefinition (CRD) for Karpenter's NodeClaim resource, specifying its schema, validation rules, and status fields for managing node lifecycle and provisioning within a cluster.\"\n      },\n      {\n        \"path\": \"pkg/controllers/provisioning/provisioner.go\",\n        \"purpose\": \"Provisioner controller that waits for enqueued pods, batches th...",
+      "latency_seconds": 0.979
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/api/node/util.go",
+          "pkg/ciliumenvoyconfig/k8s_reflector.go",
+          "pkg/k8s/client/informers/externalversions/cilium.io/v2/ciliumlocalredirectpolicy.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/ciliumenvoyconfig/k8s_reflector.go\",\n      \"purpose\": \"Provides reflection of CiliumEnvoyConfig and CiliumClusterwideEnvoyConfig Kubernetes CRDs into the Cilium internal state database (statedb) as CEC objects, handling node selector filtering, resource parsing, and listener/service port extraction. Enables Cilium's Envoy integration to consume ...",
+      "latency_seconds": 0.125
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePath": "pkg/ciliumenvoyconfig/k8s_reflector.go",
+        "fromLine": 95,
+        "toLine": 190
+      },
+      "result_preview": "# pkg/ciliumenvoyconfig/k8s_reflector.go\nLines: 95 - 190 of 235\nMore: fromLine=191\n\n95 | \ttransform := func(txn statedb.ReadTxn, obj any) (*CEC, bool) {\n96 | \t\tvar (\n97 | \t\t\tobjMeta *metav1.ObjectMeta\n98 | \t\t\tspec    *ciliumv2.CiliumEnvoyConfigSpec\n99 | \t\t)\n100 | \n101 | \t\tswitch cecObj := obj.(type) {\n102 | \t\tcase *ciliumv2.CiliumEnvoyConfig:\n103 | \t\t\tobjMeta = &cecObj.ObjectMeta\n104 | \t\t\tspec = &cecObj.Spec\n105 | \t\tcase *ciliumv2.CiliumClusterwideEnvoyConfig:\n106 | \t\t\tobjMeta = &cecObj.ObjectMe...",
+      "latency_seconds": 0.497
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/serviceregistry/kube/controller/util.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/serviceregistry/kube/controller/util.go\",\n      \"purpose\": \"Utility helpers for the Istio Pilot Kubernetes service registry controller, providing label extraction, port resolution, service\u00e2\u0080\u0091pod matching, node selector handling, proxy key generation, and Multi\u00e2\u0080\u0091Cluster Service hostname creation. These functions are used by the controller ...",
+      "latency_seconds": 0.153
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pilot/pkg/serviceregistry/kube/controller/util.go",
+        "fromLine": 127,
+        "toLine": 137
+      },
+      "result_preview": "# pilot/pkg/serviceregistry/kube/controller/util.go\nLines: 127 - 137 of 185\nMore: fromLine=138\n\n127 | func getNodeSelectorsForService(svc *v1.Service) labels.Instance {\n128 | \tif nodeSelector := svc.Annotations[annotation.TrafficNodeSelector.Name]; nodeSelector != \"\" {\n129 | \t\tvar nodeSelectorKV map[string]string\n130 | \t\tif err := json.Unmarshal([]byte(nodeSelector), &nodeSelectorKV); err != nil {\n131 | \t\t\tlog.Debugf(\"failed to unmarshal node selector annotation value for service %s.%s: %v\",\n132...",
+      "latency_seconds": 1.423
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePaths": [
+          "pkg/controllers/provisioning/scheduling/scheduler.go",
+          "pkg/apis/v1/nodeclaim.go",
+          "pkg/scheduling/requirement.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"d1b54414-5d03-411c-a8cb-b1504b559cf3\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controllers/provisioning/scheduling/scheduler.go\",\n      \"purpose\": \"Core scheduling engine for Karpenter that evaluates pod placement across existing nodes, in-flight nodes, and new node claims. It manages scheduling constraints, resource reservations, and topology awareness to determine optimal pod placement. This file contains scheduling logi...",
+      "latency_seconds": 0.162
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePath": "pkg/scheduling/requirement.go",
+        "fromLine": 1,
+        "toLine": 106
+      },
+      "result_preview": "# pkg/scheduling/requirement.go\nLines: 1 - 106 of 369\nMore: fromLine=107\n\n1 | /*\n2 | Copyright The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS I...",
+      "latency_seconds": 1.404
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePath": "pkg/apis/v1/nodeclaim.go",
+        "fromLine": 85,
+        "toLine": 123
+      },
+      "result_preview": "# pkg/apis/v1/nodeclaim.go\nLines: 85 - 123 of 197\nMore: fromLine=124\n\n85 | const (\n86 | \tNodeSelectorOpGte v1.NodeSelectorOperator = \"Gte\"\n87 | \tNodeSelectorOpLte v1.NodeSelectorOperator = \"Lte\"\n88 | )\n89 | \n90 | // A node selector requirement is a selector that contains values, a key, an operator that relates the key and values\n91 | // and minValues that represent the requirement to have at least that many values.\n92 | type NodeSelectorRequirementWithMinValues struct {\n93 | \t//nolint:kubeapilin...",
+      "latency_seconds": 0.468
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "extract NodeSelector from PodSpec",
+        "channels": [
+          "purpose",
+          "functions",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"Documentation/observability/hubble/ip-packet-tracing.rst\",\n        \"purpose\": \"Tutorial documentation demonstrating how to configure Cilium to detect, extract, and monitor arbitrary IP Options from network packets, specifically IP Option 136 (Stream ID) for packet tracing\"\n      },\n      {\n        \"path\": \"Documentation/update-codeowners.sh\",\n        \"purpose\": \"Generates a reStructuredText documentation file from the CODEOWNERS file, extra...",
+      "latency_seconds": 0.89
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "plugin/pkg/admission/podnodeselector/admission.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"plugin/pkg/admission/podnodeselector/admission.go\",\n      \"purpose\": \"Implements a Kubernetes admission controller plugin that enforces pod node selector constraints by validating that pod node selectors do not conflict with namespace-level node selectors and ensuring pod selectors are within allowed cluster-wide whitelists. It integrates with the K...",
+      "latency_seconds": 0.113
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePath": "plugin/pkg/admission/podnodeselector/admission.go",
+        "fromLine": 100,
+        "toLine": 157
+      },
+      "result_preview": "# plugin/pkg/admission/podnodeselector/admission.go\nLines: 100 - 157 of 280\nMore: fromLine=158\n\n100 | // Admit enforces that pod and its namespace node label selectors matches at least a node in the cluster.\n101 | func (p *Plugin) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {\n102 | \tif shouldIgnore(a) {\n103 | \t\treturn nil\n104 | \t}\n105 | \tif !p.WaitForReady() {\n106 | \t\treturn admission.NewForbidden(a, fmt.Errorf(\"not yet ready to handle request\"))\n107 | ...",
+      "latency_seconds": 1.687
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector network policy Cilium",
+        "channels": [
+          "purpose",
+          "classes",
+          "functions"
+        ],
+        "path": "pkg/policy"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/policy/api/cidr_test.go\",\n        \"purpose\": \"Validates CIDR (Classless Inter-Domain Routing) string patterns for both IPv4 and IPv6 addresses using a comprehensive regular expression\"\n      },\n      {\n        \"path\": \"pkg/policy/api/doc.go\",\n        \"purpose\": \"Defines the API package for Cilium network policy interface, providing Kubernetes API generation and deepcopy capabilities\"\n      },\n      {\n        \"path\": \"pkg/policy/api/egre...",
+      "latency_seconds": 0.478
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "Documentation/security/policy/host.rst"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"Documentation/security/policy/host.rst\",\n      \"purpose\": \"This file provides the Cilium documentation for Host Policies, describing their purpose, configuration, examples, troubleshooting steps, and known issues. It explains how Host Policies extend CiliumClusterwideNetworkPolicy with a NodeSelector, the required Helm flags, and operational conside...",
+      "latency_seconds": 0.136
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "pod.Spec.NodeSelector",
+        "channels": [
+          "purpose",
+          "functions",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"pod.Spec.NodeSelector\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"functions\": {\n    \"data\": [...",
+      "latency_seconds": 0.605
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector pod scheduling cluster-autoscaler",
+        "channels": [
+          "purpose",
+          "functions",
+          "keywords"
+        ],
+        "path": "pkg"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/api/job/warnings.go\",\n        \"purpose\": \"Provides validation warnings for JobSpec in Kubernetes Batch API, specifically checking for potential issues with Indexed Jobs when completions and parallelism exceed soft limits, and delegating pod template warnings to shared pod validation logic.\"\n      },\n      {\n        \"path\": \"pkg/api/v1/pod/util.go\",\n        \"purpose\": \"This file provides utility functions for working with Kubernetes Pod ...",
+      "latency_seconds": 0.732
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go\",\n      \"purpose\": \"NodeAffinity is a Kubernetes scheduler framework plugin that enforces node affinity rules during pod scheduling. It implements filtering (to exclude nodes that don't match required affinity), scoring (to rank nodes based on preferred affinity), and queueing hint logic ...",
+      "latency_seconds": 0.157
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePath": "pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go",
+        "fromLine": 159,
+        "toLine": 239
+      },
+      "result_preview": "# pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go\nLines: 159 - 239 of 378\nMore: fromLine=240\n\n159 | func (pl *NodeAffinity) PreFilter(ctx context.Context, cycleState fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {\n160 | \taffinity := pod.Spec.Affinity\n161 | \tnoNodeAffinity := (affinity == nil ||\n162 | \t\taffinity.NodeAffinity == nil ||\n163 | \t\taffinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil)\n164 | \tif noNodeAffinity...",
+      "latency_seconds": 1.477
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "staging/src/k8s.io/component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"staging/src/k8s.io/component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go\",\n      \"purpose\": \"This file provides runtime utilities for parsing and evaluating Kubernetes node affinity rules, enabling efficient matching of pod scheduling constraints against node labels and fields. It wraps the core v1.NodeSelector and v1.PreferredSchedulingT...",
+      "latency_seconds": 0.192
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePath": "staging/src/k8s.io/component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go",
+        "fromLine": 294,
+        "toLine": 334
+      },
+      "result_preview": "# staging/src/k8s.io/component-helpers/scheduling/corev1/nodeaffinity/nodeaffinity.go\nLines: 294 - 334 of 334\n\n294 | \n295 | type preferredSchedulingTerm struct {\n296 | \tnodeSelectorTerm\n297 | \tweight int\n298 | }\n299 | \n300 | type RequiredNodeAffinity struct {\n301 | \tlabelSelector labels.Selector\n302 | \tnodeSelector  *LazyErrorNodeSelector\n303 | }\n304 | \n305 | // GetRequiredNodeAffinity returns the parsing result of pod's nodeSelector and nodeAffinity.\n306 | func GetRequiredNodeAffinity(pod *v1.P...",
+      "latency_seconds": 1.539
+    }
+  ],
+  "error": ""
+}

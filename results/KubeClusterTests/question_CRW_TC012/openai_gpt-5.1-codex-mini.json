@@ -1,0 +1,448 @@
+{
+  "model": "openai/gpt-5.1-codex-mini",
+  "answer": "### 1. Architecture Overview\nIstio ensures its sidecar-injection mutating webhook (MutatingWebhookConfiguration) always carries the current Istiod CA bundle by orchestrating three cooperating components:\n\n1. **Istiod Bootstrap (`pilot/pkg/bootstrap/sidecarinjector.go` & `pilot/pkg/bootstrap/server.go`)**  \n   - When the `INJECT_ENABLED` flag is true and the injection template exists, `initSidecarInjector` instantiates the injection `Webhook` (lines 43\u2011113).  \n   - If `features.InjectionWebhookConfigName` is populated (i.e., operator-provided webhook config), the bootstrap registers a start hook (\u201cinjection patcher\u201d) that constructs a `WebhookCertPatcher` and runs it concurrently alongside the webhook server (lines 91\u2011105 in `sidecarinjector.go`). This ensures the patcher lifecycle is tied to Istiod startup (supported by `Server`\u2019s `addStartFunc` infrastructure in `pilot/pkg/bootstrap/server.go`, which adds the registered start functions to the boot sequence\u2014see lines 230\u2011529).\n\n2. **Certificate Bundle Management (`pilot/pkg/keycertbundle/watcher.go`)**  \n   - Istiod maintains a thread-safe `keycertbundle.Watcher` that stores TLS certificates, private keys, CA bundles, and CRLs. Callers can register for notifications through `AddWatcher`, read the current bundle via `GetCABundle`, and are signaled whenever new certificates are set (`SetAndNotify`/`SetFromFilesAndNotify`, lines 37\u2011120).\n\n3. **Webhook Patching (`pkg/webhooks/webhookpatch.go` + `pkg/webhooks/util/util.go`)**  \n   - `WebhookCertPatcher` (lines 45\u2011168) watches all MutatingWebhookConfiguration resources for its targeted revision, enqueues conflicting updates, and, upon a CA bundle rotation, loads the new bundle via `util.LoadCABundle` (lines 119\u2011150).  \n   - `startCaBundleWatcher` (lines 170\u2011184) subscribes to the `keycertbundle.Watcher` and enqueues every matching webhook resource for patching whenever the CA bundle changes.  \n   - `patchMutatingWebhookConfig` (lines 120\u2011168) fetches each webhook config, validates the `istio.io/rev` label matches the intended revision, identifies the sidecar-injector webhook entry by suffix, and updates its `ClientConfig.CABundle` only if the PEM bytes differ, avoiding unnecessary API calls.  \n   - The patcher runs via a rate-limited queue (`newWebhookPatcherQueue`, lines 78\u201187) that allows rapid retries for quick conflicts but throttles longer-lived inconsistencies, ensuring resilient, API-server-friendly updates.\n\n### 2. Detailed Analysis\n\n#### A. Sidecar Injector Initialization (`pilot/pkg/bootstrap/sidecarinjector.go`)\n- `initSidecarInjector` validates injection is enabled and loads configuration either from disk or a ConfigMap (lines 43\u201174).  \n- Creates an `inject.Webhook` with parameters (lines 76\u201189) and conditionally registers the certificate patcher start function if `features.InjectionWebhookConfigName` is non-empty (lines 91\u2011105).  \n- This patcher start function builds a `WebhookCertPatcher` using the Istiod CA bundle watcher (`s.istiodCertBundleWatcher`) and revision-specific webhook name (`\"sidecar-injector.istio.io\"`) (lines 95\u2011102), then runs it asynchronously, ensuring webhook credentials stay in sync without leader election.\n\n#### B. Server Lifecycle & Certificate Watcher (`pilot/pkg/bootstrap/server.go`)\n- `Server` holds shared components: CA/RA, the `istiodCertBundleWatcher`, and supports `addStartFunc` for modular startup (lines 101\u2011189).  \n- Components needing the watcher (like the webhook patcher) rely on `istiodCertBundleWatcher` to receive CA updates (lines 164\u2011189).  \n- The server bootstrapping process (not fully expanded here) ensures `istiodCertBundleWatcher` is initialized before the patcher start hook runs, enabling timely CA bundle propagation.\n\n#### C. Certificate Bundle Watching (`pilot/pkg/keycertbundle/watcher.go`)\n- `Watcher` maintains the `KeyCertBundle` struct (cert, key, CA bundle, CRL) guarded by `sync.RWMutex` to allow concurrent reads and exclusive writes (lines 22\u201134).  \n- `AddWatcher`/`RemoveWatcher` manage subscribers, returning buffered channels signaled on updates (lines 43\u201164).  \n- `SetAndNotify` and `SetFromFilesAndNotify` safely update stored bundles and broadcast notifications by pushing to each watcher\u2019s channel (lines 66\u2011120).  \n- `GetCABundle` provides the latest PEM bundle to patchers (lines 122\u2011127). This is what `pkg/webhooks/webhookpatch.go` leverages through `util.LoadCABundle` (lines 119\u2011145), ensuring only verified PEM data is used.\n\n#### D. Webhook Certificate Patching (`pkg/webhooks/webhookpatch.go` & `pkg/webhooks/util/util.go`)\n- `WebhookCertPatcher` (lines 45\u201158) holds the target revision, webhook name suffix, queue, CA bundle watcher, and client for `MutatingWebhookConfiguration`.  \n- Construction (`NewWebhookCertPatcher`, lines 60\u201175) wires the Kubernetes client, queue, and event handlers. The queue uses a fast-slow rate limiter (lines 78\u201187) to handle conflicts gracefully.  \n- `webhookPatchTask` (lines 101\u2011117) delegates to `patchMutatingWebhookConfig`, suppressing retries for terminal conditions (missing webhook, wrong revision, name mismatch) and reporting failures on retriable errors (lines 101\u2011117).  \n- `patchMutatingWebhookConfig`:\n  - Retrieves the config with `w.webhooks.Get` (line 121).  \n  - Ensures the revision label (`istio.io/rev`) exists and matches the desired revision (lines 126\u2011135), avoiding cross-revision patches.  \n  - Loads the CA bundle via `util.LoadCABundle` (lines 139\u2011144), which in turn verifies the PEM is a valid X.509 certificate (lines 39\u201157 in `pkg/webhooks/util/util.go`).  \n  - Iterates webhooks, matching by name suffix and updating `ClientConfig.CABundle` only upon change to prevent redundant Kubernetes updates (lines 145\u2011157).  \n  - When a bundle change occurs, calls `w.webhooks.Update` to persist changes (lines 158\u2011165), with success/failure metrics emitted.  \n- `startCaBundleWatcher` (lines 170\u2011184) subscribes to the CA watcher, and on any update enqueues all tracked webhook configurations (lines 172\u2011180), prompting `patchMutatingWebhookConfig` to re-evaluate each webhook\u2019s bundle.\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| `edd43087-bf39-42b6-85b0-ed3297ec760a` | `pilot/pkg/bootstrap/sidecarinjector.go` | Entry point: initializes the sidecar injector, registers `WebhookCertPatcher` start hook when `features.InjectionWebhookConfigName` is set, linking Istiod CA rotation to webhook patching (lines 43\u2011105). |\n| `edd43087-bf39-42b6-85b0-ed3297ec760a` | `pilot/pkg/bootstrap/server.go` | Bootstraps Istiod server (contains `istiodCertBundleWatcher`, `addStartFunc` infrastructure, and component wiring) ensuring patcher lifecycle is part of startup/shutdown (lines 101\u2011189, 230\u2011529). |\n| `edd43087-bf39-42b6-85b0-ed3297ec760a` | `pilot/pkg/keycertbundle/watcher.go` | Implements CA bundle watcher that stores PEM data, notifies subscribers, and exposes `GetCABundle`, enabling `WebhookCertPatcher` to react to certificate rotations (lines 22\u2011141). |\n| `edd43087-bf39-42b6-85b0-ed3297ec760a` | `pkg/webhooks/webhookpatch.go` | Core patcher: subscribes to webhook events, loads verified CA bundles, matches webhook entries by revision and name suffix, and updates MutatingWebhookConfiguration CABundle field with rate-limited retries (lines 45\u2011184). |\n| `edd43087-bf39-42b6-85b0-ed3297ec760a` | `pkg/webhooks/util/util.go` | Provides `LoadCABundle`/`VerifyCABundle` utilities used by the patcher to validate the PEM-encoded CA bundle before writing it into MutatingWebhookConfiguration (lines 26\u201160). |\n\nThis constitutes the complete chain of files responsible for Istio\u2019s MutatingWebhookConfiguration CA bundle patching: bootstrap wiring \u2192 CA bundle watcher \u2192 patch queue \u2192 webhook config updates.",
+  "cost": {
+    "input_tokens": 1029677,
+    "output_tokens": 7706,
+    "total_tokens": 1037383,
+    "cost_usd": 0.53025
+  },
+  "status": "success",
+  "latency_seconds": 127.84,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.065
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.396
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "MutatingWebhookConfiguration",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/register.go\",\n        \"purpose\": \"Registers Kubernetes admission registration API types (v1beta1) with the runtime scheme, enabling serialization and deserialization of ValidatingWebhookConfiguration and MutatingWebhookConfiguration resources.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/client-go/kubernetes/typed/admissionregistration/v1beta1/admissionregistrat...",
+      "latency_seconds": 0.605
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "MutatingWebhookConfiguration",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"istioctl/pkg/tag/util.go\",\n        \"purpose\": \"Provides utility functions for managing Istio tags and revisions on Kubernetes resources such as MutatingWebhookConfigurations, Services, and Namespaces. Enables listing, extracting, deleting, and deactivating resources based on Istio label selectors, supporting installation and upgrade workflows.\"\n      },\n      {\n        \"path\": \"manifests/charts/default/templates/mutatingwebhook.yaml\",\n     ...",
+      "latency_seconds": 0.952
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "cainjection",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"cainjection\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"keywords\": {\n    \"data\": [],\n    \"pag...",
+      "latency_seconds": 1.036
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "caBundle",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"releasenotes/notes/37737.yaml\",\n        \"purpose\": \"This file records a release note entry for a bug\u00e2\u0080\u0091fix in the installation area. It documents the removal of the caBundle default value from a Helm chart to enable a GitOps workflow, and links the fix to issue 33052.\"\n      },\n      {\n        \"path\": \"releasenotes/notes/837475-caBundle.yaml\",\n        \"purpose\": \"Provides a release note entry documenting a bug\u00e2\u0080\u0091fix that removes the caBundl...",
+      "latency_seconds": 0.529
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pkg/webhooks/webhookpatch.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pkg/webhooks/webhookpatch.go\",\n      \"purpose\": \"Manages webhook certificate patching for Istio webhook configurations, ensuring CA bundles are updated when certificates change\",\n      \"summary\": \"{\\\"Rate Limiter\\\":\\\"Uses fast-slow rate limiter with 5 quick retries then slows down to prevent API server overload\\\",\\\"Revision Validation\\\":\\\"Ensures we...",
+      "latency_seconds": 0.133
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "pkg/webhooks/webhookpatch.go",
+        "fromLine": 45,
+        "toLine": 190,
+        "maxTokens": 6000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pkg/webhooks/webhookpatch.go\nLines: 45 - 186 of 186\n\n45 | // WebhookCertPatcher listens for webhooks on specified revision and patches their CA bundles\n46 | type WebhookCertPatcher struct {\n47 | \t// revision to patch webhooks for\n48 | \trevision    string\n49 | \twebhookName string\n50 | \n51 | \tqueue controllers.Queue\n52 | \n53 | \t// File path to the x509 certificate bundle used by the webhook server\n54 | \t// and patched into the webhook config.\n55 | \tCABundleWatcher *keycertbundle.Watcher\n56 | \n57...",
+      "latency_seconds": 0.486
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pkg/webhooks/util/util.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pkg/webhooks/util/util.go\",\n      \"purpose\": \"Provides utilities for loading and verifying CA bundles used by Istio webhooks. Defines a ConfigError type for enriched error reporting and functions to retrieve a CA bundle from a watcher and ensure it is a valid PEM-encoded X509 certificate. Other webhook components import this package to obtain truste...",
+      "latency_seconds": 0.155
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "pkg/webhooks/util/util.go",
+        "fromLine": 26,
+        "toLine": 65,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pkg/webhooks/util/util.go\nLines: 26 - 61 of 61\n\n26 | type ConfigError struct {\n27 | \terr    error\n28 | \treason string\n29 | }\n30 | \n31 | func (e ConfigError) Error() string {\n32 | \treturn e.err.Error()\n33 | }\n34 | \n35 | func (e ConfigError) Reason() string {\n36 | \treturn e.reason\n37 | }\n38 | \n39 | func LoadCABundle(caBundleWatcher *keycertbundle.Watcher) ([]byte, error) {\n40 | \tcaBundle := caBundleWatcher.GetCABundle()\n41 | \tif err := VerifyCABundle(caBundle); err != nil {\n42 | \t\treturn nil, &C...",
+      "latency_seconds": 0.436
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "keycertbundle",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pilot/pkg/keycertbundle/watcher_test.go\",\n        \"purpose\": \"Unit tests for the keycertbundle watcher component, verifying notification behavior and file-based initialization\"\n      },\n      {\n        \"path\": \"security/pkg/pki/util/keycertbundle.go\",\n        \"purpose\": \"Provides a thread\u00e2\u0080\u0091safe container (KeyCertBundle) for X.509 certificates, private keys, certificate chains, root CAs and optional CRLs, along with utilities to load, verif...",
+      "latency_seconds": 0.682
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/keycertbundle/watcher.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/keycertbundle/watcher.go\",\n      \"purpose\": \"Manages certificate and key bundles for istiod, providing thread-safe access and notification to watchers when certificates are updated\",\n      \"summary\": \"{\\\"Thread Safety\\\":\\\"Uses RWMutex to provide concurrent read access and exclusive write access to certificate bundle\\\",\\\"Observer Pattern\\\":...",
+      "latency_seconds": 0.109
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "pilot/pkg/keycertbundle/watcher.go",
+        "fromLine": 22,
+        "toLine": 150,
+        "maxTokens": 6000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pilot/pkg/keycertbundle/watcher.go\nLines: 22 - 142 of 142\n\n22 | // KeyCertBundle stores the cert, private key and root cert for istiod.\n23 | type KeyCertBundle struct {\n24 | \tCertPem  []byte\n25 | \tKeyPem   []byte\n26 | \tCABundle []byte\n27 | \tCRL      []byte\n28 | }\n29 | \n30 | type Watcher struct {\n31 | \tmutex     sync.RWMutex\n32 | \tbundle    KeyCertBundle\n33 | \twatcherID int32\n34 | \twatchers  map[int32]chan struct{}\n35 | }\n36 | \n37 | func NewWatcher() *Watcher {\n38 | \treturn &Watcher{\n39 | \t\twat...",
+      "latency_seconds": 0.457
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "WebhookCertPatcher",
+        "channels": [
+          "functions",
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/webhooks/webhookpatch.go\",\n        \"purpose\": \"Manages webhook certificate patching for Istio webhook configurations, ensuring CA bundles are updated when certificates change\"\n      }\n    ],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 1,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    }\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"p...",
+      "latency_seconds": 0.531
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/bootstrap/sidecarinjector.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/bootstrap/sidecarinjector.go\",\n      \"purpose\": \"The file initializes and registers the Istio sidecar injection mutating webhook, selecting configuration from local files or a ConfigMap, and optionally patches its TLS certificate based on feature flags.\",\n      \"summary\": \"{\\\"Webhook Initialization\\\":\\\"Creates the mutating webhook using in...",
+      "latency_seconds": 0.116
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "pilot/pkg/bootstrap/sidecarinjector.go",
+        "fromLine": 33,
+        "toLine": 150,
+        "maxTokens": 6000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pilot/pkg/bootstrap/sidecarinjector.go\nLines: 33 - 122 of 122\n\n33 | const (\n34 | \t// Name of the webhook config in the config - no need to change it.\n35 | \twebhookName = \"sidecar-injector.istio.io\"\n36 | \t// defaultInjectorConfigMapName is the default name of the ConfigMap with the injection config\n37 | \t// The actual name can be different - use getInjectorConfigMapName\n38 | \tdefaultInjectorConfigMapName = \"istio-sidecar-injector\"\n39 | )\n40 | \n41 | var injectionEnabled = env.Register(\"INJECT_EN...",
+      "latency_seconds": 0.452
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "istiodCertBundleWatcher",
+        "channels": [
+          "paths",
+          "purpose",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[paths] 0 results for \\\"istiodCertBundleWatcher\\\". Full paths are brittle \u00e2\u0080\u0094 the stored relative_path may differ by prefix or structure. Try searching with just the FILENAME (e.g. \\\"shared_informer.go\\\" instead of \\\"staging/src/k8s.io/client-go/tools/cache/shared_informer.go\\\"). Or swi...",
+      "latency_seconds": 0.546
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "CertBundleWatcher",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"CertBundleWatcher\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"keywords\": {\n    \"data\": [],\n  ...",
+      "latency_seconds": 0.826
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "CABundleWatcher",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"CABundleWatcher\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"keywords\": {\n    \"data\": [\n      ...",
+      "latency_seconds": 0.539
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/bootstrap/server.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/bootstrap/server.go\",\n      \"purpose\": \"pilot/pkg/bootstrap/server.go#chunk0: Bootstrap and launch the Istio Pilot discovery service with all required components.\\npilot/pkg/bootstrap/server.go#chunk1: \\npilot/pkg/bootstrap/server.go#chunk2: Wire together server components, security assets, and health checks during Pilot startup.\",\n      \"...",
+      "latency_seconds": 0.114
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "certBundle",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pilot/pkg/keycertbundle/watcher_test.go\",\n        \"purpose\": \"Unit tests for the keycertbundle watcher component, verifying notification behavior and file-based initialization\"\n      },\n      {\n        \"path\": \"security/pkg/pki/util/keycertbundle.go\",\n        \"purpose\": \"Provides a thread\u00e2\u0080\u0091safe container (KeyCertBundle) for X.509 certificates, private keys, certificate chains, root CAs and optional CRLs, along with utilities to load, verif...",
+      "latency_seconds": 0.523
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "pilot/pkg/bootstrap/server.go",
+        "fromLine": 101,
+        "toLine": 250,
+        "maxTokens": 6000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pilot/pkg/bootstrap/server.go\nLines: 101 - 250 of 1415\nMore: fromLine=251\n\n101 | // readinessProbe defines a function that will be used indicate whether a server is ready.\n102 | type readinessProbe func() bool\n103 | \n104 | // Server contains the runtime configuration for the Pilot discovery service.\n105 | type Server struct {\n106 | \tXDSServer *xds.DiscoveryServer\n107 | \n108 | \tclusterID   cluster.ID\n109 | \tenvironment *model.Environment\n110 | \n111 | \tkubeClient kubelib.Client\n112 | \n113 | \tmul...",
+      "latency_seconds": 1.094
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "pilot/pkg/bootstrap/server.go",
+        "fromLine": 1190,
+        "toLine": 1330,
+        "maxTokens": 6000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pilot/pkg/bootstrap/server.go\nLines: 1190 - 1330 of 1415\nMore: fromLine=1331\n\n1190 | \t\t\tNewLeaderElection(args.Namespace, args.PodName, leaderelection.IPAutoallocateController, args.Revision, s.kubeClient).\n1191 | \t\t\tAddRunFunction(func(leaderStop <-chan struct{}) {\n1192 | \t\t\t\tipallocate := ipallocate.NewIPAllocator(leaderStop, s.kubeClient)\n1193 | \t\t\t\tipallocate.Run(leaderStop)\n1194 | \t\t\t}).Run(stop)\n1195 | \t\treturn nil\n1196 | \t})\n1197 | }\n1198 | \n1199 | func (s *Server) initMulticluster(args...",
+      "latency_seconds": 1.138
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "istiodCertBundle",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"istiodCertBundle\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"keywords\": {\n    \"data\": [],\n   ...",
+      "latency_seconds": 0.592
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "keycertbundle.NewWatcher",
+        "channels": [
+          "functions",
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"keycertbundle.NewWatcher\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"purpose\": {\n    \"data\": [],...",
+      "latency_seconds": 0.714
+    }
+  ],
+  "error": ""
+}

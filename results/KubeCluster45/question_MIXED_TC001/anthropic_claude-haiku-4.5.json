@@ -1,0 +1,251 @@
+{
+  "model": "anthropic/claude-haiku-4.5",
+  "answer": "Perfect! Now I have comprehensive information. Let me compile the final analysis with all the relevant files.\n\n## Phase 3: Synthesis & Answer\n\nBased on my exhaustive analysis of the codebase across ArgoCD, cert-manager, OpenTelemetry Operator, and related Kubernetes infrastructure tools, here is the complete impact analysis of adding a new `WaitForCacheSync(ctx context.Context) bool` method to the `SharedInformer` interface in `k8s.io/client-go/tools/cache`.\n\n---\n\n### 1. Architecture Overview\n\nThe `SharedInformer` interface is a foundational abstraction in Kubernetes client-go that enables efficient, cached watching of API resources. It sits at the core of the Kubernetes controller pattern used across all major infrastructure tools:\n\n**Request/Data Path:**\n1. **Informer Initialization** \u2192 Factory creates SharedInformer instances for each resource type\n2. **Cache Synchronization** \u2192 Informer starts watching API server, populating local cache via reflector\n3. **Event Distribution** \u2192 Resource changes trigger event handlers (Add/Update/Delete)\n4. **Controller Processing** \u2192 Controllers wait for cache sync before processing items from work queues\n5. **Reconciliation** \u2192 Controllers use cached data to reconcile desired vs. live state\n\nThe new `WaitForCacheSync(ctx context.Context) bool` method would provide a context-aware, cancellable way for controllers to block until their informer caches are fully synchronized with the API server\u2014critical for preventing stale-data bugs in production systems.\n\n**Current Pattern (without context):**\n- `WaitForCacheSync()` blocks indefinitely\n- No way to cancel or timeout\n- Controllers must use external timeout mechanisms\n\n**New Pattern (with context):**\n- `WaitForCacheSync(ctx)` respects context cancellation\n- Enables graceful shutdown and timeout handling\n- Aligns with Go best practices for concurrent operations\n\n---\n\n### 2. Detailed Analysis\n\n#### **A. Kubernetes Core (k8s.io/client-go)**\n\nThe base implementation and interface definition:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **SharedInformer Interface** | `staging/src/k8s.io/client-go/tools/cache/shared_informer.go` | **MUST IMPLEMENT** - Defines the interface. Lines 40-238 define SharedInformer interface. Must add `WaitForCacheSync(ctx context.Context) bool` method signature. |\n| **SharedIndexInformer Implementation** | `staging/src/k8s.io/client-go/tools/cache/shared_informer.go` (L416-476) | **MUST IMPLEMENT** - The `sharedIndexInformer` struct implements SharedInformer. Must implement the new method. Current `HasSynced()` (L612-620) checks sync status; new method wraps this with context awareness. |\n| **Factory Interface** | `staging/src/k8s.io/client-go/informers/factory.go` (L239-314) | **MUST ADAPT** - SharedInformerFactory interface defines `WaitForCacheSync()` (L213). Must add context-aware variant or update existing signature. |\n| **Factory Implementation** | `staging/src/k8s.io/client-go/informers/factory.go` (L160-213) | **MUST IMPLEMENT** - The factory's `WaitForCacheSync()` method (L160-213) coordinates sync across all informers. Must implement context-aware version. |\n| **Controller** | `staging/src/k8s.io/client-go/tools/cache/controller.go` | **SHOULD ADAPT** - Low-level controller used by informers. May need to support context cancellation in its sync loop. |\n| **DynamicInformer** | `staging/src/k8s.io/client-go/dynamic/dynamicinformer/informer.go` | **MUST IMPLEMENT** - Dynamic informer wrapper must implement new method. |\n| **DynamicInformer Interface** | `staging/src/k8s.io/client-go/dynamic/dynamicinformer/interface.go` | **MUST ADAPT** - Interface definition must include new method. |\n\n**Code-Level Details:**\n- **Current `WaitForCacheSync()` signature** (L395-415 in shared_informer.go):\n  ```go\n  func WaitForCacheSync(stopCh <-chan struct{}, cacheSyncs ...InformerSynced) bool\n  ```\n- **New signature needed:**\n  ```go\n  func WaitForCacheSync(ctx context.Context) bool\n  ```\n- **Implementation pattern** (in sharedIndexInformer):\n  - Loop checking `HasSynced()` (L612-620)\n  - Respect context cancellation via `ctx.Done()`\n  - Return `false` if context cancelled before sync completes\n\n---\n\n#### **B. ArgoCD (Application Delivery)**\n\nArgoCD uses informers extensively for watching Applications, ApplicationSets, and cluster resources:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **Informer Factory** | `pkg/client/informers/externalversions/factory.go` | **MUST ADAPT** - Generated factory for ArgoCD CRDs (Application, ApplicationSet, etc.). Must implement new method on factory interface. |\n| **Application Controller** | `cmd/argocd-application-controller/commands/argocd_application_controller.go` (L101-254) | **SHOULD ADAPT** - Entry point for application controller. Currently initializes informers and waits for sync. Should use context-aware sync with graceful shutdown timeout. |\n| **Application Controller State** | `controller/state.go` (L545-753) | **SHOULD ADAPT** - Core reconciliation logic that compares Git state with cluster state. Depends on informer cache being synced. Could benefit from context-aware sync to prevent stale comparisons. |\n| **Application Controller Sync** | `controller/sync.go` (L120-432) | **SHOULD ADAPT** - Synchronization orchestration. Relies on informer caches being up-to-date. Context-aware sync would improve reliability. |\n| **Notification Controller** | `notification_controller/controller/controller.go` (L191-193) | **MUST ADAPT** - Monitors applications and projects via informers. Line 191-193 shows cache sync call. Must use new context-aware method. |\n| **Server** | `server/server.go` (L557-564) | **SHOULD ADAPT** - Main API server initializes informers. Graceful shutdown (L570-751) could use context-aware sync. |\n| **ApplicationSet Controller** | `applicationset/controllers/applicationset_controller.go` | **SHOULD ADAPT** - Watches ApplicationSet resources and related resources. Informer initialization should use context-aware sync. |\n\n**Code-Level Details:**\n- **Notification Controller** (L191-193):\n  ```go\n  // Current pattern - no context\n  if !cache.WaitForCacheSync(stopCh, c.applications.HasSynced, c.appProjects.HasSynced) {\n      return fmt.Errorf(\"failed to sync caches\")\n  }\n  ```\n  **Should become:**\n  ```go\n  ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)\n  defer cancel()\n  if !c.applications.WaitForCacheSync(ctx) || !c.appProjects.WaitForCacheSync(ctx) {\n      return fmt.Errorf(\"failed to sync caches\")\n  }\n  ```\n\n---\n\n#### **C. cert-manager (Certificate Management)**\n\ncert-manager uses informers to watch Certificates, Issuers, ClusterIssuers, and Secrets:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **Informer Factory** | `pkg/client/informers/externalversions/factory.go` | **MUST ADAPT** - Generated factory for cert-manager CRDs (Certificate, Issuer, ClusterIssuer, CertificateRequest, Order, Challenge). Must implement new method. |\n| **Issuer Controller** | `pkg/controller/issuers/controller.go` (L67-108) | **MUST ADAPT** - Watches Issuer resources and Secrets. Register method (L67-108) sets up informers. Must use context-aware sync. |\n| **ClusterIssuer Controller** | `pkg/controller/clusterissuers/controller.go` (L68-113) | **MUST ADAPT** - Watches ClusterIssuer resources. Register function (L68-113) sets up informers. Must use context-aware sync. |\n| **CertificateRequest Controller** | `pkg/controller/certificaterequests/controller.go` (L104-209) | **MUST ADAPT** - Generic controller for CertificateRequest resources. Constructor (L104-209) registers informers. Must use context-aware sync. |\n| **ACME Challenge Controller** | `pkg/controller/acmechallenges/controller.go` (L86-166) | **MUST ADAPT** - Watches ACME challenges and related resources. Initialization (L86-166) sets up informers. Must use context-aware sync. |\n| **Controller Start** | `cmd/controller/app/start.go` (L59-128) | **MUST ADAPT** - Entry point for controller binary. PreRunE and RunE (L59-128) initialize and start controllers. Should use context-aware sync with timeout. |\n\n**Code-Level Details:**\n- **ClusterIssuer Controller** (L88-91):\n  ```go\n  // Current pattern\n  if !cache.WaitForCacheSync(stopCh, c.issuerInformer.HasSynced, c.secretInformer.HasSynced) {\n      return fmt.Errorf(\"failed to sync caches\")\n  }\n  ```\n  **Should become:**\n  ```go\n  ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)\n  defer cancel()\n  if !c.issuerInformer.WaitForCacheSync(ctx) || !c.secretInformer.WaitForCacheSync(ctx) {\n      return fmt.Errorf(\"failed to sync caches\")\n  }\n  ```\n\n---\n\n#### **D. OpenTelemetry Operator (Observability)**\n\nOpenTelemetry Operator uses informers to watch OpenTelemetryCollector, TargetAllocator, and Prometheus CRs:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **Main Entry Point** | `main.go` (L81-200) | **MUST ADAPT** - Initializes controller-runtime manager and reconcilers. Manager setup (L81-200) configures informers. Should use context-aware sync. |\n| **OpenTelemetryCollector Controller** | `internal/controllers/opentelemetrycollector_controller.go` (L227-305) | **MUST ADAPT** - Reconciliation logic (L227-305) depends on informer caches. Should use context-aware sync for resource discovery. |\n| **Prometheus Operator Watcher** | `cmd/otel-allocator/internal/watcher/promOperator.go` (L250-313) | **MUST ADAPT** - Creates informers for ServiceMonitor, PodMonitor, Probe, ScrapeConfig. Watch method (L316-411) starts informers. Must use context-aware sync. |\n| **Prometheus Operator Watcher Test** | `cmd/otel-allocator/internal/watcher/promOperator_test.go` | **SHOULD ADAPT** - Tests informer setup. Should test context-aware sync behavior. |\n| **Reconcile Test** | `internal/controllers/reconcile_test.go` (L615-698) | **SHOULD ADAPT** - Tests reconciliation logic. Should verify context-aware sync in test setup. |\n\n**Code-Level Details:**\n- **Prometheus Operator Watcher** (L541-569):\n  ```go\n  // Current pattern - WaitForNamedCacheSync\n  func (p *PrometheusCRWatcher) WaitForNamedCacheSync(ctx context.Context) bool {\n      // Custom implementation waiting for specific informers\n  }\n  ```\n  **Should leverage new SharedInformer method:**\n  ```go\n  func (p *PrometheusCRWatcher) WaitForNamedCacheSync(ctx context.Context) bool {\n      for _, informer := range p.informers {\n          if !informer.WaitForCacheSync(ctx) {\n              return false\n          }\n      }\n      return true\n  }\n  ```\n\n---\n\n#### **E. OpenTelemetry Collector Contrib (Telemetry Collection)**\n\nOpenTelemetry Collector uses informers for Kubernetes resource discovery:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **k8s Attributes Processor Client** | `processor/k8sattributesprocessor/internal/kube/client.go` (L193-377) | **MUST ADAPT** - Manages informers for Pods, Nodes, Deployments, etc. Start method (L254-378) initializes informers. Must use context-aware sync. |\n| **k8s Cluster Receiver Watcher** | `receiver/k8sclusterreceiver/watcher.go` (L220-284) | **MUST ADAPT** - Sets up informers for cluster resource discovery. Informer setup (L220-284) must use context-aware sync. |\n| **k8s Config** | `internal/k8sconfig/config.go` | **SHOULD ADAPT** - Configuration for Kubernetes integration. May initialize informers. Should support context-aware sync. |\n\n**Code-Level Details:**\n- **k8s Attributes Processor** (L254-378):\n  ```go\n  // Current pattern - no context\n  if !cache.WaitForCacheSync(stopCh, informers...) {\n      return fmt.Errorf(\"failed to sync caches\")\n  }\n  ```\n  **Should become:**\n  ```go\n  ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)\n  defer cancel()\n  for _, informer := range informers {\n      if !informer.WaitForCacheSync(ctx) {\n          return fmt.Errorf(\"failed to sync cache for %v\", informer)\n      }\n  }\n  ```\n\n---\n\n#### **F. Istio (Service Mesh)**\n\nIstio uses informers for service discovery and configuration:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **Informer Factory** | `pkg/kube/informerfactory/factory.go` (L81-251) | **MUST ADAPT** - Custom factory for Istio informers. Start method (L173-219) and WaitForCacheSync (L220-251) must support context. |\n| **Service Controller** | `pilot/pkg/bootstrap/servicecontroller.go` (L32-94) | **SHOULD ADAPT** - Initializes service controllers with informers. Should use context-aware sync. |\n| **Multicluster Cluster** | `pkg/kube/multicluster/cluster.go` | **SHOULD ADAPT** - Manages informers for multi-cluster scenarios. Should use context-aware sync. |\n\n**Code-Level Details:**\n- **Istio Informer Factory** (L220-251):\n  ```go\n  // Current pattern\n  func (f *informerFactory) WaitForCacheSync(stopCh <-chan struct{}) bool {\n      // Waits for all informers\n  }\n  ```\n  **Should add context variant:**\n  ```go\n  func (f *informerFactory) WaitForCacheSync(ctx context.Context) bool {\n      // Waits for all informers with context cancellation\n  }\n  ```\n\n---\n\n#### **G. External Secrets Operator**\n\nExternal Secrets uses informers for secret management:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **Informer Manager** | `pkg/controllers/externalsecret/informer_manager.go` | **SHOULD ADAPT** - Manages informers for ExternalSecret resources. Should use context-aware sync. |\n| **Controller Root** | `cmd/controller/root.go` | **SHOULD ADAPT** - Entry point for controller. Should use context-aware sync with timeout. |\n\n---\n\n#### **H. Cilium (Networking)**\n\nCilium uses informers for network policy and service discovery:\n\n| Component | File | Impact |\n|-----------|------|--------|\n| **Informer Factory** | `pkg/k8s/client/informers/externalversions/factory.go` | **MUST ADAPT** - Generated factory for Cilium CRDs. Must implement new method. |\n| **Slim Informer Factory**",
+  "llm_condensed_answer": "SUMMARY: Adding a context-aware WaitForCacheSync method to the SharedInformer interface requires implementation in the core client-go library and adaptation across major Kubernetes ecosystem projects. This change impacts controller initialization patterns in ArgoCD, cert-manager, OpenTelemetry Operator, and related tools that rely on informer cache synchronization for reliable operation.\n\nFILES:\n- kubernetes/staging/src/k8s.io/client-go/tools/cache/shared_informer.go \u2014 Defines SharedInformer interface and sharedIndexInformer implementation\n- kubernetes/staging/src/k8s.io/client-go/informers/factory.go \u2014 SharedInformerFactory interface and implementation\n- kubernetes/staging/src/k8s.io/client-go/dynamic/dynamicinformer/informer.go \u2014 DynamicInformer implementation\n- kubernetes/staging/src/k8s.io/client-go/dynamic/dynamicinformer/interface.go \u2014 DynamicInformer interface definition\n- argoproj/argo-cd/pkg/client/informers/externalversions/factory.go \u2014 Generated informer factory for ArgoCD CRDs\n- argoproj/argo-cd/cmd/argocd-application-controller/commands/argocd_application_controller.go \u2014 Application controller entry point\n- argoproj/argo-cd/controller/state.go \u2014 Core reconciliation logic\n- argoproj/argo-cd/controller/sync.go \u2014 Synchronization orchestration\n- argoproj/argo-cd/notification_controller/controller/controller.go \u2014 Notification controller with cache sync\n- argoproj/argo-cd/server/server.go \u2014 API server initialization\n- argoproj/argo-cd/applicationset/controllers/applicationset_controller.go \u2014 ApplicationSet controller\n- cert-manager/pkg/client/informers/externalversions/factory.go \u2014 Generated informer factory for cert-manager CRDs\n- cert-manager/pkg/controller/issuers/controller.go \u2014 Issuer controller initialization\n- cert-manager/pkg/controller/clusterissuers/controller.go \u2014 ClusterIssuer controller initialization\n- cert-manager/pkg/controller/certificaterequests/controller.go \u2014 CertificateRequest controller constructor\n- cert-manager/pkg/controller/acmechallenges/controller.go \u2014 ACME challenge controller initialization\n- cert-manager/cmd/controller/app/start.go \u2014 Controller binary entry point\n- open-telemetry/opentelemetry-operator/main.go \u2014 Operator entry point and manager setup\n- open-telemetry/opentelemetry-operator/internal/controllers/opentelemetrycollector_controller.go \u2014 OpenTelemetryCollector controller reconciliation\n- open-telemetry/opentelemetry-operator/cmd/otel-allocator/internal/watcher/promOperator.go \u2014 Prometheus CR watcher with informers\n- open-telemetry/opentelemetry-operator/cmd/otel-allocator/internal/watcher/promOperator_test.go \u2014 Prometheus watcher tests\n- open-telemetry/opentelemetry-operator/internal/controllers/reconcile_test.go \u2014 Reconciliation tests\n- open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/kube/client.go \u2014 k8s attributes processor client\n- open-telemetry/opentelemetry-collector-contrib/receiver/k8sclusterreceiver/watcher.go \u2014 k8s cluster receiver watcher\n- open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig/config.go \u2014 Kubernetes configuration\n- istio/istio/pkg/kube/informerfactory/factory.go \u2014 Istio custom informer factory\n- istio/istio/pilot/pkg/bootstrap/servicecontroller.go \u2014 Service controller initialization\n- istio/istio/pkg/kube/multicluster/cluster.go \u2014 Multi-cluster informer management\n- external-secrets/pkg/controllers/externalsecret/informer_manager.go \u2014 ExternalSecret informer manager\n- external-secrets/cmd/controller/root.go \u2014 Controller entry point\n- cilium/cilium/pkg/k8s/client/informers/externalversions/factory.go \u2014 Generated informer factory for Cilium CRDs",
+  "cost": {
+    "input_tokens": 620350,
+    "output_tokens": 6221,
+    "total_tokens": 626571,
+    "cost_usd": 0.651455
+  },
+  "status": "success",
+  "latency_seconds": 97.36,
+  "tool_calls_count": 23,
+  "agent_steps": 9,
+  "tool_calls": [
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"keyPatterns\":[\"Declarative Configuration (Kustomization Schema)\",\"Filter-Based Pipeline (Reader-Filter-Writer)\",\"Plugin Architecture (Built-in, Exec, KRM Function)\",\"Base/Overlay Composition with Component Reuse\",\"Resource Identity Management (ResId/GVKN)\",\"Event Sourcing / Provenance Tracking\",\"Static Site Generation (Hugo + Docsy)\",\"Golden File Testing\",\"Semantic Ve...",
+      "latency_seconds": 3.331
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformer WaitForCacheSync"
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformer WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 415,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"opentelemetry-collector-contrib\",\n    \"grafana\",\n    \"autoscaler\",\n    \"external-dns\",\n    \"cert-manager\",\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/code-generator/examples/crd/informers/externalversions/factory.go\",...",
+      "latency_seconds": 5.143
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "informer cache sync kubernetes client-go"
+      },
+      "result_preview": "{\n  \"query\": \"informer cache sync kubernetes client-go\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"autoscaler\",\n    \"kubernetes\",\n    \"external-dns\",\n    \"istio\",\n    \"opentelemetry-collector-contrib\",\n    \"cert-manager\",\n    \"grafana\",\n    \"cilium\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"addon-resizer/vendor/k8s.io/client-go/tools/cache/shared_informer...",
+      "latency_seconds": 6.297
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer interface implementation"
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer interface implementation\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"autoscaler\",\n    \"kubernetes\",\n    \"grafana\",\n    \"argo-cd\",\n    \"opentelemetry-collector-contrib\",\n    \"crossplane\",\n    \"jaeger\",\n    \"external-secrets\",\n    \"cilium\",\n    \"helm\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"cluster-autoscaler/apis/capacit...",
+      "latency_seconds": 4.89
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "ArgoCD informer controller reconciliation"
+      },
+      "result_preview": "{\n  \"query\": \"ArgoCD informer controller reconciliation\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"cert-manager\",\n    \"argo-cd\",\n    \"external-secrets\",\n    \"grafana\",\n    \"autoscaler\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/informers/apps/v1beta1/controllerrevision.go\",\n      \"repo_name\": \"kubernetes\",\n  ...",
+      "latency_seconds": 4.537
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cert-manager controller informer sync"
+      },
+      "result_preview": "{\n  \"query\": \"cert-manager controller informer sync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"gatekeeper\",\n    \"external-secrets\",\n    \"cert-manager\",\n    \"grafana\",\n    \"autoscaler\",\n    \"prometheus\",\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/informers/apps/v1beta1/controllerrevision.go\",\n   ...",
+      "latency_seconds": 4.595
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "OpenTelemetry Operator controller informer"
+      },
+      "result_preview": "{\n  \"query\": \"OpenTelemetry Operator controller informer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"karpenter\",\n    \"opentelemetry-operator\",\n    \"argo-cd\",\n    \"autoscaler\",\n    \"cilium\",\n    \"grafana\",\n    \"loki\",\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/informers/apps/v1beta1/controlle...",
+      "latency_seconds": 4.518
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "Prometheus operator controller informer"
+      },
+      "result_preview": "{\n  \"query\": \"Prometheus operator controller informer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"opentelemetry-operator\",\n    \"kubernetes\",\n    \"karpenter\",\n    \"argo-cd\",\n    \"grafana\",\n    \"cilium\",\n    \"loki\",\n    \"external-secrets\",\n    \"ingress-nginx\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"cmd/otel-allocator/internal/watcher/promOperator.go\",\n   ...",
+      "latency_seconds": 3.776
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "pkg/client/informers/externalversions/factory.go",
+          "server/server.go",
+          "notification_controller/controller/controller.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"purpose\": \"Factory for creating shared Kubernetes informers for ArgoCD custom resources, managing lifecycle and caching of resource watchers across namespaces.\",\n      \"summary\": \"{\\\"Design Pattern (~L22-40)\\\":\\\"Factory pattern for creating and managing shared informers, centralizing resource watching and caching logic.\\...",
+      "latency_seconds": 1.071
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "pkg/client/informers/externalversions/factory.go",
+          "pkg/controller/certificaterequests/controller.go",
+          "pkg/controller/acmechallenges/controller.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"purpose\": \"Provides a factory for creating shared informers for cert-manager's custom resources (ACME and cert-manager API groups). It manages the lifecycle of informers, including starting, stopping, and synchronizing caches, and is used by controllers to watch for changes to resources like certificates, issuers, and or...",
+      "latency_seconds": 0.414
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePaths": [
+          "main.go",
+          "cmd/otel-allocator/internal/watcher/promOperator.go",
+          "internal/autodetect/prometheus/operator.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n  \"files\": [\n    {\n      \"path\": \"main.go\",\n      \"purpose\": \"Main entry point for the OpenTelemetry Operator, responsible for initializing the Kubernetes controller manager, configuring webhooks, setting up reconcilers, and managing the operator's lifecycle and feature gates.\",\n      \"summary\": \"{\\\"Design Pattern (~L81-200)\\\":\\\"Uses a controller-runtime manager pattern to orchestrate Kubernetes controllers and...",
+      "latency_seconds": 0.404
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "WaitForCacheSync controller start initialization"
+      },
+      "result_preview": "{\n  \"query\": \"WaitForCacheSync controller start initialization\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"karpenter\",\n    \"kubernetes\",\n    \"crossplane\",\n    \"cert-manager\",\n    \"istio\",\n    \"argo-cd\",\n    \"gatekeeper\",\n    \"ingress-nginx\",\n    \"opentelemetry-collector\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/controllers/nodeclaim/lifecycle/initial...",
+      "latency_seconds": 3.921
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "informer factory start sync cache kubernetes"
+      },
+      "result_preview": "{\n  \"query\": \"informer factory start sync cache kubernetes\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"istio\",\n    \"grafana\",\n    \"cilium\",\n    \"argo-cd\",\n    \"autoscaler\",\n    \"cert-manager\",\n    \"opentelemetry-collector-contrib\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/informers/factory.go\",\n      \"repo_na...",
+      "latency_seconds": 3.917
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "controller-runtime manager reconciler setup"
+      },
+      "result_preview": "{\n  \"query\": \"controller-runtime manager reconciler setup\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"external-secrets\",\n    \"crossplane\",\n    \"cilium\",\n    \"autoscaler\",\n    \"grafana\",\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/kubelet/pluginmanager/plugin_manager.go\",\n      \"repo_name\": \"kubernetes\",\n      \"knowledge_i...",
+      "latency_seconds": 2.086
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "861aece6-9526-4522-8e22-4699961b1c9c",
+        "relativePaths": [
+          "staging/src/k8s.io/client-go/tools/cache/shared_informer.go",
+          "staging/src/k8s.io/client-go/informers/factory.go",
+          "staging/src/k8s.io/client-go/tools/cache/controller.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n  \"files\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/tools/cache/shared_informer.go\",\n      \"purpose\": \"staging/src/k8s.io/client-go/tools/cache/shared_informer.go#chunk0: This chunk defines the core interfaces, structs, and functions for SharedInformers in Kubernetes client-go, enabling cached, eventually consistent access to API object collections with event notification capabilities.\\nstaging/src/k...",
+      "latency_seconds": 0.988
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pkg/kube/informerfactory/factory.go",
+          "pilot/pkg/bootstrap/servicecontroller.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pkg/kube/informerfactory/factory.go\",\n      \"purpose\": \"Provides a unified factory for creating, starting, and managing shared Kubernetes informers with support for multiple filters, dynamic types, and graceful shutdown. It abstracts informer lifecycle (Start, WaitForCacheSync, Shutdown) and ensures unique informer instances via a composite key.\",\n      \"summary\": \"{\\\"Factory P...",
+      "latency_seconds": 0.809
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "11013c10-9fdc-4638-8651-c1f2abb23c81",
+        "relativePaths": [
+          "processor/k8sattributesprocessor/internal/kube/client.go",
+          "receiver/k8sclusterreceiver/watcher.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"11013c10-9fdc-4638-8651-c1f2abb23c81\",\n  \"files\": [\n    {\n      \"path\": \"processor/k8sattributesprocessor/internal/kube/client.go\",\n      \"purpose\": \"This file implements a Kubernetes WatchClient that monitors cluster resources (Pods, Namespaces, Nodes, Deployments, StatefulSets, DaemonSets, Jobs, ReplicaSets) and maintains in-memory caches for fast resource-to-telemetry correlation. It handles event processing, metadata extraction, and lifecycle ma...",
+      "latency_seconds": 0.808
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "application controller sync reconcile argo-cd"
+      },
+      "result_preview": "{\n  \"query\": \"application controller sync reconcile argo-cd\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"argo-cd\",\n    \"gatekeeper\",\n    \"crossplane\",\n    \"cert-manager\",\n    \"kubernetes\",\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"applicationset/controllers/applicationset_controller.go\",\n      \"repo_name\": \"argo-cd\",\n      \"kno...",
+      "latency_seconds": 2.847
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "issuer controller reconcile cert-manager"
+      },
+      "result_preview": "{\n  \"query\": \"issuer controller reconcile cert-manager\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"cert-manager\",\n    \"crossplane\",\n    \"gatekeeper\",\n    \"cilium\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/controller/clusterissuers/controller.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"sc...",
+      "latency_seconds": 2.416
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "reconciler setup opentelemetry operator"
+      },
+      "result_preview": "{\n  \"query\": \"reconciler setup opentelemetry operator\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"opentelemetry-operator\",\n    \"tempo\",\n    \"grafana\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"internal/controllers/reconcile_test.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0....",
+      "latency_seconds": 2.781
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "controller/state.go",
+          "controller/sync.go",
+          "cmd/argocd-application-controller/commands/argocd_application_controller.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"controller/state.go\",\n      \"purpose\": \"Manages application state comparison and synchronization in ArgoCD by comparing Git repository manifests with live Kubernetes cluster states, generating manifests, handling reconciliation, and providing interfaces for state management across multiple sources. Manages application state comparison and synchronization in ArgoCD's controller,...",
+      "latency_seconds": 0.398
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "pkg/controller/issuers/controller.go",
+          "pkg/controller/clusterissuers/controller.go",
+          "cmd/controller/app/start.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controller/issuers/controller.go\",\n      \"purpose\": \"This file defines the controller for the Issuer custom resource in cert-manager. It is responsible for watching Issuer resources and their associated Secrets, queuing reconciliation requests, and triggering the sync logic which delegates to specific issuer implementations (e.g., ACME, CA, Vault).\",\n      \"summary\": \"{\\\"Co...",
+      "latency_seconds": 0.404
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePaths": [
+          "internal/controllers/opentelemetrycollector_controller.go",
+          "internal/controllers/reconcile_test.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n  \"files\": [\n    {\n      \"path\": \"internal/controllers/opentelemetrycollector_controller.go\",\n      \"purpose\": \"This file implements the Kubernetes controller for the OpenTelemetryCollector custom resource. It defines the reconciliation logic to manage the lifecycle of OpenTelemetry Collector instances, including creation, updates, deletion, and status handling. It orchestrates the generation of Kubernetes reso...",
+      "latency_seconds": 0.404
+    }
+  ],
+  "error": ""
+}

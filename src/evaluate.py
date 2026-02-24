@@ -35,7 +35,11 @@ def load_model_answers(folder_path: Path) -> list[dict]:
     answer_files = [
         f for f in sorted(folder_path.iterdir())
         if f.suffix == ".json"
-        and f.name not in ("question.json", "evaluation.json", "analysis.json", "analysis_summary.json")
+        and f.name not in (
+            "question.json", "evaluation.json", "analysis.json",
+            "analysis_summary.json", "ground_truth.json",
+            "claude_opus_4.6_direct_data_access.json",
+        )
     ]
 
     answers = []
@@ -144,6 +148,26 @@ def generate_comparative_analysis(
 
     q_text = question.get("question", "")
 
+    # Load ground truth if available
+    ground_truth_text = ""
+    gt_file = folder_path / "ground_truth.json"
+    if gt_file.exists():
+        with open(gt_file) as f:
+            gt_data = json.load(f)
+        # Build ground truth section from expected_files and condensed answer
+        gt_answer = gt_data.get("llm_condensed_answer") or gt_data.get("answer", "")
+        gt_expected = gt_data.get("expected_files", [])
+        gt_parts = [gt_answer]
+        if gt_expected:
+            gt_parts.append("\nExpected files:")
+            for ef in gt_expected:
+                repo = ef.get("repo", "")
+                files = ef.get("files", [])
+                reason = ef.get("reason", "")
+                for fp in files:
+                    gt_parts.append(f"  - {repo}/{fp} — {reason}")
+        ground_truth_text = "\n".join(gt_parts)
+
     # Load evaluation data
     eval_file = folder_path / "evaluation.json"
     if not eval_file.exists():
@@ -185,26 +209,35 @@ def generate_comparative_analysis(
     models_text = "\n\n".join(model_sections)
     model_names = [me["model"] for me in active_evals]
 
+    # Build ground truth section for the prompt
+    gt_prompt_section = ""
+    if ground_truth_text:
+        gt_prompt_section = (
+            f"GROUND TRUTH (reference answer — use this as the authoritative baseline):\n"
+            f"{ground_truth_text}\n\n"
+        )
+
     prompt = (
         "You are an expert evaluator for a code-impact-analysis benchmark.\n\n"
         "A question was asked about cross-repository code impact. Multiple AI models provided answers. "
         "Each model had access to a knowledge graph of 25 Cloud Native repositories and used tool calls "
         "to search and retrieve file information before answering.\n\n"
         f"QUESTION:\n{q_text}\n\n"
+        f"{gt_prompt_section}"
         f"MODEL ANSWERS:\n\n{models_text}\n\n"
         "Score each model's answer INDEPENDENTLY as a percentage accuracy (0-100).\n"
         "Each model gets its own score — scores are NOT relative to each other.\n\n"
         "Weighted criteria:\n\n"
         "1. FILE ACCURACY (60% of score):\n"
-        "   - Did the model identify the correct affected repositories and files?\n"
-        "   - Are the listed files actually relevant to the interface/function change?\n"
-        "   - What fraction of the truly affected files did it find?\n\n"
+        "   - Compare each model's listed files against the GROUND TRUTH expected files\n"
+        "   - What fraction of the ground truth files did the model find?\n"
+        "   - Did the model identify the correct affected repositories and files?\n\n"
         "2. REASONING QUALITY (30% of score):\n"
         "   - Did the model explain WHY each file is affected (interface implementation, dependency chain, data flow)?\n"
         "   - Did it describe what specifically needs to change in each file?\n"
         "   - Is the analysis thorough — covering architecture, cross-repo impact, and breaking changes?\n\n"
         "3. PRECISION PENALTY (10% of score — deduct for errors):\n"
-        "   - Did the model list files/repos that are clearly irrelevant (hallucination)?\n"
+        "   - Did the model list files/repos that are clearly NOT in the ground truth and irrelevant (hallucination)?\n"
         "   - A concise, accurate answer is better than a verbose, unfocused one\n"
         "   - Models that pad their answer with irrelevant files should score lower\n\n"
         "IMPORTANT: Each score is an independent percentage (0-100). Multiple models CAN have the same score.\n"

@@ -1,0 +1,450 @@
+{
+  "model": "openai/gpt-5.1-codex-mini",
+  "answer": "### 1. Architecture Overview\n\nBoth Gatekeeper and Istio ship Kubernetes `ValidatingWebhookConfiguration` resources, but they manage them separately:\n\n- **Gatekeeper** uses its Helm chart to render two webhooks (`validation.gatekeeper.sh` and `check-ignore-label.gatekeeper.sh`) that inspect almost every API object and namespace label respectively. The `gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml` template contains all of the dynamic behavior: it honors `disableValidatingWebhook`, injects Helm-set failure policies, namespace exemptions, object selectors, optional `DELETE`/`CONNECT` operations, and links the webhook to the `gatekeeper-webhook-service` (Lines 2\u2011110). This template feeds into Gatekeeper\u2019s runtime through the controller-runtime manager, so Kubernetes admission requests hit Gatekeeper\u2019s validation logic once configured.\n\n- **Gatekeeper\u2019s controller** (`pkg/controller/webhookconfig/webhookconfig_controller.go`) watches the actual Kubernetes `ValidatingWebhookConfiguration` that was created from that Helm template. On every update or deletion it extracts the Gatekeeper webhook definition and compares its selectors/rules to a cached `WebhookMatchingConfig`. When the stored config changes, the reconciler triggers **ConstraintTemplate** reconciliation events so policies running inside Gatekeeper stay aligned with the webhook\u2019s admission filters (Lines 229\u2011288). A channel with retry-on-full semantics ensures events are delivered even under load (Lines 85\u2011144).\n\n- **Istio** also renders its own validating webhook(s) per revision. The Helm template in `manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml` conditionally creates `istio-validator` webhooks when validation is enabled (Lines 1\u201167). It supports custom URLs, CA bundle-aware failure policy transitions, and object selectors matching `istio.io/rev` labels so each revision validates only its own resources. The base chart separately renders `istiod-default-validator` for the default revision (Lines 1\u201158), ensuring the default control plane gets a `ValidatingWebhookConfiguration` tied to its specific Service.\n\nTogether, these files illustrate that **two distinct systems (Gatekeeper + Istio) each declare and own their own webhook configurations** (Gatekeeper via Helm + controller, Istio via Helm templates and revision labels). Any change to `ValidatingWebhookConfiguration` must be scoped to the appropriate template/controller to avoid conflicting webhooks.\n\n---\n\n### 2. Detailed Analysis\n\n#### Gatekeeper Webhook Template (`charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml`)\n- The Helm template renders a `ValidatingWebhookConfiguration` only when `.Values.disableValidatingWebhook` is false (Lines 2\u201114). It sets metadata labels for release tracking and gatekeeper identity (Lines 5\u201113).\n- **Policy webhook** (`validation.gatekeeper.sh`):\n  - Connects to either a static URL (`.Values.validatingWebhookURL`) or to `gatekeeper-webhook-service` with `/v1/admit` path (Lines 18\u201126).\n  - Dynamically sets `failurePolicy`, optionally adds `matchConditions` when Kubernetes \u22651.28 (Lines 27\u201132), and uses `matchPolicy: Exact` (Line 33).\n  - Namespace/object selection logic excludes Gatekeeper namespaces (Lines 35\u201152) and respects `.Values.validatingWebhookExemptNamespacesLabels`.\n  - Rules cover all `CREATE`/`UPDATE` (plus optional `DELETE`/`CONNECT`) operations, and include optional subresources (Lines 53\u201178).\n  - The webhook has `sideEffects: None` and a configurable `timeoutSeconds` (Lines 79\u201180).\n- **Label-check webhook** (`check-ignore-label.gatekeeper.sh`):\n  - Always points to the webhook service and validates namespace `CREATE/UPDATE` operations to prevent forbidden label changes (Lines 82\u2011110).\n\nThis template feeds the Kubernetes API server with the gatekeeper webhooks; modifications to any of these Helm values directly translate into changes to the `ValidatingWebhookConfiguration`.\n\n#### Gatekeeper Webhook Config Controller (`pkg/controller/webhookconfig/webhookconfig_controller.go`)\n- Maintains a concurrent `WebhookMatchingConfig` cache per configuration name (Lines 259\u2011264) and compares incoming webhook definitions against stored values.\n- When a `ValidatingWebhookConfiguration` changes (or is deleted), `configChanged` becomes true and `triggerConstraintTemplateReconciliation` emits `GenericEvent` items for every `ConstraintTemplate`. When no config change is detected, only \u201cdirty\u201d templates are requeued (Lines 229\u2011285). This ensures policy definitions are revalidated if the admission scope shifts.\n- The controller uses mutexes plus helper functions like `sendEventWithRetry` to avoid dropping events when the event channel is full (Lines 85\u2011144). It also exposes `getVwhName`/`setVwhName` for integration testing (Lines 39\u201154).\n- `isGatekeeperValidatingWebhook` matches webhook names (Lines 290\u2011293), ensuring it only tracks Gatekeeper\u2019s own webhook.\n\n#### Gatekeeper Webhook Registration Helper (`pkg/webhook/webhook.go`)\n- Provides a `Dependencies` struct for injection (Line 26\u201131) and an `AddToManager` function that wires controllers, including the webhook config controller, into controller-runtime (Lines 40\u201150). This ensures the reconcilers watching `ValidatingWebhookConfiguration` are started as part of Gatekeeper\u2019s manager.\n\n#### Istio Validating Webhook Templates\n- **Revision-specific webhooks** (`manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml`):\n  - Created only for clusters where validation is enabled and appropriate resource scope is set (Lines 1\u201113). They are named `istio-validator[-<revision>]-<namespace>` (Lines 7\u201114).\n  - Each webhook targets either `.Values.base.validationURL` or the per-revision `istiod` Service (Lines 20\u201129) and optionally injects `caBundle` (Lines 30\u201132).\n  - Rules cover the Istio API groups across all versions and resources (Lines 33\u201146).\n  - Failure policy defaults to `Ignore` without a certificate and flips to `Fail` once the CA bundle is present, with `sideEffects: None` and the object selector matching the current revision label (Lines 46\u201167).\n- **Default revision booster** (`manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml`):\n  - Renders `istiod-default-validator` unless `.Values.defaultRevision` is empty (Lines 1\u201129).\n  - Selects the default revision\u2019s Service, attaches the CA bundle when available, and uses the same rules for Istio API groups (Lines 32\u201155).\n  - The Helm conditional ensures only the default revision installs this webhook, preventing duplication with revisioned installations.\n\nThese two templates coordinate: Helm uses release values (`.Values.revision`, `.Values.defaultRevision`, `.Values.base.validationCABundle`, etc.) to decide which webhook resources exist and how they are configured. Because both Gatekeeper and Istio supply Kubernetes admission webhooks, cluster operators must ensure their Helm values do not conflict (e.g., both can register `ValidatingWebhookConfiguration` resources, but each uses distinct names/selectors and hits different services), and Gatekeeper\u2019s controller keeps its policy templates aligned with the actual webhook definition deployed.\n\n---\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| `Knowledge 509a1028-e065-4f57-9af4-6513f3929680` | `charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml` | Helm template that renders Gatekeeper\u2019s two validating webhooks (`validation.gatekeeper.sh` and `check-ignore-label.gatekeeper.sh`), controls namespace/object selectors, failure policies, operations (Lines 2\u2011110). |\n| `Knowledge 509a1028-e065-4f57-9af4-6513f3929680` | `pkg/controller/webhookconfig/webhookconfig_controller.go` | Controller that watches the actual `ValidatingWebhookConfiguration`, caches selectors/rules (`WebhookMatchingConfig`), triggers ConstraintTemplate reconciliation when the webhook configuration changes, and handles deletions (Lines 229\u2011288). |\n| `Knowledge 509a1028-e065-4f57-9af4-6513f3929680` | `pkg/webhook/webhook.go` | Dependency injection + manager registration helper that ensures the webhook configuration controller is started as part of Gatekeeper\u2019s runtime (Lines 26\u201150). |\n| `Knowledge edd43087-bf39-42b6-85b0-ed3297ec760a` | `manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml` | Helm template that conditionally creates Istio\u2019s revision-scoped `ValidatingWebhookConfiguration`, handles CA bundles, failure policy updates, and matches `istio.io/rev` labels (Lines 1\u201167). |\n| `Knowledge edd43087-bf39-42b6-85b0-ed3297ec760a` | `manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml` | Base chart template that renders `istiod-default-validator` for the default Istio revision, linking to the appropriate Service and CA bundle, ensuring default revision validation is always present when configured (Lines 1\u201158). |\n\nThese files collectively capture every component involved in defining, deploying, and reacting to `ValidatingWebhookConfiguration` resources for both Gatekeeper and Istio within the available repositories.",
+  "cost": {
+    "input_tokens": 1104057,
+    "output_tokens": 10051,
+    "total_tokens": 1114108,
+    "cost_usd": 0.57213
+  },
+  "status": "success",
+  "latency_seconds": 150.57,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.08
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.366
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ValidatingWebhookConfiguration",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths",
+          "imports",
+          "semantic"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/admissionregistration/v1beta1/register.go\",\n        \"purpose\": \"Registers Kubernetes admission registration API types (v1beta1) with the runtime scheme, enabling serialization and deserialization of ValidatingWebhookConfiguration and MutatingWebhookConfiguration resources.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/client-go/kubernetes/typed/admissionregistration/v1beta1/admissionregistrat...",
+      "latency_seconds": 1.443
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ValidatingWebhookConfiguration",
+        "channels": [
+          "purpose",
+          "paths",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml\",\n        \"purpose\": \"This file defines a Kubernetes ValidatingWebhookConfiguration for the Gatekeeper admission controller. It configures two validating webhooks: one for general policy validation and another for checking/ignoring labels on namespaces. The webhook configuration is templated using Helm, allowing customization of behav...",
+      "latency_seconds": 0.785
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "validatingwebhookconfiguration",
+        "channels": [
+          "purpose",
+          "paths",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml\",\n        \"purpose\": \"This Helm template generates a Kubernetes ValidatingWebhookConfiguration named istiod-default-validator when Istio's default revision is set and the resource scope includes the cluster. It configures the admission webhook to validate Istio CRDs, optionally using a custom URL or service, and sets failurePolicy based on presence of a CA b...",
+      "latency_seconds": 0.562
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "webhookconfig",
+        "channels": [
+          "purpose",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"istioctl/pkg/tag/util.go\",\n        \"purpose\": \"Provides utility functions for managing Istio tags and revisions on Kubernetes resources such as MutatingWebhookConfigurations, Services, and Namespaces. Enables listing, extracting, deleting, and deactivating resources based on Istio label selectors, supporting installation and upgrade workflows.\"\n      },\n      {\n        \"path\": \"manifests/charts/base/templates/defaultrevision-validatingwebho...",
+      "latency_seconds": 0.584
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [
+          "charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"509a1028-e065-4f57-9af4-6513f3929680\",\n  \"files\": [\n    {\n      \"path\": \"charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml\",\n      \"purpose\": \"This file defines a Kubernetes ValidatingWebhookConfiguration for the Gatekeeper admission controller. It configures two validating webhooks: one for general policy validation and another for checking/ignoring labels on nam...",
+      "latency_seconds": 0.107
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [],
+        "relativePath": "charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml",
+        "fromLine": 1,
+        "toLine": 150,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# charts/gatekeeper/templates/gatekeeper-validating-webhook-configuration-validatingwebhookconfiguration.yaml\nLines: 1 - 112 of 112\n\n1 | ---\n2 | {{- if not .Values.disableValidatingWebhook }}\n3 | apiVersion: admissionregistration.k8s.io/v1\n4 | kind: ValidatingWebhookConfiguration\n5 | metadata:\n6 |   annotations: {{- toYaml .Values.validatingWebhookAnnotations | trim | nindent 4 }}\n7 |   labels:\n8 |     app: '{{ template \"gatekeeper.name\" . }}'\n9 |     chart: '{{ template \"gatekeeper.name\" . }}'\n...",
+      "latency_seconds": 1.419
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml\",\n      \"purpose\": \"Creates a Kubernetes ValidatingWebhookConfiguration for Istio's control plane when validation is enabled, using Helm templating to conditionally include the resource based on global and istiod remote settings. It configures the webhook cl...",
+      "latency_seconds": 0.123
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml",
+        "fromLine": 1,
+        "toLine": 120,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml\nLines: 1 - 70 of 70\n\n1 | {{- if or (eq .Values.global.resourceScope \"all\") (eq .Values.global.resourceScope \"cluster\") }}\n2 | # Created if this is not a remote istiod, OR if it is and is also a config cluster\n3 | {{- if or (not .Values.istiodRemote.enabled) (and .Values.istiodRemote.enabled (or .Values.global.configCluster .Values.istiodRemote.enabledLocalInjectorIstiod)) }}\n4 | {{- if .Values.global.c...",
+      "latency_seconds": 0.433
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml\",\n      \"purpose\": \"This Helm template generates a Kubernetes ValidatingWebhookConfiguration named istiod-default-validator when Istio's default revision is set and the resource scope includes the cluster. It configures the admission webhook to validate Istio CRDs, o...",
+      "latency_seconds": 0.109
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [],
+        "relativePath": "manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml",
+        "fromLine": 1,
+        "toLine": 120,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# manifests/charts/base/templates/defaultrevision-validatingwebhookconfiguration.yaml\nLines: 1 - 59 of 59\n\n1 | {{- if or (eq .Values.global.resourceScope \"all\") (eq .Values.global.resourceScope \"cluster\") }}\n2 | {{- if not (eq .Values.defaultRevision \"\") }}\n3 | apiVersion: admissionregistration.k8s.io/v1\n4 | kind: ValidatingWebhookConfiguration\n5 | metadata:\n6 |   name: istiod-default-validator\n7 |   labels:\n8 |     app: istiod\n9 |     release: {{ .Release.Name }}\n10 |     istio: istiod\n11 |    ...",
+      "latency_seconds": 1.34
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "validatingWebhookName",
+        "channels": [
+          "purpose",
+          "paths",
+          "keywords",
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"validatingWebhookName\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"paths\": {\n    \"data\": [],\n ...",
+      "latency_seconds": 0.673
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [
+          "charts/gatekeeper/values.yaml"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"509a1028-e065-4f57-9af4-6513f3929680\",\n  \"files\": [],\n  \"totalRequested\": 1,\n  \"totalFound\": 0\n}",
+      "latency_seconds": 0.104
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "folder",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "charts/gatekeeper",
+        "page": 1,
+        "pageSize": 100,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"folder\",\n  \"data\": {\n    \"purpose\": \"Provides authoritative documentation and configuration schema for the Gatekeeper Helm chart, enabling users to deploy and customize the policy engine within a Kubernetes cluster.\\nThis folder defines the complete Helm chart for deploying the Gatekeeper policy engine on Kubernetes, encompassing all Kubernetes resource templates for the controller, audit components, RBAC, admission webhooks, and lifecycle hooks, as well as the CustomResourceDe...",
+      "latency_seconds": 0.177
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "values",
+        "channels": [
+          "glob"
+        ],
+        "path": "",
+        "glob": "**/charts/gatekeeper/**values.yaml",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"glob\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[glob] 0 results for pattern. Verify the glob syntax: use ** for recursive directory matching, * for single-level. Example: \\\"**/*.test.ts\\\" or \\\"**/auth/*.go\\\". The pattern is matched against relative_path.\"\n  }\n}",
+      "latency_seconds": 0.246
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "values",
+        "channels": [
+          "paths"
+        ],
+        "path": "charts/gatekeeper",
+        "glob": "",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[paths] 0 results for \\\"values\\\". Full paths are brittle \u00e2\u0080\u0094 the stored relative_path may differ by prefix or structure. Try searching with just the FILENAME (e.g. \\\"shared_informer.go\\\" instead of \\\"staging/src/k8s.io/client-go/tools/cache/shared_informer.go\\\"). Or switch to the glob c...",
+      "latency_seconds": 0.324
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "folder",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "charts",
+        "page": 1,
+        "pageSize": 100,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"folder\",\n  \"data\": {\n    \"purpose\": \"This folder contains the complete Helm chart for deploying the Gatekeeper policy engine on Kubernetes. It provides authoritative configuration schemas, Kubernetes resource templates for controllers and webhooks, and lifecycle hooks for installation, upgrade, and uninstallation.\\n\",\n    \"summary\": \"{\\\"CRD Schema Definition\\\":\\\"Defines OpenAPI v3 schemas for all Gatekeeper custom resources, including validation rules, property structures, and ...",
+      "latency_seconds": 0.183
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "values",
+        "channels": [
+          "glob"
+        ],
+        "path": "",
+        "glob": "manifest_staging/charts/gatekeeper/**/*values.yaml",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"glob\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[glob] 0 results for pattern. Verify the glob syntax: use ** for recursive directory matching, * for single-level. Example: \\\"**/*.test.ts\\\" or \\\"**/auth/*.go\\\". The pattern is matched against relative_path.\"\n  }\n}",
+      "latency_seconds": 0.216
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [
+          "pkg/controller/webhookconfig/webhookconfig_controller.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 3000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"509a1028-e065-4f57-9af4-6513f3929680\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controller/webhookconfig/webhookconfig_controller.go\",\n      \"purpose\": \"This file implements a Kubernetes controller for managing ValidatingWebhookConfiguration resources in the Gatekeeper project. It monitors changes to webhook configurations and triggers reconciliation of ConstraintTemplates when matching fields change, ensuring that webhook ...",
+      "latency_seconds": 0.121
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [],
+        "relativePath": "pkg/controller/webhookconfig/webhookconfig_controller.go",
+        "fromLine": 220,
+        "toLine": 320,
+        "maxTokens": 4000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "# pkg/controller/webhookconfig/webhookconfig_controller.go\nLines: 220 - 294 of 294\n\n220 | \tcache    *webhookconfigcache.WebhookConfigCache\n221 | \tctEvents chan<- event.GenericEvent\n222 | \n223 | \t// dirtyMu protects access to dirtyTemplates\n224 | \tdirtyMu        sync.Mutex\n225 | \tdirtyTemplates map[string]*v1beta1.ConstraintTemplate\n226 | } // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=get;list;watch\n227 | // +kubebuilder:rbac:groups=temp...",
+      "latency_seconds": 0.464
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ValidatingWebhookName",
+        "channels": [
+          "keywords",
+          "functions",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"charts/gatekeeper/templates/gatekeeper-audit-deployment.yaml\",\n        \"purpose\": \"This file defines a Kubernetes Deployment manifest for the Gatekeeper audit controller, which is responsible for auditing Kubernetes resources against policies. It configures the audit controller's container, command-line arguments, environment variables, probes, and volume mounts based on Helm chart values.\"\n      },\n      {\n        \"path\": \"charts/gatekeep...",
+      "latency_seconds": 0.779
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ValidatingWebhookName",
+        "channels": [
+          "functions",
+          "keywords",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"ValidatingWebhookName\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"keywords\": {\n    \"data\": [\n   ...",
+      "latency_seconds": 0.737
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "relativePaths": [
+          "pkg/webhook/webhook.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 2000,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"509a1028-e065-4f57-9af4-6513f3929680\",\n  \"files\": [\n    {\n      \"path\": \"pkg/webhook/webhook.go\",\n      \"purpose\": \"Provides dependency injection and manager registration for Gatekeeper webhook controllers, enabling integration with Kubernetes controller-runtime\",\n      \"summary\": \"{\\\"Dependency Injection\\\":\\\"Centralizes OPA client, mutation system, and expansion system for webhook controllers\\\",\\\"Manager Registration\\\":...",
+      "latency_seconds": 0.137
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "validation.gatekeeper",
+        "channels": [
+          "purpose",
+          "paths",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "509a1028-e065-4f57-9af4-6513f3929680",
+        "fileRole": "",
+        "page": 1,
+        "pageSize": 20,
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"validation.gatekeeper\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"paths\": {\n    \"data\": [],\n ...",
+      "latency_seconds": 0.551
+    }
+  ],
+  "error": ""
+}

@@ -1,0 +1,268 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "answer": "I now have a complete, exhaustive picture of every file involved. Let me compile the full analysis and produce all the required code changes.\n\n---\n\n### 1. Architecture Overview\n\nThe codebase (Grafana repo, `knowledgeId: e0a5c5ee-310a-4bff-ab29-ef18eaab0826`) has **two distinct metrics middleware paths** for HTTP client instrumentation, both directly coupled to `prometheus.Registerer`:\n\n**Path A \u2014 `PrometheusMetricsMiddleware` (generic HTTP client middleware)**\n```\nNewPrometheusMetricsMiddleware(prefix)\n  \u2192 PrometheusMetrics{counter, failureCounter, histogram, gauge}\n  \u2192 .Register(prometheus.Registerer) / .MustRegister() / .WithMustRegister()\n  \u2192 PrometheusMetricsMiddleware(*PrometheusMetrics) \u2192 httpclient.Middleware\n```\n\n**Path B \u2014 `newMetricsMiddleware` / `NewMetricsMiddleware` (plugin client middleware)**\n```\nProvideClientWithMiddlewares(... prometheus.Registerer ...)\n  \u2192 CreateMiddlewares(... prometheus.Registerer ...)\n    \u2192 clientmiddleware.NewMetricsMiddleware(promRegisterer, registry)\n      \u2192 newMetricsMiddleware(promRegisterer, registry)\n        \u2192 promRegisterer.MustRegister(5 prometheus collectors)\n```\n\nThe refactor replaces `prometheus.Registerer` with a new `MetricsCollector` interface in both paths, so any component that registers HTTP client metrics through either middleware must implement that interface.\n\n---\n\n### 2. Detailed Analysis\n\n#### File 1: `pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go`\n\n**Current state:**\n- `PrometheusMetrics` struct holds four raw `prometheus.*` fields.\n- `Register(registry prometheus.Registerer) error` and `MustRegister(registry prometheus.Registerer)` call `registry.Register(collector)` directly.\n- `WithMustRegister(registry prometheus.Registerer) *PrometheusMetrics` chains the call.\n- `PrometheusMetricsMiddleware(metrics *PrometheusMetrics) httpclient.Middleware` is the middleware factory.\n\n**Change:** Replace `prometheus.Registerer` parameter with a new `MetricsCollector` interface. The `PrometheusMetrics` struct itself becomes the canonical implementation of that interface.\n\n#### File 2: `pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go`\n\n**Current state:**\n- `newMetricsMiddleware(promRegisterer prometheus.Registerer, pluginRegistry registry.Service)` creates 5 `prometheus.*Vec` collectors and calls `promRegisterer.MustRegister(...)` directly.\n- `NewMetricsMiddleware(promRegisterer prometheus.Registerer, pluginRegistry registry.Service)` is the public factory.\n\n**Change:** Replace `prometheus.Registerer` parameter with `MetricsCollector`. The `pluginMetrics` struct becomes the implementation.\n\n#### File 3: `pkg/services/pluginsintegration/pluginsintegration.go`\n\n**Current state:**\n- `ProvideClientWithMiddlewares(... promRegisterer prometheus.Registerer ...)` passes the raw registerer down.\n- `NewMiddlewareHandler(... promRegisterer prometheus.Registerer ...)` and `CreateMiddlewares(... promRegisterer prometheus.Registerer ...)` propagate it.\n\n**Change:** The `prometheus.Registerer` parameter type changes to `MetricsCollector` at the call site, or a concrete adapter is injected via Wire.\n\n#### File 4: `pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go`\n\n**Current state:** Uses `promauto` (auto-registers to `prometheus.DefaultRegisterer`) for all five global vars. No explicit `prometheus.Registerer` parameter, but it implicitly uses the default registry.\n\n**Change:** Move from `promauto` globals to explicit registration through a `MetricsCollector` injected into `DataSourceMetricsMiddleware()`.\n\n#### Test files (3 & 4)\n\n- `prometheus_metrics_middleware_test.go`: Uses `NewPrometheusMetricsMiddleware(\"test\")` without registering \u2014 tests still work because `testutil.ToFloat64` reads the collector directly. No change needed to test logic, but the `Register`/`MustRegister` signatures change.\n- `metrics_middleware_test.go`: Passes `prometheus.NewRegistry()` (which implements `prometheus.Registerer`) to `newMetricsMiddleware`. After the refactor, it must pass a `MetricsCollector` implementation \u2014 the concrete `PrometheusRegistererCollector` adapter wrapping `prometheus.NewRegistry()`.\n\n---\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| grafana | `pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go` | **Core file to change.** Defines `PrometheusMetrics`, `Register(prometheus.Registerer)`, `MustRegister`, `WithMustRegister`, and `PrometheusMetricsMiddleware`. All `prometheus.Registerer` usages replaced with `MetricsCollector`. |\n| grafana | `pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware_test.go` | Tests `PrometheusMetricsMiddleware` and `NewPrometheusMetricsMiddleware`. Must be updated to use `MetricsCollector` in any `Register`/`MustRegister` call paths. |\n| grafana | `pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go` | Uses `promauto` (implicit `prometheus.DefaultRegisterer`) for 5 global metric vars. Must be refactored to accept and use a `MetricsCollector`. |\n| grafana | `pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware_test.go` | Tests `DataSourceMetricsMiddleware`. Must be updated to inject a `MetricsCollector` mock/stub. |\n| grafana | `pkg/infra/httpclient/httpclientprovider/http_client_provider.go` | Calls `DataSourceMetricsMiddleware()` \u2014 must pass a `MetricsCollector` after the signature change. |\n| grafana | `pkg/infra/httpclient/httpclientprovider/http_client_provider_test.go` | Tests the middleware chain assembled by `New(...)`. Verifies `DataSourceMetricsMiddlewareName` at index 1. Must be updated if `New` signature changes. |\n| grafana | `pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go` | **Core file to change.** `newMetricsMiddleware` and `NewMetricsMiddleware` accept `prometheus.Registerer` and call `promRegisterer.MustRegister(...)`. Replace with `MetricsCollector`. |\n| grafana | `pkg/services/pluginsintegration/clientmiddleware/metrics_middleware_test.go` | Passes `prometheus.NewRegistry()` to `newMetricsMiddleware`. Must wrap it in a `MetricsCollector` adapter. |\n| grafana | `pkg/services/pluginsintegration/pluginsintegration.go` | `ProvideClientWithMiddlewares`, `NewMiddlewareHandler`, `CreateMiddlewares` all accept `prometheus.Registerer` and pass it to `NewMetricsMiddleware`. Must change to `MetricsCollector`. |\n\n---\n\nNow here are all the precise code changes:\n\n---\n\n## Changes\n\n### `pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go`\n\nThis is the **central file**. We introduce the `MetricsCollector` interface here (it's the natural home \u2014 it's the package that owns the HTTP client metrics middleware), make `PrometheusMetrics` implement it, and update all method signatures.\n\n```go\npackage httpclientprovider\n\nimport (\n\t\"net/http\"\n\t\"time\"\n\n\t\"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n\t\"github.com/prometheus/client_golang/prometheus\"\n)\n\n// MetricsCollector is the interface that any component must implement in order\n// to register HTTP client metrics through the PrometheusMetricsMiddleware.\n// It decouples the middleware from the concrete prometheus.Registerer type,\n// allowing callers to provide custom registration logic (e.g. namespaced\n// registries, no-op collectors for tests, or multi-registry fan-outs).\ntype MetricsCollector interface {\n\t// RegisterMetrics registers the provided Prometheus collectors.\n\t// It returns an error if any collector cannot be registered.\n\tRegisterMetrics(collectors ...prometheus.Collector) error\n}\n\n// PrometheusMetrics groups the Prometheus metrics for a PrometheusMetricsMiddleware.\n// It implements MetricsCollector so it can register its own collectors into any\n// MetricsCollector-compatible registry.\ntype PrometheusMetrics struct {\n\trequestsCounter          prometheus.Counter\n\tfailureCounter           prometheus.Counter\n\tdurationSecondsHistogram prometheus.Histogram\n\tinFlightGauge            prometheus.Gauge\n}\n\n// NewPrometheusMetricsMiddleware returns a new *PrometheusMetrics with pre-filled\n// metrics using the specified name prefix.\nfunc NewPrometheusMetricsMiddleware(prefix string) *PrometheusMetrics {\n\treturn &PrometheusMetrics{\n\t\trequestsCounter: prometheus.NewCounter(prometheus.CounterOpts{\n\t\t\tName: prefix + \"_request_total\",\n\t\t}),\n\t\tfailureCounter: prometheus.NewCounter(prometheus.CounterOpts{\n\t\t\tName: prefix + \"_failure_total\",\n\t\t}),\n\t\tdurationSecondsHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{\n\t\t\tName: prefix + \"_request_duration_seconds\",\n\t\t}),\n\t\tinFlightGauge: prometheus.NewGauge(prometheus.GaugeOpts{\n\t\t\tName: prefix + \"_in_flight_request\",\n\t\t}),\n\t}\n}\n\n// RegisterMetrics implements MetricsCollector. It registers all four internal\n// Prometheus collectors into whatever backend the caller provides.\n// This makes *PrometheusMetrics itself a valid MetricsCollector.\nfunc (m *PrometheusMetrics) RegisterMetrics(collectors ...prometheus.Collector) error {\n\t// When called as a MetricsCollector by external code, register the\n\t// provided collectors. When called internally (see Register below),\n\t// the four own collectors are passed.\n\tfor _, c := range collectors {\n\t\t// We need a real registry to forward to; callers that want\n\t\t// self-registration should use Register(collector) below.\n\t\t_ = c // no-op path \u2014 see Register for the canonical self-registration path.\n\t}\n\treturn nil\n}\n\n// Register registers the metrics in the current PrometheusMetrics into the\n// provided MetricsCollector. This replaces the old prometheus.Registerer parameter.\nfunc (m *PrometheusMetrics) Register(collector MetricsCollector) error {\n\treturn collector.RegisterMetrics(\n\t\tm.requestsCounter,\n\t\tm.failureCounter,\n\t\tm.durationSecondsHistogram,\n\t\tm.inFlightGauge,\n\t)\n}\n\n// MustRegister is like Register but panics on failure instead of returning an error.\nfunc (m *PrometheusMetrics) MustRegister(collector MetricsCollector) {\n\tif err := m.Register(collector); err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// WithMustRegister calls MustRegister and returns itself, enabling chained\n// initialization in the global scope:\n//\n//\tvar svcMetrics = NewPrometheusMetricsMiddleware(\"my_client\").WithMustRegister(myCollector)\nfunc (m *PrometheusMetrics) WithMustRegister(collector MetricsCollector) *PrometheusMetrics {\n\tm.MustRegister(collector)\n\treturn m\n}\n\n// PrometheusMetricsMiddleware is a middleware that updates the in-flight gauge,\n// request counter, duration histogram, and failure counter on the provided\n// *PrometheusMetrics instance for every HTTP request that passes through the\n// httpclient. For the metrics to be exposed, the *PrometheusMetrics must have\n// been registered with a MetricsCollector before this middleware is used.\nfunc PrometheusMetricsMiddleware(metrics *PrometheusMetrics) httpclient.Middleware {\n\treturn httpclient.MiddlewareFunc(func(opts httpclient.Options, next http.RoundTripper) http.RoundTripper {\n\t\treturn httpclient.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {\n\t\t\tstartTime := time.Now()\n\t\t\tmetrics.inFlightGauge.Inc()\n\n\t\t\tres, err := next.RoundTrip(req)\n\n\t\t\tmetrics.inFlightGauge.Dec()\n\t\t\tmetrics.requestsCounter.Inc()\n\t\t\tmetrics.durationSecondsHistogram.Observe(time.Since(startTime).Seconds())\n\t\t\tif err != nil || (res != nil && (res.StatusCode < 200 || res.StatusCode > 299)) {\n\t\t\t\tmetrics.failureCounter.Inc()\n\t\t\t}\n\n\t\t\treturn res, err\n\t\t})\n\t})\n}\n```\n\n> **Note on `RegisterMetrics` design:** The `MetricsCollector` interface is intentionally minimal \u2014 one method, `RegisterMetrics(...prometheus.Collector) error`. The `PrometheusRegistererCollector` adapter below bridges it to any existing `prometheus.Registerer` (including `prometheus.DefaultRegisterer`, `prometheus.NewRegistry()`, etc.), so no existing registry code needs to change.\n\n---\n\n### New file: `pkg/infra/httpclient/httpclientprovider/metrics_collector.go`\n\nThis file provides the **concrete adapter** that bridges `MetricsCollector` \u2192 `prometheus.Registerer`, so all existing callers that already have a `prometheus.Registerer` can wrap it in one line.\n\n```go\npackage httpclientprovider\n\nimport \"github.com/prometheus/client_golang/prometheus\"\n\n// PrometheusRegistererCollector adapts a prometheus.Registerer to the\n// MetricsCollector interface. Use this to bridge any existing\n// prometheus.Registerer (including prometheus.DefaultRegisterer or a\n// prometheus.NewRegistry()) into a MetricsCollector without changing the\n// underlying registry.\n//\n// Example:\n//\n//\tcollector := NewPrometheusRegistererCollector(prometheus.DefaultRegisterer)\n//\tmetrics := NewPrometheusMetricsMiddleware(\"my_svc\").WithMustRegister(collector)\ntype PrometheusRegistererCollector struct {\n\tregisterer prometheus.Registerer\n}\n\n// NewPrometheusRegistererCollector wraps a prometheus.Registerer as a MetricsCollector.\nfunc NewPrometheusRegistererCollector(r prometheus.Registerer) *PrometheusRegistererCollector {\n\treturn &PrometheusRegistererCollector{registerer: r}\n}\n\n// RegisterMetrics implements MetricsCollector by forwarding each collector to\n// the underlying prometheus.Registerer.\nfunc (p *PrometheusRegistererCollector) RegisterMetrics(collectors ...prometheus.Collector) error {\n\tfor _, c := range collectors {\n\t\tif err := p.registerer.Register(c); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n```\n\n---\n\n### `pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go`\n\nReplace the five `promauto` package-level globals (which implicitly use `prometheus.DefaultRegisterer`) with explicit registration through an injected `MetricsCollector`. The `DataSourceMetricsMiddleware()` function gains a `MetricsCollector` parameter.\n\n```go\npackage httpclientprovider\n\nimport (\n\t\"net/http\"\n\t\"strconv\"\n\t\"time\"\n\n\tsdkhttpclient \"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n\t\"github.com/grafana/grafana/pkg/infra/metrics/metricutil\"\n\t\"github.com/prometheus/client_golang/prometheus\"\n\t\"github.com/prometheus/client_golang/prometheus/promhttp\"\n)\n\n// datasourceMetrics holds the Prometheus collectors for datasource HTTP requests.",
+  "llm_condensed_answer": "SUMMARY: The refactor replaces direct usage of `prometheus.Registerer` with a new `MetricsCollector` interface across two HTTP client middleware paths. This decouples metric registration from the concrete Prometheus registry, requiring any component registering HTTP client metrics to implement the interface. The change affects both generic HTTP client and plugin client middleware, plus their test files.\n\nFILES:\n- grafana/pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go \u2014 Core file to change; defines PrometheusMetrics and updates all prometheus.Registerer usages to MetricsCollector\n- grafana/pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware_test.go \u2014 Tests must be updated to use MetricsCollector in Register/MustRegister call paths\n- grafana/pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go \u2014 Must be refactored to accept and use a MetricsCollector instead of implicit promauto registration\n- grafana/pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware_test.go \u2014 Tests must be updated to inject a MetricsCollector mock/stub\n- grafana/pkg/infra/httpclient/httpclientprovider/http_client_provider.go \u2014 Must pass a MetricsCollector to DataSourceMetricsMiddleware after signature change\n- grafana/pkg/infra/httpclient/httpclientprovider/http_client_provider_test.go \u2014 Tests may need updates if New signature changes to accept MetricsCollector\n- grafana/pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go \u2014 Core file to change; replaces prometheus.Registerer parameter with MetricsCollector\n- grafana/pkg/services/pluginsintegration/clientmiddleware/metrics_middleware_test.go \u2014 Must wrap prometheus.NewRegistry() in a MetricsCollector adapter\n- grafana/pkg/services/pluginsintegration/pluginsintegration.go \u2014 Must change prometheus.Registerer parameters to MetricsCollector in ProvideClientWithMiddlewares and related functions",
+  "cost": {
+    "input_tokens": 581735,
+    "output_tokens": 7455,
+    "total_tokens": 589190,
+    "cost_usd": 1.85703
+  },
+  "status": "success",
+  "latency_seconds": 149.1,
+  "tool_calls_count": 20,
+  "agent_steps": 11,
+  "tool_calls": [
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "metrics middleware prometheus registerer HTTP client"
+      },
+      "result_preview": "{\n  \"query\": \"metrics middleware prometheus registerer HTTP client\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 700,\n  \"repos_matched\": [\n    \"grafana\",\n    \"thanos\",\n    \"prometheus\",\n    \"kubernetes\",\n    \"cilium\",\n    \"argo-cd\",\n    \"opentelemetry-collector\",\n    \"mimir\",\n    \"jaeger\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/infra/httpclient/httpclientprovider/prometheus_metrics...",
+      "latency_seconds": 2.31
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "metrics middleware",
+        "channels": [
+          "purpose",
+          "keywords"
+        ]
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go\",\n        \"purpose\": \"This file implements a Prometheus-based metrics middleware for Grafana's HTTP client, specifically for datasource requests. It instruments outgoing HTTP requests with counters, histograms, and gauges to track request counts, durations, response sizes, and in-flight requests, enabling observability into datasource interactions. The middleware integ...",
+      "latency_seconds": 1.493
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go",
+          "pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go",
+          "pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware_test.go",
+          "pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware_test.go",
+          "pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go\",\n      \"purpose\": \"Provides Prometheus instrumentation middleware for the Grafana HTTP client. It defines a metric holder struct, creates prefixed counters, histogram and gauge, registers them, and supplies a middleware that updates these metrics around each HTTP request, enabling observability of request...",
+      "latency_seconds": 0.401
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "PrometheusMetricsMiddleware httpclientprovider",
+        "channels": [
+          "imports",
+          "classes",
+          "functions"
+        ],
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826"
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/server/wire.go\",\n        \"purpose\": \"This file defines Wire dependency injection sets for Grafana's server package, configuring providers and bindings for services, enabling modular initialization of the server with dependencies for both OSS and Enterprise builds.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/services/setting/service.go\",\n        \"p...",
+      "latency_seconds": 0.498
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go",
+        "fromLine": 1,
+        "toLine": 88
+      },
+      "result_preview": "# pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go\nLines: 1 - 88 of 89\nMore: fromLine=89\n\n1 | package httpclientprovider\n2 | \n3 | import (\n4 | \t\"net/http\"\n5 | \t\"time\"\n6 | \n7 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n8 | \t\"github.com/prometheus/client_golang/prometheus\"\n9 | )\n10 | \n11 | // PrometheusMetrics groups some metrics for a PrometheusMetricsMiddleware\n12 | type PrometheusMetrics struct {\n13 | \trequestsCounter          prometheus.Counter\n14 |...",
+      "latency_seconds": 1.612
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware_test.go",
+        "fromLine": 1,
+        "toLine": 94
+      },
+      "result_preview": "# pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware_test.go\nLines: 1 - 94 of 95\nMore: fromLine=95\n\n1 | package httpclientprovider\n2 | \n3 | import (\n4 | \t\"net/http\"\n5 | \t\"net/http/httptest\"\n6 | \t\"testing\"\n7 | \n8 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n9 | \t\"github.com/prometheus/client_golang/prometheus/testutil\"\n10 | \t\"github.com/stretchr/testify/require\"\n11 | )\n12 | \n13 | func TestPrometheusMetricsMiddleware(t *testing.T) {\n14 | \tnoOpHandlerFunc := f...",
+      "latency_seconds": 1.636
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/infra/httpclient/httpclientprovider/http_client_provider.go",
+          "pkg/infra/httpclient/httpclientprovider/http_client_provider_test.go",
+          "pkg/server/wire.go",
+          "pkg/services/updatemanager/grafana.go",
+          "pkg/services/updatemanager/plugins.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/infra/httpclient/httpclientprovider/http_client_provider.go\",\n      \"purpose\": \"Provides a factory function to create a pre-configured HTTP client provider for Grafana's data proxy, integrating tracing, metrics, authentication, and custom middleware for datasource requests.\",\n      \"summary\": \"{\\\"Middleware Chain (~L24-48)\\\":\\\"Configures a sequence of middlewares for tracin...",
+      "latency_seconds": 0.724
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NewPrometheusMetricsMiddleware WithMustRegister",
+        "channels": [
+          "functions",
+          "purpose"
+        ],
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/infra/httpclient/httpclientprovider/prometheus_metrics_middleware.go\",\n        \"purpose\": \"Provides Prometheus instrumentation middleware for the Grafana HTTP client. It defines a metric holder struct, creates prefixed counters, histogram and gauge, registers them, and supplies a middleware that updates these metrics around each HTTP request, enabling observability of request volume, latency, in\u00e2\u0080\u0091flight count and failures.\",\n        ...",
+      "latency_seconds": 0.797
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/infra/httpclient/httpclientprovider/http_client_provider.go",
+        "fromLine": 1,
+        "toLine": 94
+      },
+      "result_preview": "# pkg/infra/httpclient/httpclientprovider/http_client_provider.go\nLines: 1 - 94 of 95\nMore: fromLine=95\n\n1 | package httpclientprovider\n2 | \n3 | import (\n4 | \t\"net/http\"\n5 | \t\"time\"\n6 | \n7 | \t\"github.com/grafana/grafana-aws-sdk/pkg/awsauth\"\n8 | \tsdkhttpclient \"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n9 | \t\"github.com/mwitkow/go-conntrack\"\n10 | \n11 | \t\"github.com/grafana/grafana/pkg/infra/log\"\n12 | \t\"github.com/grafana/grafana/pkg/infra/metrics/metricutil\"\n13 | \t\"github.com/gr...",
+      "latency_seconds": 0.718
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go",
+        "fromLine": 1,
+        "toLine": 110
+      },
+      "result_preview": "# pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go\nLines: 1 - 110 of 273\nMore: fromLine=111\n\n1 | package clientmiddleware\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"errors\"\n6 | \t\"time\"\n7 | \n8 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend\"\n9 | \t\"github.com/prometheus/client_golang/prometheus\"\n10 | \t\"google.golang.org/grpc/codes\"\n11 | \tgrpcstatus \"google.golang.org/grpc/status\"\n12 | \n13 | \t\"github.com/grafana/grafana/pkg/infra/tracing\"\n14 | \t\"github.com/grafana/grafana/pkg...",
+      "latency_seconds": 1.037
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go",
+        "fromLine": 111,
+        "toLine": 273
+      },
+      "result_preview": "# pkg/services/pluginsintegration/clientmiddleware/metrics_middleware.go\nLines: 111 - 273 of 273\n\n111 | \ttarget, err := m.pluginTarget(ctx, pluginCtx.PluginID, pluginCtx.PluginVersion)\n112 | \tif err != nil {\n113 | \t\treturn err\n114 | \t}\n115 | \tendpoint := backend.EndpointFromContext(ctx)\n116 | \tm.pluginRequestSize.WithLabelValues(\"grafana-backend\", pluginCtx.PluginID, string(endpoint), target, pluginCtx.PluginVersion).Observe(requestSize)\n117 | \treturn nil\n118 | }\n119 | \n120 | // instrumentPlugin...",
+      "latency_seconds": 1.376
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NewMetricsMiddleware prometheus.Registerer plugin",
+        "channels": [
+          "imports",
+          "functions"
+        ],
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826"
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"apps/advisor/pkg/app/checkregistry/checkregistry.go\",\n        \"purpose\": \"Provides a centralized registry for Grafana Advisor checks, aggregating various check implementations (datasource, plugin, auth, config, instance) into a single service that can be queried by the application.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"apps/advisor/pkg/app/checks/da...",
+      "latency_seconds": 0.5
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NewMetricsMiddleware clientmiddleware",
+        "channels": [
+          "imports",
+          "purpose"
+        ],
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826"
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/infra/httpclient/httpclientprovider/grafana_request_id_header_middleware.go\",\n        \"purpose\": \"Provides a middleware function that adds a Grafana request ID header to HTTP requests for allow-listed data source URLs, enabling request tracing and correlation within the Grafana ecosystem.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\": \"pkg/infra/httpclien...",
+      "latency_seconds": 0.416
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/services/pluginsintegration/clientmiddleware/metrics_middleware_test.go",
+        "fromLine": 1,
+        "toLine": 60
+      },
+      "result_preview": "# pkg/services/pluginsintegration/clientmiddleware/metrics_middleware_test.go\nLines: 1 - 60 of 316\nMore: fromLine=61\n\n1 | package clientmiddleware\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"errors\"\n6 | \t\"fmt\"\n7 | \t\"testing\"\n8 | \n9 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend\"\n10 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend/handlertest\"\n11 | \t\"github.com/prometheus/client_golang/prometheus\"\n12 | \t\"github.com/prometheus/client_golang/prometheus/testutil\"\n13 | \tdto \"github.com/prometheu...",
+      "latency_seconds": 1.339
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/services/pluginsintegration/pluginsintegration.go",
+        "fromLine": 1,
+        "toLine": 80
+      },
+      "result_preview": "# pkg/services/pluginsintegration/pluginsintegration.go\nLines: 1 - 80 of 228\nMore: fromLine=81\n\n1 | package pluginsintegration\n2 | \n3 | import (\n4 | \t\"github.com/google/wire\"\n5 | \n6 | \t\"github.com/grafana/grafana-plugin-sdk-go/backend\"\n7 | \t\"github.com/prometheus/client_golang/prometheus\"\n8 | \n9 | \t\"github.com/grafana/grafana/apps/advisor/pkg/app/checkregistry\"\n10 | \t\"github.com/grafana/grafana/pkg/infra/tracing\"\n11 | \t\"github.com/grafana/grafana/pkg/plugins\"\n12 | \t\"github.com/grafana/grafana/pk...",
+      "latency_seconds": 1.04
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go",
+        "fromLine": 1,
+        "toLine": 132
+      },
+      "result_preview": "# pkg/infra/httpclient/httpclientprovider/datasource_metrics_middleware.go\nLines: 1 - 132 of 133\nMore: fromLine=133\n\n1 | package httpclientprovider\n2 | \n3 | import (\n4 | \t\"net/http\"\n5 | \t\"strconv\"\n6 | \t\"time\"\n7 | \n8 | \tsdkhttpclient \"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n9 | \t\"github.com/grafana/grafana/pkg/infra/metrics/metricutil\"\n10 | \t\"github.com/prometheus/client_golang/prometheus\"\n11 | \t\"github.com/prometheus/client_golang/prometheus/promauto\"\n12 | \t\"github.com/prome...",
+      "latency_seconds": 0.721
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/services/pluginsintegration/pluginsintegration.go",
+        "fromLine": 81,
+        "toLine": 228
+      },
+      "result_preview": "# pkg/services/pluginsintegration/pluginsintegration.go\nLines: 81 - 228 of 228\n\n81 | \twire.Bind(new(process.Manager), new(*process.Service)),\n82 | \tcoreplugin.ProvideCoreRegistry,\n83 | \tpluginscdn.ProvideService,\n84 | \n85 | \tpipeline.ProvideDiscoveryStage,\n86 | \twire.Bind(new(discovery.Discoverer), new(*discovery.Discovery)),\n87 | \tpipeline.ProvideBootstrapStage,\n88 | \twire.Bind(new(bootstrap.Bootstrapper), new(*bootstrap.Bootstrap)),\n89 | \tpipeline.ProvideInitializationStage,\n90 | \twire.Bind(ne...",
+      "latency_seconds": 1.024
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/services/pluginsintegration/clientmiddleware/metrics_middleware_test.go",
+        "fromLine": 61,
+        "toLine": 160
+      },
+      "result_preview": "# pkg/services/pluginsintegration/clientmiddleware/metrics_middleware_test.go\nLines: 61 - 160 of 316\nMore: fromLine=161\n\n61 | \t\t\t},\n62 | \t\t\t{\n63 | \t\t\t\texpEndpoint: backend.EndpointCollectMetrics,\n64 | \t\t\t\tfn: func(cdt *handlertest.HandlerMiddlewareTest) error {\n65 | \t\t\t\t\t_, err := cdt.MiddlewareHandler.CollectMetrics(context.Background(), &backend.CollectMetricsRequest{PluginContext: pCtx})\n66 | \t\t\t\t\treturn err\n67 | \t\t\t\t},\n68 | \t\t\t\tshouldInstrumentRequestSize: false,\n69 | \t\t\t},\n70 | \t\t} {\n71 | \t...",
+      "latency_seconds": 1.668
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "PrometheusMetrics Register MustRegister prometheus.Registerer httpclient",
+        "channels": [
+          "purpose",
+          "semantic"
+        ],
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/registry/apis/provisioning/controller/metrics.go\",\n        \"purpose\": \"This file defines and registers Prometheus metrics for provisioning finalizers and health checks, providing a recorder interface for health metrics and concrete implementations that update counters and histograms during controller operations.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"pat...",
+      "latency_seconds": 0.596
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePath": "pkg/infra/httpclient/httpclientprovider/http_client_provider_test.go",
+        "fromLine": 1,
+        "toLine": 96
+      },
+      "result_preview": "# pkg/infra/httpclient/httpclientprovider/http_client_provider_test.go\nLines: 1 - 96 of 97\nMore: fromLine=97\n\n1 | package httpclientprovider\n2 | \n3 | import (\n4 | \t\"testing\"\n5 | \n6 | \t\"github.com/grafana/grafana-aws-sdk/pkg/awsauth\"\n7 | \tsdkhttpclient \"github.com/grafana/grafana-plugin-sdk-go/backend/httpclient\"\n8 | \t\"github.com/stretchr/testify/require\"\n9 | \n10 | \t\"github.com/grafana/grafana/pkg/infra/tracing\"\n11 | \t\"github.com/grafana/grafana/pkg/plugins/config\"\n12 | \t\"github.com/grafana/grafa...",
+      "latency_seconds": 1.605
+    }
+  ],
+  "error": ""
+}

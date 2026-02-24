@@ -1,0 +1,525 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "answer": "I now have comprehensive evidence from all four repositories. Let me compile the complete analysis.\n\n---\n\n## 1. Architecture Overview\n\n`corev1.Secret.Data` is typed as `map[string][]byte` in the Kubernetes API. Every file that reads from or writes to this field treats it as a plain Go map \u2014 using bracket indexing (`secret.Data[\"key\"]`), range iteration (`for k, v := range secret.Data`), nil-check-and-initialize (`secret.Data = make(map[string][]byte)`), and direct assignment (`secret.Data[k] = v`). Renaming this field's type to `SecretData` with different accessor methods (e.g., `Get(key)`, `Set(key, val)`, `Range(fn)`) would break **every one of these call sites** at compile time.\n\nThe four repos interact with `Secret.Data` across three distinct patterns:\n\n| Pattern | Example | Repos |\n|---|---|---|\n| **Map-index read** `secret.Data[\"key\"]` | Reading cluster server URL, repo password, TLS key | ArgoCD, cert-manager, external-secrets |\n| **Range iteration** `for k, v := range secret.Data` | Serializing all keys, copying data | Helm, ArgoCD, external-secrets |\n| **Map-initialize + assign** `secret.Data = make(map[string][]byte)` | Creating new secrets | Helm, ArgoCD, cert-manager, external-secrets |\n\n---\n\n## 2. Detailed Analysis\n\n### \ud83d\udd34 Helm (`d49f3ae3`)\n\n**`pkg/storage/driver/secrets.go`** \u2014 `newSecretsObject()` (L285):\n```go\nData: map[string][]byte{\"release\": []byte(s)},\n```\nConstructs a `*v1.Secret` literal with `Data` as a `map[string][]byte`. The type change breaks this struct literal.\n\n**`pkg/engine/files.go`** \u2014 `AsSecrets()` (L135\u2013146):\n```go\nm := make(map[string]string)\nfor k, v := range f {\n    m[path.Base(k)] = base64.StdEncoding.EncodeToString(v)\n}\nreturn toYAML(m)\n```\nThis builds the YAML for a Secret's `data:` section. While it doesn't directly access `secret.Data`, it produces the raw map that callers embed into `Secret.Data`. Any accessor-method change would require this serialization path to change too.\n\n---\n\n### \ud83d\udd34 ArgoCD (`cceba948`)\n\n**`util/db/secrets.go`** \u2014 `boolOrFalse()`, `intOrZero()`, `updateSecretBool()`, `updateSecretInt()`, `updateSecretString()` (L49\u201383):\n```go\nval, present := secret.Data[key]          // read\nsecret.Data[key] = []byte(...)            // write\nif _, present := secret.Data[key]; ...    // existence check\n```\nFive helper functions all use direct map indexing. Every one breaks.\n\n**`util/db/cluster.go`** \u2014 `clusterToSecret()` and `SecretToCluster()` (L351\u2013459):\n```go\nsecret.Data = data                         // assign whole map\ns.Data[\"config\"], s.Data[\"server\"], s.Data[\"name\"], s.Data[\"namespaces\"],\ns.Data[\"shard\"], s.Data[\"clusterResources\"], s.Data[\"project\"]  // 7 key reads\n```\n`clusterToSecret` builds a `map[string][]byte` and assigns it to `secret.Data`. `SecretToCluster` reads 7 named keys by bracket index.\n\n**`util/db/repository_secrets.go`** \u2014 `secretToRepository()`, `repositoryToSecret()`, `secretToRepoCred()`, `repoCredsToSecret()`, `getRepositorySecret()`, `getRepositoryCredentialIndex()` (L329\u2013606):\n```go\nstring(secretCopy.Data[\"name\"]), string(secretCopy.Data[\"url\"]), ...  // 15+ key reads\nsecretCopy.Data = make(map[string][]byte)                              // init\nstring(cred.Data[\"url\"])                                               // in loop\n```\nThe most heavily impacted file \u2014 15+ distinct `secret.Data[\"key\"]` accesses across 4 functions.\n\n**`applicationset/utils/kubernetes.go`** \u2014 `GetSecretRef()` (L39\u201343):\n```go\ntokenBytes, ok := secret.Data[ref.Key]\n```\nDirect bracket-index read.\n\n**`cmd/argocd/commands/admin/initial_password.go`** \u2014 `NewInitialPasswordCommand()` (L34):\n```go\nif initialPass, ok := secret.Data[\"password\"]; ok {\n```\nDirect bracket-index read.\n\n**`cmd/argocd/commands/admin/generatespec_utils.go`** \u2014 `convertSecretData()` (L99\u2013108):\n```go\nfor k, v := range secret.Data {\n    secret.StringData[k] = string(v)\n}\nsecret.Data = map[string][]byte{}\n```\nRange iteration + whole-map assignment.\n\n**`util/settings/settings.go`** \u2014 `updateSecret()` / `GetSecretByName()` (L684, L788):\n```go\nData: make(map[string][]byte),             // struct literal init\nsecretCopy.Data = make(map[string][]byte)  // nil-guard init\nreflect.DeepEqual(beforeUpdate.Data, argoCDSecret.Data)  // comparison\n```\n\n**`hack/gen-resources/generators/repo_generator.go`** \u2014 `Generate()` (L103\u2013107):\n```go\nData: map[string][]byte{\n    \"type\": []byte(\"git\"), \"url\": []byte(repo.Url), \"project\": []byte(\"default\"),\n},\n```\nStruct literal with `Data` as a map.\n\n---\n\n### \ud83d\udd34 cert-manager (`5c4b66d9`)\n\n**`pkg/util/kube/pki.go`** \u2014 `ParseTLSKeyFromSecret()`, `SecretTLSCertChain()`, `SecretTLSKeyPairAndCA()`, `SecretTLSKeyPair()` (L59, L78, L105, L123, L132):\n```go\nkeyBytes, ok := secret.Data[keyName]\ncertBytes, ok := secret.Data[corev1.TLSCertKey]\ncaBytes, ok := secret.Data[cmmeta.TLSCAKey]\nkeyBytes, ok := secret.Data[corev1.TLSPrivateKeyKey]\n```\nFour functions, five direct bracket-index reads. This is the **core PKI utility** used by every issuer controller.\n\n**`pkg/server/tls/authority/authority.go`** \u2014 `regenerateCA()` (L393\u2013414):\n```go\nData: map[string][]byte{\n    corev1.TLSCertKey: certBytes, corev1.TLSPrivateKeyKey: pkBytes, cmmeta.TLSCAKey: certBytes,\n},\n// and later:\nif s.Data == nil { s.Data = make(map[string][]byte) }\ns.Data[corev1.TLSCertKey] = certBytes\ns.Data[corev1.TLSPrivateKeyKey] = pkBytes\ns.Data[cmmeta.TLSCAKey] = certBytes\n```\nBoth struct literal and post-nil-check assignment.\n\n**`pkg/controller/cainjector/sources.go`** \u2014 `secretDataSource.ReadCA()` (L194):\n```go\ncaData, hasCAData := secret.Data[cmmeta.TLSCAKey]\n```\nDirect bracket-index read.\n\n**`pkg/controller/certificaterequests/ca/ca.go`** \u2014 `Sign()` (L82):\nCalls `kube.SecretTLSKeyPairAndCA()` which internally does all the `secret.Data[...]` reads. Indirect but still broken if the utility signature changes.\n\n**`test/unit/gen/secret.go`** \u2014 `SetSecretData()` (L58\u201362):\n```go\nfunc SetSecretData(data map[string][]byte) SecretModifier {\n    return func(sec *corev1.Secret) {\n        sec.Data = make(map[string][]byte)\n        maps.Copy(sec.Data, data)\n    }\n}\n```\nThe function signature `map[string][]byte` and the `sec.Data = make(map[string][]byte)` both break.\n\n**`internal/informers/core_filteredsecrets.go`** \u2014 `secretNamespaceLister` (L232\u2013340):\nImplements the `SecretLister` interface that returns `*corev1.Secret`. Any change to `Secret.Data`'s type propagates to all callers of `.Get()` and `.List()` that then access `.Data`.\n\n---\n\n### \ud83d\udd34 external-secrets (`df9200e3`)\n\n**`pkg/controllers/pushsecret/pushsecret_controller_template.go`** \u2014 `applyTemplate()` (L64\u201365):\n```go\ndataMap := make(map[string][]byte)\nmaps.Copy(dataMap, secret.Data)\n```\n`maps.Copy` requires both arguments to be the same map type. If `secret.Data` is no longer `map[string][]byte`, this breaks.\n\n**`pkg/controllers/templating/parser.go`** \u2014 `MergeSecret()` (L114):\n```go\nval, ok := sec.Data[k.Key]\n```\nDirect bracket-index read.\n\n**`providers/v1/kubernetes/client.go`** \u2014 `GetSecret()`, `DeleteSecret()`, `mergePushSecretData()` (L69\u201370, L95, L100, L139\u2013140, L166\u2013168, L180, L183):\n```go\nfor key, val := range secret.Data { m[key] = string(val) }   // range\nif _, ok := extSecret.Data[remoteRef.GetProperty()]; !ok {}   // existence check\nlen(extSecret.Data)                                            // len()\nremoteSecret.Data = make(map[string][]byte)                    // init\nfor k, v := range localSecret.Data { remoteSecret.Data[k] = v } // range+assign\nremoteSecret.Data[remoteRef.GetProperty()] = value             // assign\nremoteSecret.Data[remoteRef.GetProperty()] = localSecret.Data[remoteRef.GetSecretKey()] // read+assign\n```\nThe most heavily impacted file in external-secrets \u2014 7 distinct map operations.\n\n**`pkg/controllers/externalsecret/externalsecret_controller_manifest.go`** \u2014 `renderTemplatedManifest()` (L294):\n```go\ntempSecret := &v1.Secret{Data: make(map[string][]byte)}\n```\nStruct literal initialization.\n\n---\n\n## 3. Relevant Files\n\n| Repo | File Path | Why Breaks |\n|------|-----------|------------|\n| **helm** | `pkg/storage/driver/secrets.go` | `Data: map[string][]byte{\"release\": []byte(s)}` \u2014 struct literal at L285 |\n| **helm** | `pkg/storage/driver/secrets_test.go` | Tests construct `*v1.Secret` with `Data` map literals; all assertions break |\n| **helm** | `pkg/engine/files.go` | `AsSecrets()` builds `map[string]string` for Secret `data:` section; serialization contract breaks |\n| **helm** | `pkg/engine/files_test.go` | Tests for `AsSecrets()` and `AsConfig()` break with serialization changes |\n| **argo-cd** | `util/db/secrets.go` | `boolOrFalse()`, `intOrZero()`, `updateSecretBool()`, `updateSecretInt()`, `updateSecretString()` \u2014 5 functions use `secret.Data[key]` bracket indexing (L49\u201383) |\n| **argo-cd** | `util/db/cluster.go` | `clusterToSecret()` assigns `secret.Data = data` (L376); `SecretToCluster()` reads 7 keys by bracket index (L400\u2013454) |\n| **argo-cd** | `util/db/repository_secrets.go` | `secretToRepository()` reads 15+ keys; `repositoryToSecret()` calls `make(map[string][]byte)` + `updateSecret*`; `secretToRepoCred()` reads 12 keys; `repoCredsToSecret()` inits map; `getRepositorySecret()` and `getRepositoryCredentialIndex()` read `cred.Data[\"url\"]` in loops (L329\u2013606) |\n| **argo-cd** | `util/db/repository_secrets_test.go` | Tests for all the above functions break |\n| **argo-cd** | `applicationset/utils/kubernetes.go` | `GetSecretRef()` reads `secret.Data[ref.Key]` at L39 |\n| **argo-cd** | `applicationset/utils/kubernetes_test.go` | Tests for `GetSecretRef()` construct secrets with `Data` map literals |\n| **argo-cd** | `cmd/argocd/commands/admin/initial_password.go` | `secret.Data[\"password\"]` bracket read at L34 |\n| **argo-cd** | `cmd/argocd/commands/admin/generatespec_utils.go` | `convertSecretData()` ranges over `secret.Data` and assigns `secret.Data = map[string][]byte{}` (L104\u2013107) |\n| **argo-cd** | `cmd/argocd/commands/admin/generatespec_utils_test.go` | Tests for `convertSecretData()` break |\n| **argo-cd** | `util/settings/settings.go` | `updateSecret()` initializes `Data: make(map[string][]byte)` (L684); `GetSecretByName()` nil-guards with `make(map[string][]byte)` (L788); `reflect.DeepEqual` on `.Data` (L695) |\n| **argo-cd** | `util/settings/settings_test.go` | Tests for settings secret management break |\n| **argo-cd** | `util/kube/util_test.go` | Tests `CreateOrUpdateSecretField` and `CreateOrUpdateSecretData` \u2014 both operate on `secret.Data` as a map |\n| **argo-cd** | `hack/gen-resources/generators/repo_generator.go` | `Data: map[string][]byte{...}` struct literal at L103\u2013107 |\n| **cert-manager** | `pkg/util/kube/pki.go` | `ParseTLSKeyFromSecret()`, `SecretTLSCertChain()`, `SecretTLSKeyPairAndCA()`, `SecretTLSKeyPair()` \u2014 5 bracket-index reads on `secret.Data` (L59, L78, L105, L123, L132) |\n| **cert-manager** | `pkg/server/tls/authority/authority.go` | `regenerateCA()` uses struct literal `Data: map[string][]byte{...}` and post-nil-check `s.Data[key] = val` (L393\u2013414) |\n| **cert-manager** | `pkg/controller/cainjector/sources.go` | `secretDataSource.ReadCA()` reads `secret.Data[cmmeta.TLSCAKey]` at L194 |\n| **cert-manager** | `pkg/controller/certificaterequests/ca/ca.go` | `Sign()` calls `kube.SecretTLSKeyPairAndCA()` which does all `secret.Data[...]` reads; breaks transitively |\n| **cert-manager** | `pkg/controller/certificaterequests/vault/vault.go` | `Sign()` calls `kube.SecretTLSKeyRef()` \u2192 `ParseTLSKeyFromSecret()` \u2192 `secret.Data[keyName]`; breaks transitively |\n| **cert-manager** | `pkg/controller/certificatesigningrequests/ca/ca_test.go` | `secretDataFor()` helper at L783 builds `map[string][]byte` for `secret.Data`; all test cases break |\n| **cert-manager** | `test/unit/gen/secret.go` | `SetSecretData(data map[string][]byte)` function signature and `sec.Data = make(map[string][]byte)` both break (L",
+  "llm_condensed_answer": "SUMMARY: Changing corev1.Secret.Data from map[string][]byte to a new type would break all direct map operations across Helm, ArgoCD, cert-manager, and external-secrets. The breakage occurs in three main patterns: bracket-index reads (secret.Data[\"key\"]), range iterations (for k, v := range secret.Data), and map-initialization/assignment (secret.Data = make(...)). Every file that constructs, reads, or writes to Secret.Data would require code changes.\n\nFILES:\n- helm/pkg/storage/driver/secrets.go \u2014 Struct literal with Data: map[string][]byte\n- helm/pkg/engine/files.go \u2014 AsSecrets() builds map for Secret data section\n- argo-cd/util/db/secrets.go \u2014 Five functions use secret.Data[key] bracket indexing\n- argo-cd/util/db/cluster.go \u2014 clusterToSecret() assigns whole map; SecretToCluster() reads 7 keys\n- argo-cd/util/db/repository_secrets.go \u2014 15+ bracket-index reads across multiple functions\n- argo-cd/applicationset/utils/kubernetes.go \u2014 GetSecretRef() reads secret.Data[ref.Key]\n- argo-cd/cmd/argocd/commands/admin/initial_password.go \u2014 Reads secret.Data[\"password\"]\n- argo-cd/cmd/argocd/commands/admin/generatespec_utils.go \u2014 Ranges over secret.Data and reassigns\n- argo-cd/util/settings/settings.go \u2014 Initializes Data: make(map[string][]byte) and uses reflect.DeepEqual\n- argo-cd/hack/gen-resources/generators/repo_generator.go \u2014 Struct literal with Data: map[string][]byte\n- cert-manager/pkg/util/kube/pki.go \u2014 Five bracket-index reads in PKI utility functions\n- cert-manager/pkg/server/tls/authority/authority.go \u2014 Struct literal and post-nil-check assignments\n- cert-manager/pkg/controller/cainjector/sources.go \u2014 Reads secret.Data[cmmeta.TLSCAKey]\n- cert-manager/pkg/controller/certificaterequests/ca/ca.go \u2014 Calls utility that reads secret.Data[...]\n- cert-manager/test/unit/gen/secret.go \u2014 Function signature and sec.Data = make(map[string][]byte)\n- external-secrets/pkg/controllers/pushsecret/pushsecret_controller_template.go \u2014 maps.Copy with secret.Data\n- external-secrets/pkg/controllers/templating/parser.go \u2014 Reads sec.Data[k.Key]\n- external-secrets/providers/v1/kubernetes/client.go \u2014 7 distinct map operations on secret.Data\n- external-secrets/pkg/controllers/externalsecret/externalsecret_controller_manifest.go \u2014 Struct literal initialization",
+  "cost": {
+    "input_tokens": 1023257,
+    "output_tokens": 9826,
+    "total_tokens": 1033083,
+    "cost_usd": 3.217161
+  },
+  "status": "success",
+  "latency_seconds": 204.86,
+  "tool_calls_count": 40,
+  "agent_steps": 12,
+  "tool_calls": [
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "secret.Data",
+        "channels": [
+          "keywords",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"secret.Data\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/c...",
+      "latency_seconds": 0.556
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "corev1.Secret",
+        "channels": [
+          "classes",
+          "imports"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[classes] 0 results for \\\"corev1.Secret\\\". Try a PARTIAL class name (e.g. \\\"Auth\\\" instead of \\\"AuthenticationServiceImpl\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"imports\": {\n    \"data\": [],\n    \"paginat...",
+      "latency_seconds": 0.506
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Secret Data map bytes",
+        "channels": [
+          "semantic",
+          "purpose"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/util/yaml/decoder.go\",\n        \"purpose\": \"Provides YAML and JSON decoding utilities for Kubernetes API objects, enabling stream-based parsing of multi-document YAML and JSON streams for the addon-resizer component.\",\n        \"knowledge_id\": \"ca1bbafc-55ee-468b-bd84-b94ce96619f0\",\n        \"repo_name\": \"autoscaler\"\n      },\n      {\n        \"path\": \"cluster-autoscaler/processors/capacitybuffer/pod...",
+      "latency_seconds": 0.961
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Secret Data",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"common/common_test.go\",\n        \"purpose\": \"This file provides unit tests for utility functions in the common package, specifically testing gRPC keep-alive enforcement settings from environment variables and Redis password retrieval from Kubernetes secrets, ensuring reliable configuration management in ArgoCD.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        \"path\": \"...",
+      "latency_seconds": 2.321
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Secret Data",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"internal/apis/certmanager/types_certificate.go\",\n        \"purpose\": \"Defines the core Kubernetes Custom Resource Definitions (CRDs) for cert-manager's Certificate resource: its specification (desired state), status (observed state), and supporting types like private key config, subject attributes, keystores, and name constraints. This file serves as the API schema for managing TLS certificates via Kubernetes objects.\",\n        \"knowledge_i...",
+      "latency_seconds": 2.318
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Secret Data",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"config/crds/bases/external-secrets.io_clusterexternalsecrets.yaml\",\n        \"purpose\": \"config/crds/bases/external-secrets.io_clusterexternalsecrets.yaml#chunk0: Defines the Kubernetes CRD schema for ClusterExternalSecret to manage ExternalSecrets cluster-wide.\\nconfig/crds/bases/external-secrets.io_clusterexternalsecrets.yaml#chunk1: Defines the detailed schema for the ClusterExternalSecret custom resource's spec and status fields for the...",
+      "latency_seconds": 2.323
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Secret Data",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b"
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"internal/chart/v3/metadata_test.go\",\n        \"purpose\": \"Unit test file validating Helm v3 chart metadata structure and constraints, including API version, name, version, type, dependencies, and maintainers. It ensures metadata integrity before chart deployment and enforces sanitization of invalid characters in string fields.\",\n        \"knowledge_id\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n        \"repo_name\": \"helm\"\n      },\n      {\n    ...",
+      "latency_seconds": 3.902
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [
+          "pkg/storage/driver/secrets.go",
+          "pkg/engine/files.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n  \"files\": [\n    {\n      \"path\": \"pkg/storage/driver/secrets.go\",\n      \"purpose\": \"Implements a Kubernetes Secret-based storage driver for Helm releases, enabling persistence of release state as Kubernetes Secrets. It provides CRUD operations for releases, label-based querying, and integrates with Kubernetes API for storage.\",\n      \"summary\": \"{\\\"SecretsDriverName (~L42)\\\":\\\"Constant defining the driver name ...",
+      "latency_seconds": 0.419
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "util/db/secrets.go",
+          "util/db/cluster.go",
+          "util/db/repository_secrets.go",
+          "applicationset/utils/kubernetes.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"util/db/secrets.go\",\n      \"purpose\": \"This file provides secret management utilities for Argo CD's database layer, handling Kubernetes Secret lifecycle operations including creation, deletion, listing, and watching. It abstracts secret handling for Argo CD's internal use (e.g., cluster credentials, repository credentials) by leveraging Kubernetes API and informers, with suppor...",
+      "latency_seconds": 0.408
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "pkg/util/kube/pki.go",
+          "pkg/controller/cainjector/sources.go",
+          "pkg/server/tls/authority/authority.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"pkg/util/kube/pki.go\",\n      \"purpose\": \"Provides utility functions for retrieving and parsing TLS certificates, private keys, and certificate chains from Kubernetes Secrets using informers. Supports certificate management by abstracting Kubernetes API interactions for PKI operations in cert-manager.\",\n      \"summary\": \"{\\\"TLS Secret Parsing (~L32-152)\\\":\\\"Core functionality fo...",
+      "latency_seconds": 0.89
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePaths": [
+          "pkg/controllers/pushsecret/pushsecret_controller_template.go",
+          "pkg/controllers/externalsecret/externalsecret_controller_manifest.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controllers/pushsecret/pushsecret_controller_template.go\",\n      \"purpose\": \"Template application logic for PushSecret resources, merging template data with secret data while preserving original secret integrity\",\n      \"summary\": \"{\\\"Template Engine\\\":\\\"Uses external-secrets template engine V2 for processing template data\\\",\\\"Data Integrity\\\":\\\"Creates copy of secret.Data ...",
+      "latency_seconds": 0.403
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePath": "pkg/storage/driver/secrets.go",
+        "fromLine": 161,
+        "toLine": 287
+      },
+      "result_preview": "# pkg/storage/driver/secrets.go\nLines: 161 - 287 of 288\nMore: fromLine=288\n\n161 | // Create creates a new Secret holding the release. If the\n162 | // Secret already exists, ErrReleaseExists is returned.\n163 | func (secrets *Secrets) Create(key string, rel release.Releaser) error {\n164 | \t// set labels for secrets object meta data\n165 | \tvar lbs labels\n166 | \n167 | \trls, err := releaserToV1Release(rel)\n168 | \tif err != nil {\n169 | \t\treturn err\n170 | \t}\n171 | \n172 | \tlbs.init()\n173 | \tlbs.fromMap(...",
+      "latency_seconds": 1.977
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePath": "pkg/engine/files.go",
+        "fromLine": 90,
+        "toLine": 165
+      },
+      "result_preview": "# pkg/engine/files.go\nLines: 90 - 165 of 166\nMore: fromLine=166\n\n90 | // AsConfig turns a Files group and flattens it to a YAML map suitable for\n91 | // including in the 'data' section of a Kubernetes ConfigMap definition.\n92 | // Duplicate keys will be overwritten, so be aware that your file names\n93 | // (regardless of path) should be unique.\n94 | //\n95 | // This is designed to be called from a template, and will return empty string\n96 | // (via toYAML function) if it cannot be serialized to Y...",
+      "latency_seconds": 1.967
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/db/secrets.go",
+        "fromLine": 26,
+        "toLine": 113
+      },
+      "result_preview": "# util/db/secrets.go\nLines: 26 - 113 of 188\nMore: fromLine=114\n\n26 | func (db *db) listSecretsByType(types ...string) ([]*corev1.Secret, error) {\n27 | \tlabelSelector := labels.NewSelector()\n28 | \treq, err := labels.NewRequirement(common.LabelKeySecretType, selection.Equals, types)\n29 | \tif err != nil {\n30 | \t\treturn nil, err\n31 | \t}\n32 | \tlabelSelector = labelSelector.Add(*req)\n33 | \n34 | \tsecretsLister, err := db.settingsMgr.GetSecretsLister()\n35 | \tif err != nil {\n36 | \t\treturn nil, err\n37 | \t...",
+      "latency_seconds": 1.994
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "pkg/util/kube/pki.go",
+        "fromLine": 1,
+        "toLine": 152
+      },
+      "result_preview": "# pkg/util/kube/pki.go\nLines: 1 - 152 of 152\n\n1 | /*\n2 | Copyright 2020 The cert-manager Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITHOU...",
+      "latency_seconds": 1.966
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/db/cluster.go",
+        "fromLine": 351,
+        "toLine": 460
+      },
+      "result_preview": "# util/db/cluster.go\nLines: 351 - 460 of 460\n\n351 | func clusterToSecret(c *appv1.Cluster, secret *corev1.Secret) error {\n352 | \tdata := make(map[string][]byte)\n353 | \tdata[\"server\"] = []byte(strings.TrimRight(c.Server, \"/\"))\n354 | \tif c.Name == \"\" {\n355 | \t\tdata[\"name\"] = []byte(c.Server)\n356 | \t} else {\n357 | \t\tdata[\"name\"] = []byte(c.Name)\n358 | \t}\n359 | \tif len(c.Namespaces) != 0 {\n360 | \t\tdata[\"namespaces\"] = []byte(strings.Join(c.Namespaces, \",\"))\n361 | \t}\n362 | \tconfigBytes, err := json.M...",
+      "latency_seconds": 1.999
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/db/repository_secrets.go",
+        "fromLine": 329,
+        "toLine": 508
+      },
+      "result_preview": "# util/db/repository_secrets.go\nLines: 329 - 508 of 621\nMore: fromLine=509\n\n329 | func secretToRepository(secret *corev1.Secret) (*appsv1.Repository, error) {\n330 | \tsecretCopy := secret.DeepCopy()\n331 | \n332 | \trepository := &appsv1.Repository{\n333 | \t\tName:                       string(secretCopy.Data[\"name\"]),\n334 | \t\tRepo:                       string(secretCopy.Data[\"url\"]),\n335 | \t\tUsername:                   string(secretCopy.Data[\"username\"]),\n336 | \t\tPassword:                   string(s...",
+      "latency_seconds": 2.024
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "applicationset/utils/kubernetes.go",
+        "fromLine": 1,
+        "toLine": 63
+      },
+      "result_preview": "# applicationset/utils/kubernetes.go\nLines: 1 - 63 of 64\nMore: fromLine=64\n\n1 | package utils\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"fmt\"\n6 | \n7 | \t\"github.com/argoproj/argo-cd/v3/common\"\n8 | \n9 | \tcorev1 \"k8s.io/api/core/v1\"\n10 | \t\"sigs.k8s.io/controller-runtime/pkg/client\"\n11 | \n12 | \targoprojiov1alpha1 \"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n13 | )\n14 | \n15 | var ErrDisallowedSecretAccess = fmt.Errorf(\"secret must have label %q=%q\", common.LabelKeySecretType, common.Lab...",
+      "latency_seconds": 1.994
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePath": "pkg/controllers/pushsecret/pushsecret_controller_template.go",
+        "fromLine": 40,
+        "toLine": 96
+      },
+      "result_preview": "# pkg/controllers/pushsecret/pushsecret_controller_template.go\nLines: 40 - 96 of 114\nMore: fromLine=97\n\n40 | // applyTemplate merges template in the following order:\n41 | // * template.Data (highest precedence)\n42 | // * template.templateFrom\n43 | // * secret via ps.data or ps.dataFrom.\n44 | // Apply template modifications for the source secret. These modifications will only live in memory as we will\n45 | // never modify it.\n46 | func (r *Reconciler) applyTemplate(ctx context.Context, ps *v1alph...",
+      "latency_seconds": 1.992
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/db/repository_secrets.go",
+        "fromLine": 509,
+        "toLine": 621
+      },
+      "result_preview": "# util/db/repository_secrets.go\nLines: 509 - 621 of 621\n\n509 | \n510 | func (s *secretsRepositoryBackend) repoCredsToSecret(repoCreds *appsv1.RepoCreds, secret *corev1.Secret) *corev1.Secret {\n511 | \tsecretCopy := secret.DeepCopy()\n512 | \n513 | \tif secretCopy.Data == nil {\n514 | \t\tsecretCopy.Data = make(map[string][]byte)\n515 | \t}\n516 | \n517 | \tupdateSecretString(secretCopy, \"url\", repoCreds.URL)\n518 | \tupdateSecretString(secretCopy, \"username\", repoCreds.Username)\n519 | \tupdateSecretString(secre...",
+      "latency_seconds": 2.01
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "pkg/controller/cainjector/sources.go",
+        "fromLine": 145,
+        "toLine": 203
+      },
+      "result_preview": "# pkg/controller/cainjector/sources.go\nLines: 145 - 203 of 204\nMore: fromLine=204\n\n145 | // secretDataSource reads a CA bundle from a Secret resource named using the\n146 | // 'cert-manager.io/inject-ca-from-secret' annotation in the form\n147 | // 'namespace/name'.\n148 | type secretDataSource struct {\n149 | \tclient client.Reader\n150 | }\n151 | \n152 | func (c *secretDataSource) Configured(log logr.Logger, metaObj metav1.Object) bool {\n153 | \tsecretNameRaw, ok := metaObj.GetAnnotations()[cmapi.WantI...",
+      "latency_seconds": 1.989
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "pkg/server/tls/authority/authority.go",
+        "fromLine": 346,
+        "toLine": 420
+      },
+      "result_preview": "# pkg/server/tls/authority/authority.go\nLines: 346 - 420 of 442\nMore: fromLine=421\n\n346 | // regenerateCA will regenerate and store a new CA.\n347 | // If the provided Secret is nil, a new secret resource will be Created.\n348 | // Otherwise, the provided resource will be modified and Updated.\n349 | func (d *DynamicAuthority) regenerateCA(ctx context.Context, s *corev1.Secret) error {\n350 | \tpk, err := pki.GenerateECPrivateKey(384)\n351 | \tif err != nil {\n352 | \t\treturn err\n353 | \t}\n354 | \tpkBytes,...",
+      "latency_seconds": 1.987
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "secret.Data key bytes",
+        "channels": [
+          "purpose",
+          "functions"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"docs/user-guide/commands/argocd_proj_add-signature-key.md\",\n        \"purpose\": \"This file provides user documentation for the ArgoCD CLI command 'argocd proj add-signature-key', detailing its usage, syntax, examples, and options to enable users to add GnuPG signature keys to projects for enhanced security and verification in GitOps workflows.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n  ...",
+      "latency_seconds": 1.043
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "util/settings/settings.go",
+          "util/kube/util_test.go",
+          "cmd/argocd/commands/admin/initial_password.go",
+          "cmd/argocd/commands/admin/generatespec_utils.go",
+          "hack/gen-resources/generators/repo_generator.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"util/settings/settings.go\",\n      \"purpose\": \"This file defines and manages the core configuration settings for ArgoCD, including authentication, repository access, and UI customization. It provides a SettingsManager that retrieves and persists configuration from Kubernetes ConfigMaps and Secrets, handling sensitive data like certificates and OIDC credentials. The file serves a...",
+      "latency_seconds": 0.735
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePaths": [
+          "pkg/controllers/externalsecret/externalsecret_controller_manifest.go",
+          "providers/v1/kubernetes/metadata.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controllers/externalsecret/externalsecret_controller_manifest.go\",\n      \"purpose\": \"This file implements the generic target manifest handling for the ExternalSecret controller, enabling the creation and management of arbitrary Kubernetes resources (like ConfigMaps, Secrets, or custom CRDs) as targets for external secret data. It provides validation, resource lifecycle mana...",
+      "latency_seconds": 0.716
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "test/e2e/framework/helper/secret.go",
+          "test/unit/gen/secret.go",
+          "test/unit/coreclients/secrets.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"test/e2e/framework/helper/secret.go\",\n      \"purpose\": \"Provides a helper function for end-to-end tests to wait for a Kubernetes Secret to contain certificate data, ensuring cert-manager has successfully populated the TLS certificate.\",\n      \"summary\": \"{\\\"Test Helper Function (~L33-59)\\\":\\\"Core utility for e2e tests to verify cert-manager's certificate issuance by polling a S...",
+      "latency_seconds": 0.728
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/settings/settings.go",
+        "fromLine": 453,
+        "toLine": 700
+      },
+      "result_preview": "# util/settings/settings.go\nLines: 453 - 700 of 2429\nMore: fromLine=701\n\n453 | \tsettingsWebhookBitbucketServerSecretKey = \"webhook.bitbucketserver.secret\"\n454 | \t// settingsWebhookGogsSecret is the key for Gogs webhook secret\n455 | \tsettingsWebhookGogsSecretKey = \"webhook.gogs.secret\"\n456 | \t// settingsWebhookAzureDevOpsUsernameKey is the key for Azure DevOps webhook username\n457 | \tsettingsWebhookAzureDevOpsUsernameKey = \"webhook.azuredevops.username\"\n458 | \t// settingsWebhookAzureDevOpsPasswor...",
+      "latency_seconds": 2.709
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "cmd/argocd/commands/admin/initial_password.go",
+        "fromLine": 1,
+        "toLine": 43
+      },
+      "result_preview": "# cmd/argocd/commands/admin/initial_password.go\nLines: 1 - 43 of 44\nMore: fromLine=44\n\n1 | package admin\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"fmt\"\n6 | \n7 | \t\"github.com/spf13/cobra\"\n8 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n9 | \t\"k8s.io/client-go/kubernetes\"\n10 | \t\"k8s.io/client-go/tools/clientcmd\"\n11 | \n12 | \t\"github.com/argoproj/argo-cd/v3/util/cli\"\n13 | \t\"github.com/argoproj/argo-cd/v3/util/errors\"\n14 | )\n15 | \n16 | const initialPasswordSecretName = \"argocd-initial-admin-secret\"\n17...",
+      "latency_seconds": 1.966
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "cmd/argocd/commands/admin/generatespec_utils.go",
+        "fromLine": 76,
+        "toLine": 108
+      },
+      "result_preview": "# cmd/argocd/commands/admin/generatespec_utils.go\nLines: 76 - 108 of 109\nMore: fromLine=109\n\n76 | // omit fields such as status, creationTimestamp and metadata.namespace in k8s objects\n77 | func omitFields(resource any) (any, error) {\n78 | \tjsonBytes, err := json.Marshal(resource)\n79 | \tif err != nil {\n80 | \t\treturn nil, err\n81 | \t}\n82 | \n83 | \ttoMap := make(map[string]any)\n84 | \terr = json.Unmarshal(jsonBytes, &toMap)\n85 | \tif err != nil {\n86 | \t\treturn nil, err\n87 | \t}\n88 | \n89 | \tdelete(toMap...",
+      "latency_seconds": 1.959
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "hack/gen-resources/generators/repo_generator.go",
+        "fromLine": 82,
+        "toLine": 117
+      },
+      "result_preview": "# hack/gen-resources/generators/repo_generator.go\nLines: 82 - 117 of 126\nMore: fromLine=118\n\n82 | func (rg *RepoGenerator) Generate(opts *util.GenerateOpts) error {\n83 | \trepos, err := FetchRepos(opts.GithubToken, opts.RepositoryOpts.Samples)\n84 | \tif err != nil {\n85 | \t\treturn err\n86 | \t}\n87 | \n88 | \tsecrets := rg.clientSet.CoreV1().Secrets(opts.Namespace)\n89 | \trg.bar.NewOption(0, int64(len(repos)))\n90 | \tfor _, repo := range repos {\n91 | \t\t_, err = secrets.Create(context.TODO(), &corev1.Secre...",
+      "latency_seconds": 2.027
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePath": "util/settings/settings.go",
+        "fromLine": 700,
+        "toLine": 900
+      },
+      "result_preview": "# util/settings/settings.go\nLines: 700 - 900 of 2429\nMore: fromLine=901\n\n700 | \t\t_, err = mgr.clientset.CoreV1().Secrets(mgr.namespace).Create(context.Background(), argoCDSecret, metav1.CreateOptions{})\n701 | \t} else {\n702 | \t\t_, err = mgr.clientset.CoreV1().Secrets(mgr.namespace).Update(context.Background(), argoCDSecret, metav1.UpdateOptions{})\n703 | \t}\n704 | \tif err != nil {\n705 | \t\treturn err\n706 | \t}\n707 | \n708 | \treturn mgr.ResyncInformers()\n709 | }\n710 | \n711 | func (mgr *SettingsManager)...",
+      "latency_seconds": 3.005
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePath": "pkg/controllers/externalsecret/externalsecret_controller_manifest.go",
+        "fromLine": 269,
+        "toLine": 334
+      },
+      "result_preview": "# pkg/controllers/externalsecret/externalsecret_controller_manifest.go\nLines: 269 - 334 of 335\nMore: fromLine=335\n\n269 | // renderTemplatedManifest renders templates for a custom resource.\n270 | func (r *Reconciler) renderTemplatedManifest(ctx context.Context, es *esv1.ExternalSecret, obj *unstructured.Unstructured, dataMap map[string][]byte) (*unstructured.Unstructured, error) {\n271 | \texecute, err := template.EngineForVersion(es.Spec.Target.Template.EngineVersion)\n272 | \tif err != nil {\n273 | ...",
+      "latency_seconds": 2.079
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "secret.Data map bytes kubernetes",
+        "channels": [
+          "purpose",
+          "functions"
+        ],
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"docs/snippets/manifest-labeled-configmap.yaml\",\n        \"purpose\": \"This file defines a Kubernetes ExternalSecret resource that fetches feature flag values from a secret store (Vault) and creates a labeled ConfigMap containing a JSON configuration. It serves as a declarative configuration snippet for demonstrating how to use the External Secrets Operator to manage application configuration.\",\n        \"knowledge_id\": \"df9200e3-5480-4b75-9de1...",
+      "latency_seconds": 1.019
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "secret.Data map bytes kubernetes",
+        "channels": [
+          "purpose",
+          "functions"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28"
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"make/config/pebble/chart/templates/configmap.yaml\",\n        \"purpose\": \"Defines a Kubernetes ConfigMap for the Pebble ACME test server, providing configuration, TLS certificate, and private key data for testing certificate issuance workflows.\",\n        \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n        \"repo_name\": \"cert-manager\"\n      },\n      {\n        \"path\": \"pkg/util/cmapichecker/cmapichecker_test.go\",\n        \"purpose\": \"...",
+      "latency_seconds": 1.015
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePaths": [
+          "pkg/controllers/templating/parser.go",
+          "runtime/esutils/utils.go",
+          "providers/v1/kubernetes/client.go",
+          "runtime/template/v2/template.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controllers/templating/parser.go\",\n      \"purpose\": \"Provides templating functionality for merging external secret data into target Kubernetes secrets using various template sources (ConfigMap, Secret, Literal)\",\n      \"summary\": \"{\\\"Template Merging\\\":\\\"Supports merging templates from ConfigMap, Secret, and Literal sources into target Kubernetes secrets\\\",\\\"Field Ownership...",
+      "latency_seconds": 0.59
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "pkg/controller/certificaterequests/ca/ca.go",
+          "pkg/controller/certificaterequests/vault/vault.go",
+          "pkg/controller/certificatesigningrequests/ca/ca_test.go",
+          "internal/informers/core_filteredsecrets.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"pkg/controller/certificaterequests/ca/ca.go\",\n      \"purpose\": \"Implements the CA issuer for cert-manager's CertificateRequest controller, responsible for signing certificate requests using a configured CA certificate and key stored in a Kubernetes Secret.\",\n      \"summary\": \"{\\\"Design Pattern (~L47-60)\\\":\\\"Uses dependency injection for template generation and signing functions...",
+      "latency_seconds": 1.205
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePath": "pkg/controllers/templating/parser.go",
+        "fromLine": 94,
+        "toLine": 177
+      },
+      "result_preview": "# pkg/controllers/templating/parser.go\nLines: 94 - 177 of 265\nMore: fromLine=178\n\n94 | // MergeSecret merges the secret template specified in the ExternalSecretTemplate's TemplateFrom field.\n95 | func (p *Parser) MergeSecret(ctx context.Context, namespace string, tpl esv1.TemplateFrom) error {\n96 | \tif tpl.Secret == nil {\n97 | \t\treturn nil\n98 | \t}\n99 | \n100 | \tvar sec v1.Secret\n101 | \tif p.TemplateFromSecret != nil {\n102 | \t\tsec = *p.TemplateFromSecret\n103 | \t} else {\n104 | \t\terr := p.Client.Get...",
+      "latency_seconds": 2.585
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePath": "providers/v1/kubernetes/client.go",
+        "fromLine": 47,
+        "toLine": 186
+      },
+      "result_preview": "# providers/v1/kubernetes/client.go\nLines: 47 - 186 of 515\nMore: fromLine=187\n\n47 | // GetSecret retrieves a secret from the Kubernetes API server by its key.\n48 | func (c *Client) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {\n49 | \tsecret, err := c.userSecretClient.Get(ctx, ref.Key, metav1.GetOptions{})\n50 | \tif err != nil {\n51 | \t\treturn nil, err\n52 | \t}\n53 | \n54 | \t// if property is not defined, we will return the json-serialized secret\n55 | \tif ref.Pr...",
+      "latency_seconds": 2.565
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "pkg/controller/certificaterequests/ca/ca.go",
+        "fromLine": 75,
+        "toLine": 134
+      },
+      "result_preview": "# pkg/controller/certificaterequests/ca/ca.go\nLines: 75 - 134 of 144\nMore: fromLine=135\n\n75 | func (c *CA) Sign(ctx context.Context, cr *cmapi.CertificateRequest, issuerObj cmapi.GenericIssuer) (*issuerpkg.IssueResponse, error) {\n76 | \tlog := logf.FromContext(ctx, \"sign\")\n77 | \n78 | \tsecretName := issuerObj.GetSpec().CA.SecretName\n79 | \tresourceNamespace := c.issuerOptions.ResourceNamespace(issuerObj)\n80 | \n81 | \t// get a copy of the CA certificate named on the Issuer\n82 | \tcaCerts, caKey, err :...",
+      "latency_seconds": 2.584
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePath": "test/unit/gen/secret.go",
+        "fromLine": 1,
+        "toLine": 63
+      },
+      "result_preview": "# test/unit/gen/secret.go\nLines: 1 - 63 of 64\nMore: fromLine=64\n\n1 | /*\n2 | Copyright 2020 The cert-manager Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\"...",
+      "latency_seconds": 2.579
+    }
+  ],
+  "error": ""
+}

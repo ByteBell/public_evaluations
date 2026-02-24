@@ -73,80 +73,320 @@ class QuestionResult:
 
 
 # ─── MCP Client (StreamableHTTP) ────────────────────────────────────────────
+#
+# MCP StreamableHTTP Transport Protocol (spec version 2025-03-26)
+# ================================================================
+#
+# The MCP (Model Context Protocol) server exposes a SINGLE HTTP endpoint
+# (e.g. http://localhost:3100/mcp) that handles both POST and GET.
+#
+# This is NOT a simple REST API. It is a stateful, SSE-based protocol:
+#
+#   1. CLIENT sends POST with JSON-RPC request body
+#   2. SERVER responds in one of two ways:
+#      a) Content-Type: application/json  → single JSON-RPC response inline
+#      b) Content-Type: text/event-stream → SSE stream on the SAME response
+#         The stream contains one or more "data: {...}" lines. The server
+#         MAY send notifications/requests before the final JSON-RPC response.
+#         The stream closes after the response is sent.
+#   3. For notifications/responses (no reply expected), server returns 202 Accepted.
+#
+# Session management:
+#   - Server returns Mcp-Session-Id header on InitializeResult
+#   - Client MUST include Mcp-Session-Id on all subsequent requests
+#   - If server returns 404, session expired → client must re-initialize
+#
+# Full initialization handshake:
+#   POST initialize         → Server returns InitializeResult + session ID
+#   POST initialized (notif)→ Server returns 202 Accepted (required by spec!)
+#   POST tools/list         → Server returns available tools
+#
+# Why stream=True matters:
+#   Without stream=True, Python requests waits for the ENTIRE response body
+#   before returning. If the server uses Fastify reply.hijack() and sends
+#   SSE events over a long-lived connection, the POST appears to hang until
+#   the server closes the stream. With stream=True, we read SSE events as
+#   they arrive via resp.iter_lines(), so we get the JSON-RPC response
+#   immediately when the server sends it — no waiting for stream close.
+#
+# GET SSE stream (optional):
+#   The client MAY open a GET to the MCP endpoint to receive server-initiated
+#   messages (not responses to POST requests). We don't use this — all our
+#   communication is request-response via POST.
+#
 
 class MCPClient:
-    """Minimal MCP client over StreamableHTTP. No dependencies beyond requests."""
+    """Full MCP StreamableHTTP client with streaming SSE support.
+
+    Implements the MCP StreamableHTTP transport (spec 2025-03-26) using only
+    the `requests` library. Handles both application/json and text/event-stream
+    response types, sends the required initialized notification, and provides
+    detailed startup logging with org_id and knowledge base discovery.
+    """
 
     def __init__(self, url: str, timeout: int = 30):
         self.url = url
         self.timeout = timeout
         self.session_id: str | None = None
         self.tools: list[dict] = []
+        self.server_instructions: str = ""
         self._http = requests.Session()
+        self._req_counter = 0
 
-    def _post(self, payload: dict) -> dict:
-        """Send a JSON-RPC request to the MCP server and parse the SSE response."""
+    def _next_id(self) -> int:
+        """Generate a monotonically increasing JSON-RPC request ID."""
+        self._req_counter += 1
+        return self._req_counter
+
+    def _post(self, payload: dict, expect_response: bool = True) -> dict | None:
+        """Send a JSON-RPC message and parse the response.
+
+        This is the core transport method. It handles three response scenarios
+        defined by the MCP StreamableHTTP spec:
+
+        1. HTTP 202 Accepted (no body) — returned for notifications/responses.
+           We return None.
+        2. Content-Type: application/json — server sent a single JSON-RPC
+           response inline. We parse and return it.
+        3. Content-Type: text/event-stream — server opened an SSE stream on
+           this POST response. We iterate lines with stream=True, parse each
+           "data: {...}" event, skip server notifications/requests, and return
+           the JSON-RPC response (has "id" + "result" or "error").
+
+        Uses stream=True so we don't block waiting for the server to close
+        the SSE connection. Events are read as they arrive.
+
+        Args:
+            payload: JSON-RPC message (request, notification, or response).
+            expect_response: If False, we expect 202 and return None.
+
+        Returns:
+            Parsed JSON-RPC response dict, or None for notifications.
+
+        Raises:
+            requests.HTTPError: On 4xx/5xx status codes.
+            TimeoutError: If the server doesn't respond within self.timeout.
+        """
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
         if self.session_id:
-            headers["mcp-session-id"] = self.session_id
+            headers["Mcp-Session-Id"] = self.session_id
 
-        resp = self._http.post(self.url, json=payload, headers=headers, timeout=self.timeout)
-        resp.raise_for_status()
+        # stream=True: don't download the full body upfront.
+        # This lets us read SSE events incrementally via iter_lines().
+        resp = self._http.post(
+            self.url, json=payload, headers=headers,
+            timeout=self.timeout, stream=True,
+        )
 
-        # Capture session ID from response headers
-        sid = resp.headers.get("mcp-session-id")
-        if sid:
-            self.session_id = sid
+        try:
+            # Capture session ID from response headers (set during initialize)
+            sid = resp.headers.get("Mcp-Session-Id")
+            if sid:
+                self.session_id = sid
 
-        # Parse SSE: look for "data: {...}" lines
-        body = resp.text
-        for line in body.splitlines():
-            if line.startswith("data: "):
-                return json.loads(line[6:])
+            # ── Scenario 1: 202 Accepted (notification was accepted, no body)
+            if resp.status_code == 202:
+                return None
 
-        # Fallback: try parsing whole body as JSON
-        return resp.json()
+            resp.raise_for_status()
+
+            # ── Scenario 2: application/json (inline JSON-RPC response)
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                return resp.json()
+
+            # ── Scenario 3: text/event-stream (SSE on this POST response)
+            # The server streams "data: {...}" lines. Each line is a JSON-RPC
+            # message. The response to our request has a matching "id" field.
+            # The server may also send notifications (no "id") or server-initiated
+            # requests before the response — we skip those.
+            if "text/event-stream" in content_type:
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or line.startswith(":"):
+                        # Empty line (event boundary) or SSE comment — skip
+                        continue
+                    if line.startswith("event:"):
+                        # Named SSE event — skip (we only care about data lines)
+                        continue
+                    if line.startswith("data: "):
+                        try:
+                            data = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            logger.warning(f"[MCP] Malformed SSE data: {line[:100]}")
+                            continue
+
+                        # JSON-RPC response has "id" + ("result" or "error")
+                        # Notifications have "method" but no "id"
+                        if "id" in data and ("result" in data or "error" in data):
+                            return data
+
+                        # Server notification or request — log and continue
+                        if "method" in data:
+                            logger.debug(f"[MCP] Server notification: {data.get('method')}")
+                            continue
+
+                # If we got here, the stream ended without a response
+                if expect_response:
+                    raise TimeoutError(
+                        "MCP SSE stream closed without sending a JSON-RPC response"
+                    )
+                return None
+
+            # ── Fallback: unknown content type — try parsing as JSON
+            logger.warning(f"[MCP] Unexpected Content-Type: {content_type}, trying JSON")
+            return resp.json()
+
+        finally:
+            # Always close the response to release the connection back to the pool.
+            # Critical when using stream=True — without this, connections leak.
+            resp.close()
 
     def initialize(self):
-        """Initialize the MCP session and fetch available tools."""
-        # 1. Initialize
+        """Full MCP initialization handshake with detailed startup logging.
+
+        Performs the complete MCP session setup:
+          [1/6] Connect to MCP server endpoint
+          [2/6] Send InitializeRequest → get session ID + server info
+          [3/6] Send initialized notification (REQUIRED by MCP spec)
+          [4/6] Fetch available tools via tools/list
+          [5/6] Call server_info + list_knowledge to discover indexed repos
+          [6/6] Print "Server is ready" with org_id, knowledge IDs, repo names
+
+        After this method returns, the client is fully ready for tool calls.
+        """
+        endpoint = self.url.split("?")[0]  # strip access_token for logging
+
+        # ── Step 1: Connect ──
+        logger.info(f"[1/6] Connecting to MCP server at {endpoint}...")
+
+        # ── Step 2: Initialize ──
+        logger.info("[2/6] Sending InitializeRequest...")
         init_resp = self._post({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": self._next_id(),
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
-                "clientInfo": {"name": "bytebell-bench", "version": "2.0"},
+                "clientInfo": {"name": "bytebell-bench", "version": "3.0"},
             },
         })
 
-        server_info = init_resp.get("result", {}).get("serverInfo", {})
-        self.server_instructions = init_resp.get("result", {}).get("instructions", "")
-        logger.info(f"MCP connected: {server_info.get('name', 'unknown')}")
+        result = init_resp.get("result", {})
+        server_info = result.get("serverInfo", {})
+        self.server_instructions = result.get("instructions", "")
+        server_name = server_info.get("name", "unknown")
+        server_version = server_info.get("version", "?")
+        logger.info(f"[2/6] Connected: {server_name} v{server_version} | "
+                     f"session={self.session_id or 'none'}")
 
-        # 2. List tools
+        # ── Step 3: Send initialized notification (REQUIRED by MCP spec) ──
+        # The spec says: after receiving InitializeResult, the client MUST send
+        # an initialized notification. The server returns 202 Accepted.
+        logger.info("[3/6] Sending initialized notification...")
+        self._post({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }, expect_response=False)
+        logger.info("[3/6] Server acknowledged initialized notification")
+
+        # ── Step 4: List tools ──
+        logger.info("[4/6] Fetching tools list...")
         tools_resp = self._post({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": self._next_id(),
             "method": "tools/list",
             "params": {},
         })
         self.tools = tools_resp.get("result", {}).get("tools", [])
-        logger.info(f"MCP tools: {[t['name'] for t in self.tools]}")
+        tool_names = [t["name"] for t in self.tools]
+        logger.info(f"[4/6] Tools available: {tool_names}")
+
+        # ── Step 5: Discover org & knowledge bases ──
+        logger.info("[5/6] Fetching server_info & list_knowledge...")
+        org_id = None
+        knowledge_bases = []
+
+        # Call server_info tool to get org metadata
+        try:
+            si_text = self.call_tool("server_info", {})
+            try:
+                si_data = json.loads(si_text)
+                org_id = si_data.get("org_id") or si_data.get("orgId")
+            except (json.JSONDecodeError, AttributeError):
+                # server_info might return plain text — extract org_id if present
+                if "org_id" in si_text:
+                    for part in si_text.split():
+                        if part.startswith("org_id"):
+                            org_id = part.split(":")[-1].strip()
+            logger.info(f"[5/6] server_info fetched | org_id={org_id or '?'}")
+        except Exception as e:
+            logger.warning(f"[5/6] server_info call failed: {e}")
+
+        # Call list_knowledge tool to discover all indexed repositories
+        try:
+            lk_text = self.call_tool("list_knowledge", {})
+            try:
+                lk_data = json.loads(lk_text)
+                # Handle both {"knowledge": [...]} and [{...}] formats
+                if isinstance(lk_data, list):
+                    knowledge_bases = lk_data
+                elif isinstance(lk_data, dict):
+                    knowledge_bases = lk_data.get("knowledge", lk_data.get("items", []))
+            except (json.JSONDecodeError, AttributeError):
+                logger.warning(f"[5/6] list_knowledge returned non-JSON: {lk_text[:200]}")
+        except Exception as e:
+            logger.warning(f"[5/6] list_knowledge call failed: {e}")
+
+        # ── Step 6: Server is ready ──
+        logger.info("=" * 60)
+        logger.info("[6/6] SERVER IS READY")
+        logger.info(f"  Server:    {server_name} v{server_version}")
+        logger.info(f"  Session:   {self.session_id or 'stateless'}")
+        logger.info(f"  Org ID:    {org_id or 'N/A'}")
+        logger.info(f"  Tools:     {tool_names}")
+        if knowledge_bases:
+            logger.info(f"  Knowledge bases: {len(knowledge_bases)}")
+            for kb in knowledge_bases:
+                if isinstance(kb, dict):
+                    kb_id = kb.get("id") or kb.get("knowledge_id") or "?"
+                    kb_name = (kb.get("name") or kb.get("repo")
+                               or kb.get("title") or "unnamed")
+                    kb_files = kb.get("file_count") or kb.get("files") or "?"
+                    logger.info(f"    - {kb_id} | {kb_name} | {kb_files} files")
+                else:
+                    logger.info(f"    - {kb}")
+        else:
+            logger.info("  Knowledge bases: (none discovered)")
+        logger.info("=" * 60)
 
     def call_tool(self, name: str, arguments: dict) -> str:
-        """Call an MCP tool and return the text result."""
-        # Strip None values — LLMs send explicit nulls for optional params,
-        # MCP servers (Zod validation) reject them.
+        """Call an MCP tool and return the text result.
+
+        Sends a tools/call JSON-RPC request. The server processes the tool
+        call and returns the result either as inline JSON or via SSE stream.
+        Both cases are handled transparently by _post().
+
+        LLMs often send explicit null values for optional parameters, but
+        MCP servers (Zod validation) reject them. We strip None values
+        from the arguments before sending.
+
+        Args:
+            name: Tool name (e.g. "graph_search", "retrieve_file").
+            arguments: Tool arguments dict. None values are stripped.
+
+        Returns:
+            Tool result as a string. For multi-content responses, text
+            parts are joined with newlines.
+        """
         clean_args = {k: v for k, v in arguments.items() if v is not None}
 
         resp = self._post({
             "jsonrpc": "2.0",
-            "id": int(time.time() * 1000),
+            "id": self._next_id(),
             "method": "tools/call",
             "params": {
                 "name": name,
@@ -154,14 +394,15 @@ class MCPClient:
             },
         })
 
-        result = resp.get("result", {})
-
         # Handle error responses
         if resp.get("error"):
             err = resp["error"]
             return f"MCP error {err.get('code')}: {err.get('message')}"
 
+        result = resp.get("result", {})
+
         # Extract text from content array
+        # MCP tool results are returned as: {"content": [{"type": "text", "text": "..."}]}
         content = result.get("content", [])
         texts = []
         for item in content:
@@ -172,7 +413,15 @@ class MCPClient:
         return "\n".join(texts) if texts else str(result)
 
     def get_openai_tools(self) -> list[dict]:
-        """Convert MCP tools to OpenAI function-calling format."""
+        """Convert MCP tools to OpenAI function-calling format.
+
+        MCP tools use JSON Schema for inputSchema. OpenAI function-calling
+        uses a similar but slightly different format. We strip the "$schema"
+        key which MCP includes but OpenAI rejects.
+
+        Returns:
+            List of OpenAI-formatted tool definitions for chat completions.
+        """
         openai_tools = []
         for tool in self.tools:
             schema = tool.get("inputSchema", {})

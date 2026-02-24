@@ -1,0 +1,311 @@
+{
+  "model": "xiaomi/mimo-v2-flash",
+  "answer": "Based on my comprehensive analysis of the codebase, I have found all relevant files that process PodSpec.NodeSelector across Cilium, Istio, and autoscaler components. Let me provide the detailed analysis.\n\n## Architecture Overview\n\nThe system processes PodSpec.NodeSelector across three major components:\n\n1. **Cilium**: Processes NodeSelector for network policy enforcement and BGP configuration\n2. **Istio**: Processes NodeSelector for service mesh routing and gateway configuration  \n3. **Autoscaler (Cluster Autoscaler & Karpenter)**: Processes NodeSelector for node provisioning and scheduling decisions\n\nThe data flow follows this pattern:\n- **Pod Creation**: Kubernetes creates pods with NodeSelector specifications\n- **Component Processing**: Each component reads and processes NodeSelector from PodSpec\n- **Decision Making**: Components use NodeSelector to make routing, policy, or provisioning decisions\n- **Action Execution**: Components apply configurations based on NodeSelector constraints\n\n## Detailed Analysis\n\n### 1. Cilium - Network Policy & BGP Configuration\n\n**Cilium processes NodeSelector in two main contexts:**\n\n#### A. Network Policy Processing (`pkg/k8s/cluster_network_policy.go`)\n- **Function**: `kcnpProcessNodeSelector()` (lines 78-92)\n- **Purpose**: Converts Kubernetes ClusterNetworkPolicy node selectors into Cilium endpoint selectors\n- **Process**:\n  1. Converts `metav1.LabelSelector` to `slim_metav1.LabelSelector`\n  2. Creates endpoint selector with node label prefix\n  3. Adds cluster-specific selectors when needed\n  4. Returns type-safe selectors for policy enforcement\n\n```go\nfunc kcnpProcessNodeSelector(clusterName string, nodeSelector *metav1.LabelSelector) types.Selectors {\n    ns := toSlimLabelSelector(nodeSelector)\n    es := api.NewESFromK8sLabelSelector(labels.LabelSourceNode+\".\", ns)\n    es.AddMatchExpression(labels.LabelSourceReservedKeyPrefix+labels.IDNameRemoteNode, slim_metav1.LabelSelectorOpExists, []string{})\n    \n    if clusterName != cmtypes.PolicyAnyCluster && !isPodSelectorSelectingCluster(ns) {\n        es.AddMatch(clusterPrefixLbl, clusterName)\n    }\n    \n    return types.ToSelectors(es)\n}\n```\n\n#### B. BGP Cluster Configuration (`operator/pkg/bgp/cluster.go`)\n- **Function**: `upsertNodeConfigs()` (lines 109-150)\n- **Purpose**: Selects nodes for BGP configuration based on NodeSelector\n- **Process**:\n  1. Parses `config.Spec.NodeSelector` from CiliumBGPClusterConfig\n  2. Converts to `slim_labels.Selector`\n  3. Matches against node labels in the cluster\n  4. Creates per-node BGP configuration objects\n\n```go\nfunc (b *BGPResourceManager) upsertNodeConfigs(ctx context.Context, config *v2.CiliumBGPClusterConfig) (sets.Set[string], sets.Set[string], error) {\n    var nodeSelector slim_labels.Selector\n    if config.Spec.NodeSelector == nil {\n        nodeSelector = slim_labels.Everything()\n    } else {\n        selector, err := slim_meta_v1.LabelSelectorAsSelector(config.Spec.NodeSelector)\n        if err != nil {\n            return nil, nil, err\n        }\n        nodeSelector = selector\n    }\n    \n    for _, node := range b.ciliumNodeStore.List() {\n        bgpNode := nodeSelector.Matches(slim_labels.Set(node.Labels))\n        // ... process matching nodes\n    }\n}\n```\n\n### 2. Istio - Service Mesh & Gateway Configuration\n\n**Istio processes NodeSelector for service routing and gateway deployment:**\n\n#### A. Service Registry Controller (`pilot/pkg/serviceregistry/kube/controller/util.go`)\n- **Function**: `getNodeSelectorsForService()` (lines 127-137)\n- **Purpose**: Parses node selector annotations from Kubernetes Services\n- **Process**:\n  1. Reads `annotation.TrafficNodeSelector.Name` from Service annotations\n  2. Unmarshals JSON-encoded node selector key-value pairs\n  3. Returns label map for node affinity logic\n\n```go\nfunc getNodeSelectorsForService(svc *v1.Service) labels.Instance {\n    if nodeSelector := svc.Annotations[annotation.TrafficNodeSelector.Name]; nodeSelector != \"\" {\n        var nodeSelectorKV map[string]string\n        if err := json.Unmarshal([]byte(nodeSelector), &nodeSelectorKV); err != nil {\n            log.Debugf(\"failed to unmarshal node selector annotation value for service %s.%s: %v\",\n                svc.Name, svc.Namespace, err)\n        }\n        return nodeSelectorKV\n    }\n    return nil\n}\n```\n\n#### B. Gateway Deployment Templates\n- **Files**: \n  - `manifests/charts/gateways/istio-egress/templates/deployment.yaml`\n  - `manifests/charts/gateways/istio-ingress/templates/deployment.yaml`\n  - `manifests/charts/ztunnel/templates/daemonset.yaml`\n- **Purpose**: Helm templates that configure NodeSelector for Istio gateway pods\n- **Process**: These templates use Helm values to set `spec.template.spec.nodeSelector` in Kubernetes Deployments/DaemonSets\n\n### 3. Autoscaler Components\n\n#### A. Cluster Autoscaler - Label Optimization (`cluster-autoscaler/utils/labels/labels.go`)\n- **Function**: `BestLabelSet()` (lines 45-80)\n- **Purpose**: Calculates optimal node label sets based on pod NodeSelector requirements\n- **Process**:\n  1. Aggregates pods by identical NodeSelector requirements\n  2. Sorts by CPU demand (highest first)\n  3. Builds compatible label set that satisfies most pods\n  4. Filters out infrastructure-specific labels to avoid conflicts\n\n```go\nfunc BestLabelSet(pods []*apiv1.Pod) map[string]string {\n    nodeSelectors := calculateNodeSelectorStats(pods)\n    sortNodeSelectorStats(nodeSelectors)\n    selector := nodeSelectors[0].nodeSelector\n    \n    for _, nss := range nodeSelectors[1:] {\n        for k, v := range nss.nodeSelector {\n            currentValue, found := selector[k]\n            if found && currentValue != v {\n                continue statloop\n            }\n            if !found {\n                for _, infraLabel := range infrastructureLabels {\n                    if strings.Contains(k, infraLabel) {\n                        continue statloop\n                    }\n                }\n            }\n        }\n        for k, v := range nss.nodeSelector {\n            selector[k] = v\n        }\n    }\n    return selector\n}\n```\n\n#### B. Karpenter - Scheduling Requirements (`pkg/scheduling/requirement.go` & `requirements.go`)\n- **Functions**: \n  - `NewRequirementWithFlexibility()` (lines 48-102)\n  - `newPodRequirements()` (lines 90-110)\n- **Purpose**: Parses and processes NodeSelector from PodSpec for scheduling decisions\n- **Process**:\n  1. Extracts `pod.Spec.NodeSelector` and `pod.Spec.Affinity.NodeAffinity`\n  2. Converts to efficient internal representation with set operations\n  3. Supports flexible scheduling with `minValues` field\n  4. Validates against well-known labels and operators\n\n```go\nfunc newPodRequirements(pod *corev1.Pod, typ podRequirementType) Requirements {\n    requirements := NewLabelRequirements(pod.Spec.NodeSelector)\n    if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {\n        return requirements\n    }\n    if typ == podRequirementTypeAll {\n        if preferred := pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution; len(preferred) > 0 {\n            sort.Slice(preferred, func(i int, j int) bool { return preferred[i].Weight > preferred[j].Weight })\n            requirements.Add(NewNodeSelectorRequirements(preferred[0].Preference.MatchExpressions...).Values()...)\n        }\n    }\n    if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil &&\n        len(pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) > 0 {\n        requirements.Add(NewNodeSelectorRequirements(pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions...).Values()...)\n    }\n    return requirements\n}\n```\n\n#### C. Karpenter - NodeClaim Validation (`pkg/apis/v1/nodeclaim_validation.go`)\n- **Function**: `ValidateRequirement()` (lines 117-160)\n- **Purpose**: Validates NodeSelector requirements in NodeClaim specifications\n- **Process**:\n  1. Normalizes label keys\n  2. Validates operators against supported set\n  3. Checks values against well-known labels\n  4. Enforces `minValues` constraints\n\n## Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| Istio | `pilot/pkg/serviceregistry/kube/controller/util.go` | Contains `getNodeSelectorsForService()` function that parses NodeSelector annotations from Kubernetes Services for service mesh routing |\n| Istio | `manifests/charts/gateways/istio-egress/templates/deployment.yaml` | Helm template that configures NodeSelector for Istio egress gateway pods |\n| Istio | `manifests/charts/gateways/istio-ingress/templates/deployment.yaml` | Helm template that configures NodeSelector for Istio ingress gateway pods |\n| Istio | `manifests/charts/ztunnel/templates/daemonset.yaml` | Helm template that configures NodeSelector for Istio ztunnel sidecar DaemonSet |\n| Cilium | `pkg/k8s/cluster_network_policy.go` | Contains `kcnpProcessNodeSelector()` function that processes NodeSelector for network policy enforcement |\n| Cilium | `operator/pkg/bgp/cluster.go` | Contains `upsertNodeConfigs()` function that uses NodeSelector to select nodes for BGP configuration |\n| Cilium | `install/kubernetes/cilium/templates/standalone-dns-proxy/daemonset.yaml` | Helm template for Cilium DNS proxy DaemonSet with NodeSelector configuration |\n| Cluster Autoscaler | `cluster-autoscaler/utils/labels/labels.go` | Contains `BestLabelSet()` function that optimizes node labels based on pod NodeSelector requirements |\n| Cluster Autoscaler | `cluster-autoscaler/utils/labels/labels_test.go` | Tests for NodeSelector label optimization logic |\n| Karpenter | `pkg/scheduling/requirement.go` | Contains `NewRequirementWithFlexibility()` function that parses NodeSelector requirements with flexibility support |\n| Karpenter | `pkg/scheduling/requirements.go` | Contains `newPodRequirements()` function that extracts NodeSelector from PodSpec for scheduling |\n| Karpenter | `pkg/apis/v1/nodeclaim_validation.go` | Contains `ValidateRequirement()` function that validates NodeSelector requirements in NodeClaims |\n| Karpenter | `pkg/apis/v1/nodeclaim.go` | Defines NodeClaim CRD schema including NodeSelector requirement fields |\n| Karpenter | `pkg/apis/v1alpha1/nodeoverlay.go` | Defines NodeOverlay CRD for dynamic node attribute overrides during scheduling |\n| Karpenter | `kwok/charts/templates/deployment.yaml` | Helm template for Karpenter controller deployment with NodeSelector configuration |\n| Karpenter | `pkg/apis/crds/karpenter.sh_nodepools.yaml` | CRD definition for NodePool resource including NodeSelector template fields |\n\n## Cross-Repo Dependencies\n\nThe components interact through shared Kubernetes APIs:\n- **Cilium** consumes `v1.Service` annotations for node selector parsing\n- **Istio** consumes `v1.Pod` specs for scheduling decisions\n- **Autoscaler** consumes `v1.Pod` specs for node provisioning decisions\n- All components use `k8s.io/api/core/v1` types for NodeSelector representation\n\n## Summary\n\nThe system processes PodSpec.NodeSelector across three distinct domains:\n\n1. **Network Policy (Cilium)**: NodeSelector determines which nodes apply specific network policies\n2. **Service Mesh (Istio)**: NodeSelector influences gateway placement and traffic routing\n3. **Autoscaling (Cluster Autoscaler & Karpenter)**: NodeSelector drives node provisioning and scheduling decisions\n\nEach component has specialized logic for parsing, validating, and acting upon NodeSelector constraints, with Cilium focusing on network security, Istio on service routing, and autoscalers on resource optimization.",
+  "cost": {
+    "input_tokens": 1486468,
+    "output_tokens": 5061,
+    "total_tokens": 1491529,
+    "cost_usd": 0.13525
+  },
+  "status": "success",
+  "latency_seconds": 118.09,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.081
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.229
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"applicationset/examples/git-generator-directory/excludes/cluster-addons/exclude-helm-guestbook/templates/deployment.yaml\",\n        \"purpose\": \"Helm chart template for a Kubernetes Deployment resource, defining a guestbook application with configurable replicas, image, probes, and resource limits. It is part of an ApplicationSet example for Git generator directory excludes, demonstrating how to exclude specific Helm charts from deployment.\"...",
+      "latency_seconds": 0.939
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Cilium NodeSelector",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/cluster_network_policy.go\",\n        \"purpose\": \"Parses Kubernetes ClusterNetworkPolicy objects into Cilium policy rules, handling ingress/egress rules, protocols, selectors, and FQDNs\"\n      },\n      {\n        \"path\": \"Documentation/api.rst\",\n        \"purpose\": \"Provides comprehensive API reference documentation for Cilium's JSON-based agent API, including access methods, compatibility guarantees, and OpenAPI specification integrat...",
+      "latency_seconds": 4.476
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Istio NodeSelector",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/charts/gateways/istio-egress/templates/deployment.yaml\",\n        \"purpose\": \"This Helm template generates a Kubernetes Deployment for the Istio egress gateway. It configures metadata, replica settings, security context, container specs (istio-proxy), environment variables, volume mounts, affinity, and tolerations based on values supplied in the Helm chart. The Deployment is consumed by the Kubernetes API to create the egress gate...",
+      "latency_seconds": 3.237
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "autoscaler NodeSelector",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"cluster-autoscaler/loop/trigger.go\",\n        \"purpose\": \"This file implements the loop trigger mechanism for the Cluster Autoscaler, determining when to start a new autoscaling iteration based on recent scaling activity, provisioning request processing, and unschedulable pod events. It acts as the scheduler's decision gate, combining time-based and event-driven triggers to optimize responsiveness and throughput.\"\n      },\n      {\n        \"...",
+      "latency_seconds": 1.723
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pilot/pkg/serviceregistry/kube/controller/util.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [],\n  \"totalRequested\": 1,\n  \"totalFound\": 0\n}",
+      "latency_seconds": 0.122
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.247
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"install/kubernetes/cilium/templates/standalone-dns-proxy/daemonset.yaml\",\n        \"purpose\": \"This Helm template renders a Kubernetes DaemonSet that deploys Cilium's standalone DNS proxy on every node. It configures host networking, security capabilities, and mounts a ConfigMap containing DNS proxy configuration, enabling Cilium to provide DNS resolution for pods without relying on kube-dns.\"\n      },\n      {\n        \"path\": \"pkg/k8s/clust...",
+      "latency_seconds": 0.876
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/charts/gateways/istio-egress/templates/deployment.yaml\",\n        \"purpose\": \"This Helm template generates a Kubernetes Deployment for the Istio egress gateway. It configures metadata, replica settings, security context, container specs (istio-proxy), environment variables, volume mounts, affinity, and tolerations based on values supplied in the Helm chart. The Deployment is consumed by the Kubernetes API to create the egress gate...",
+      "latency_seconds": 0.423
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector",
+        "knowledgeId": "ca1bbafc-55ee-468b-bd84-b94ce96619f0",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"cluster-autoscaler/loop/trigger.go\",\n        \"purpose\": \"This file implements the loop trigger mechanism for the Cluster Autoscaler, determining when to start a new autoscaling iteration based on recent scaling activity, provisioning request processing, and unschedulable pod events. It acts as the scheduler's decision gate, combining time-based and event-driven triggers to optimize responsiveness and throughput.\"\n      },\n      {\n        \"...",
+      "latency_seconds": 0.29
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NodeSelector",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "channels": [
+          "semantic",
+          "classes",
+          "functions"
+        ]
+      },
+      "result_preview": "{\n  \"semantic\": {\n    \"data\": [\n      {\n        \"path\": \"kwok/charts/crds/karpenter.sh_nodeclaims.yaml\",\n        \"purpose\": \"Defines the Kubernetes CustomResourceDefinition (CRD) for Karpenter's NodeClaim resource, specifying its schema, validation rules, and status fields for managing node lifecycle and provisioning within a cluster.\"\n      },\n      {\n        \"path\": \"kwok/charts/templates/deployment.yaml\",\n        \"purpose\": \"Kubernetes Deployment manifest for the Karpenter controller, definin...",
+      "latency_seconds": 0.555
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePaths": [
+          "pilot/pkg/serviceregistry/kube/controller/util.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"edd43087-bf39-42b6-85b0-ed3297ec760a\",\n  \"files\": [\n    {\n      \"path\": \"pilot/pkg/serviceregistry/kube/controller/util.go\",\n      \"purpose\": \"Utility helpers for the Istio Pilot Kubernetes service registry controller, providing label extraction, port resolution, service\u00e2\u0080\u0091pod matching, node selector handling, proxy key generation, and Multi\u00e2\u0080\u0091Cluster Service hostname creation. These functions are used by the controller ...",
+      "latency_seconds": 0.122
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "relativePath": "pilot/pkg/serviceregistry/kube/controller/util.go",
+        "fromLine": 127,
+        "toLine": 137
+      },
+      "result_preview": "# pilot/pkg/serviceregistry/kube/controller/util.go\nLines: 127 - 137 of 185\nMore: fromLine=138\n\n127 | func getNodeSelectorsForService(svc *v1.Service) labels.Instance {\n128 | \tif nodeSelector := svc.Annotations[annotation.TrafficNodeSelector.Name]; nodeSelector != \"\" {\n129 | \t\tvar nodeSelectorKV map[string]string\n130 | \t\tif err := json.Unmarshal([]byte(nodeSelector), &nodeSelectorKV); err != nil {\n131 | \t\t\tlog.Debugf(\"failed to unmarshal node selector annotation value for service %s.%s: %v\",\n132...",
+      "latency_seconds": 0.439
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/k8s/cluster_network_policy.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/k8s/cluster_network_policy.go\",\n      \"purpose\": \"Parses Kubernetes ClusterNetworkPolicy objects into Cilium policy rules, handling ingress/egress rules, protocols, selectors, and FQDNs\",\n      \"summary\": \"{\\\"ClusterNetworkPolicy parsing\\\":\\\"Converts Kubernetes ClusterNetworkPolicy CRD to Cilium policy rules with cluster awareness\\\",\\\"FQDN handl...",
+      "latency_seconds": 0.119
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ca1bbafc-55ee-468b-bd84-b94ce96619f0",
+        "relativePaths": [
+          "cluster-autoscaler/utils/labels/labels.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ca1bbafc-55ee-468b-bd84-b94ce96619f0\",\n  \"files\": [\n    {\n      \"path\": \"cluster-autoscaler/utils/labels/labels.go\",\n      \"purpose\": \"This file provides utilities for handling Kubernetes node labels in the context of cluster autoscaling. It calculates optimal node label sets based on pod resource requests (especially CPU), prioritizes label combinations by total CPU demand, and ensures compatibility by filtering out inf...",
+      "latency_seconds": 0.153
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePaths": [
+          "pkg/scheduling/requirement.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"d1b54414-5d03-411c-a8cb-b1504b559cf3\",\n  \"files\": [\n    {\n      \"path\": \"pkg/scheduling/requirement.go\",\n      \"purpose\": \"Represents a scheduling requirement as an efficient, canonicalized representation of a Kubernetes NodeSelectorRequirement, enabling intersection, validation, and conversion operations for scheduling decisions.\",\n      \"summary\": \"{\\\"Canonicalization (~L48-102)\\\":\\\"Converts GT/LT operators to GTE/LTE ...",
+      "latency_seconds": 0.158
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePaths": [
+          "pkg/scheduling/requirements.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"d1b54414-5d03-411c-a8cb-b1504b559cf3\",\n  \"files\": [\n    {\n      \"path\": \"pkg/scheduling/requirements.go\",\n      \"purpose\": \"This file defines the core Requirements type and related constructors for representing scheduling constraints in Karpenter. It provides efficient set operations for label-based scheduling requirements, enabling compatibility checks and intersection logic for pod and node scheduling.\",\n      \"summary...",
+      "latency_seconds": 0.115
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePaths": [
+          "pkg/apis/v1/nodeclaim_validation.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"d1b54414-5d03-411c-a8cb-b1504b559cf3\",\n  \"files\": [\n    {\n      \"path\": \"pkg/apis/v1/nodeclaim_validation.go\",\n      \"purpose\": \"This file provides validation logic for NodeClaimTemplateSpec in the Karpenter API, ensuring taints, requirements, and well-known values conform to Kubernetes and Karpenter rules. It is used by validation webhooks to enforce constraints on NodeClaim creation and updates, preventing invalid conf...",
+      "latency_seconds": 0.126
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "operator/pkg/bgp/cluster.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"operator/pkg/bgp/cluster.go\",\n      \"purpose\": \"Provides BGP cluster configuration reconciliation for Cilium operator. It creates, updates, and deletes per\u00e2\u0080\u0091node BGP config objects based on the cluster\u00e2\u0080\u0091wide BGPClusterConfig, allocates router IDs from an IP pool, and updates status conditions for missing peers, conflicts, and node selection.\",\n   ...",
+      "latency_seconds": 0.114
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePath": "pkg/k8s/cluster_network_policy.go",
+        "fromLine": 78,
+        "toLine": 92
+      },
+      "result_preview": "# pkg/k8s/cluster_network_policy.go\nLines: 78 - 92 of 396\nMore: fromLine=93\n\n78 | // kcnpProcessNodeSelector converts a label selector targeting a node into an\n79 | // EndpointSelector. If a cluster name is provided and the pod selector does\n80 | // not already explicitly target a cluster, a selector targeting the named\n81 | // cluster will be added.\n82 | func kcnpProcessNodeSelector(clusterName string, nodeSelector *metav1.LabelSelector) types.Selectors {\n83 | \tns := toSlimLabelSelector(nodeSel...",
+      "latency_seconds": 0.48
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ca1bbafc-55ee-468b-bd84-b94ce96619f0",
+        "relativePath": "cluster-autoscaler/utils/labels/labels.go",
+        "fromLine": 45,
+        "toLine": 80
+      },
+      "result_preview": "# cluster-autoscaler/utils/labels/labels.go\nLines: 45 - 80 of 134\nMore: fromLine=81\n\n45 | // BestLabelSet returns a set of labels for nodes that will allow to schedule the pods that\n46 | // requested the most cpu.\n47 | func BestLabelSet(pods []*apiv1.Pod) map[string]string {\n48 | \tnodeSelectors := calculateNodeSelectorStats(pods)\n49 | \tsortNodeSelectorStats(nodeSelectors)\n50 | \t// Take labels from the selector that covers most of the pods (in terms of requested cpu).\n51 | \tselector := nodeSelect...",
+      "latency_seconds": 0.447
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePath": "pkg/scheduling/requirement.go",
+        "fromLine": 48,
+        "toLine": 102
+      },
+      "result_preview": "# pkg/scheduling/requirement.go\nLines: 48 - 102 of 369\nMore: fromLine=103\n\n48 | func NewRequirementWithFlexibility(key string, operator corev1.NodeSelectorOperator, minValues *int, values ...string) *Requirement {\n49 | \tif normalized, ok := v1.NormalizedLabels[key]; ok {\n50 | \t\tkey = normalized\n51 | \t}\n52 | \n53 | \t// This is a super-common case, so optimize for it an inline everything.\n54 | \tif operator == corev1.NodeSelectorOpIn {\n55 | \t\ts := make(sets.Set[string], len(values))\n56 | \t\tfor _, va...",
+      "latency_seconds": 0.45
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d1b54414-5d03-411c-a8cb-b1504b559cf3",
+        "relativePath": "pkg/scheduling/requirements.go",
+        "fromLine": 74,
+        "toLine": 110
+      },
+      "result_preview": "# pkg/scheduling/requirements.go\nLines: 74 - 110 of 293\nMore: fromLine=111\n\n74 | func NewPodRequirements(pod *corev1.Pod) Requirements {\n75 | \treturn newPodRequirements(pod, podRequirementTypeAll)\n76 | }\n77 | \n78 | // NewStrictPodRequirements constructs requirements from a pod and only includes true requirements (not preferences).\n79 | func NewStrictPodRequirements(pod *corev1.Pod) Requirements {\n80 | \treturn newPodRequirements(pod, podRequirementTypeRequiredOnly)\n81 | }\n82 | \n83 | type podRequi...",
+      "latency_seconds": 0.477
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePath": "operator/pkg/bgp/cluster.go",
+        "fromLine": 109,
+        "toLine": 150
+      },
+      "result_preview": "# operator/pkg/bgp/cluster.go\nLines: 109 - 150 of 585\nMore: fromLine=151\n\n109 | func (b *BGPResourceManager) upsertNodeConfigs(ctx context.Context, config *v2.CiliumBGPClusterConfig) (sets.Set[string], sets.Set[string], error) {\n110 | \tvar nodeSelector slim_labels.Selector\n111 | \tvar errs error\n112 | \tif config.Spec.NodeSelector == nil {\n113 | \t\t// nil selector means select all nodes\n114 | \t\tnodeSelector = slim_labels.Everything()\n115 | \t} else {\n116 | \t\tselector, err := slim_meta_v1.LabelSelect...",
+      "latency_seconds": 0.794
+    }
+  ],
+  "error": ""
+}

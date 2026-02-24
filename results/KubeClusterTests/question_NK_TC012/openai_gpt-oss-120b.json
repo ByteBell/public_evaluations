@@ -1,0 +1,341 @@
+{
+  "model": "openai/gpt-oss-120b",
+  "answer": "**Answer: Renaming the `Annotations` field in `ObjectMeta` (and therefore in `ResourceMeta`)**\n\n### 1. Architecture Overview\nThe `kyaml` package provides a lightweight, dependency\u2011free representation of Kubernetes resources that is used throughout Kustomize (and therefore the `sigs.k8s.io/kustomize/kyaml/yaml` module).  \n\nKey types:\n\n| Type | File | Role |\n|------|------|------|\n| `ObjectMeta` | `kyaml/yaml/types.go` (lines\u202f154\u2011161) | Holds the `metadata` of a resource \u2013 `name`, `namespace`, `labels`, **`annotations`** |\n| `ResourceMeta` | same file (lines\u202f147\u2011152) | Embeds `ObjectMeta` and `TypeMeta` and is the struct returned by `RNode.GetMeta()` |\n| `RNode` | `kyaml/yaml/rnode.go` | Wrapper around a YAML node that provides `GetMeta() *ResourceMeta` for callers |\n\nWhen a caller does:\n\n```go\nmeta := node.GetMeta()   // meta is *ResourceMeta\nann := meta.Annotations   // currently a map[string]string\n```\n\nthe code reaches the `Annotations` field defined in `ObjectMeta`.  \n\nAll downstream code that works with Kustomize filters, generators, or any consumer of `RNode` (e.g. `kyaml`\u2011based plugins, `kustomize` CLI, Flux, Helm\u2011file, etc.) accesses the map via this field.\n\n### 2. Detailed Analysis\n\n| File | Relevant snippet | How it is used |\n|------|------------------|----------------|\n| **`kyaml/yaml/types.go`** (lines\u202f154\u2011161) | ```go type ObjectMeta struct { NameMeta `json:\",inline\" yaml:\",inline\"` Labels map[string]string `json:\"labels,omitempty\" yaml:\"labels,omitempty\"` **Annotations map[string]string `json:\"annotations,omitempty\" yaml:\"annotations,omitempty\"`** }``` | This is the source of the `Annotations` map. `ResourceMeta` embeds `ObjectMeta`, so `meta.Annotations` is resolved here. |\n| **`kyaml/yaml/rnode.go`** (function `GetMeta`) | ```go func (n *RNode) GetMeta() *ResourceMeta { // parses the node\u2019s metadata and returns a *ResourceMeta }``` | All callers of `RNode.GetMeta()` receive a pointer to `ResourceMeta`, which contains the `ObjectMeta` defined above. |\n| **`kyaml/yaml/kfns.go`** (filters) | Functions such as `AnnotationSetter`, `AnnotationGetter`, `AnnotationClearer` manipulate `meta.Annotations` via the `ObjectMeta` struct. | These filters are used by Kustomize plugins (e.g., `annotations` transformer) and therefore any code that runs a Kustomize pipeline will read/write `meta.Annotations`. |\n| **`api/filters/annotations/annotations.go`** (Kustomize built\u2011in filter) | Uses `meta := node.GetMeta(); meta.Annotations[...]=...` to apply user\u2011specified annotations. | Demonstrates downstream usage outside the `kyaml` package \u2013 the filter is part of the public Kustomize API. |\n| **`resource_customizations/kustomize.toolkit.fluxcd.io/Kustomization/actions/reconcile/action.lua`** (Flux CD) | Inserts a timestamp into `metadata.annotations` of a resource before reconciling. | Shows that external tools (Flux) rely on the same field name. |\n| **Various tests** (`kyaml/yaml/kfns_test.go`, `kyaml/yaml/rnode_test.go`, `api/filters/annotations/annotations_test.go`) | All reference `meta.Annotations` directly. | Confirms that the field is exercised throughout the test suite. |\n\nBecause `ObjectMeta` is **embedded** in `ResourceMeta`, any change to the field name must be reflected in:\n\n* The struct definition (`ObjectMeta`).\n* All code that accesses `meta.Annotations` (filters, plugins, tests, external tools).\n* JSON/YAML tags (`json:\"annotations,omitempty\" yaml:\"annotations,omitempty\"`).\n\nRenaming the field to `MetadataAnnotations` would break **every** place that currently does `meta.Annotations`. The compiler would emit errors for all those references, and any downstream binary that expects the original JSON/YAML key `annotations` would also break because the struct tag would change.\n\n### 3. Impact Summary (All Repositories)\n\n| Repository (knowledgeId) | Files that directly reference `ObjectMeta.Annotations` | Impact of renaming |\n|--------------------------|--------------------------------------------------------|--------------------|\n| **Kyaml (repo\u202f0bf65098\u20113076\u2011481c\u2011940a\u2011c65298663392)** | `kyaml/yaml/types.go` (definition) <br> `kyaml/yaml/kfns.go` (filters) <br> `kyaml/yaml/kfns_test.go` (tests) <br> `kyaml/yaml/rnode.go` (GetMeta) <br> `kyaml/yaml/rnode_test.go` (tests) | Compilation failures across the kyaml package; JSON/YAML serialization changes; all filters break. |\n| **Kustomize core (same repo)** | `api/filters/annotations/annotations.go` <br> `api/filters/annotations/annotations_test.go` <br> `api/internal/builtins/AnnotationsTransformer.go` | Built\u2011in annotation transformer would no longer compile; Kustomize CLI would fail to apply annotations. |\n| **Flux CD (repo\u202f0bf65098\u2011\u2026)** | `resource_customizations/kustomize.toolkit.fluxcd.io/Kustomization/actions/reconcile/action.lua` | Lua script expects `metadata.annotations`; runtime error when trying to insert the timestamp. |\n| **Any downstream consumer** (e.g., Helm\u2011file, Argo CD, custom plugins) | All code that calls `node.GetMeta().Annotations` (search results show many such calls) | Breaks at compile\u2011time for Go consumers; runtime failures for scripts that manipulate the YAML map directly. |\n\n### 4. Conclusion\nRenaming `ObjectMeta.Annotations` to `MetadataAnnotations` is **not safe** without a coordinated, repository\u2011wide change. The field is a core part of the `kyaml` data model, used by:\n\n* The `RNode` API (`GetMeta`) \u2013 the primary entry point for all Kustomize transformations.\n* Built\u2011in Kustomize filters (`AnnotationSetter`, `AnnotationGetter`, etc.).\n* Tests and examples throughout the codebase.\n* External tools (Flux CD Lua actions) that manipulate the same YAML structure.\n\nBecause the field is embedded and accessed via the name `Annotations` everywhere, a rename would cause **massive compile\u2011time breakage** across all repositories that depend on `kyaml`. The correct approach, if a rename is truly required, would be to:\n\n1. Introduce a **new field** `MetadataAnnotations` **in addition** to the existing `Annotations`.\n2. Mark the old field as deprecated (with a comment) and keep the JSON/YAML tag `annotations`.\n3. Update all internal code to use the new field while preserving backward compatibility.\n4. Provide a migration shim (e.g., a method `GetAnnotations()` that returns the new map) for external callers.\n5. Increment major version of the module to signal the breaking change.\n\nUntil such a coordinated migration is performed, **the rename must be avoided**.",
+  "cost": {
+    "input_tokens": 1028987,
+    "output_tokens": 6474,
+    "total_tokens": 1035461,
+    "cost_usd": 0.040332
+  },
+  "status": "success",
+  "latency_seconds": 99.24,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.088
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {
+        "orgId": "eval_benchmark"
+      },
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.312
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta",
+        "channels": [
+          "classes"
+        ],
+        "path": "",
+        "knowledgeId": null,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/meta.go\",\n        \"purpose\": \"Defines interfaces and method implementations for accessing and manipulating metadata fields of Kubernetes API objects, enabling uniform interaction with object metadata across versioned and internal APIs.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go\",\n        \"purpose\": \"addon-resizer/vendor/k8s.i...",
+      "latency_seconds": 0.381
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "0bf65098-3076-481c-940a-c65298663392",
+        "relativePaths": [
+          "kyaml/yaml/types.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"0bf65098-3076-481c-940a-c65298663392\",\n  \"files\": [\n    {\n      \"path\": \"kyaml/yaml/types.go\",\n      \"purpose\": \"This file defines core YAML manipulation types and utilities for the kyaml package, serving as a foundational layer for Kubernetes resource handling. It provides RNode wrappers, type definitions for Kubernetes metadata (TypeMeta, NameMeta, ObjectMeta, ResourceMeta), filter interfaces for declarative transforma...",
+      "latency_seconds": 0.121
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta.Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "keywords"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/slim/k8s/apis/meta/v1/meta.go\",\n        \"purpose\": \"Provides lightweight method implementations for Kubernetes meta/v1 structures (ListMeta, TypeMeta, ObjectMeta) used by Cilium's slim API. It supplies required getters/setters and ObjectKind interface compliance while omitting full k8s runtime behavior, enabling compilation without pulling the entire Kubernetes API machinery.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/c...",
+      "latency_seconds": 1.953
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta",
+        "channels": [
+          "functions",
+          "classes"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/api/meta/meta.go\",\n        \"purpose\": \"Provides utility functions for accessing and manipulating Kubernetes object metadata, enabling generic interaction with API objects' metadata fields such as name, namespace, labels, and annotations.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go\",\n        \"purpose\": \"Provides utility functions for co...",
+      "latency_seconds": 0.357
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0bf65098-3076-481c-940a-c65298663392",
+        "relativePath": "kyaml/yaml/types.go",
+        "fromLine": 150,
+        "toLine": 180
+      },
+      "result_preview": "# kyaml/yaml/types.go\nLines: 150 - 180 of 300\nMore: fromLine=181\n\n150 | \t// ObjectMeta is the metadata field of a Resource\n151 | \tObjectMeta `json:\"metadata,omitempty\" yaml:\"metadata,omitempty\"`\n152 | }\n153 | \n154 | // ObjectMeta contains metadata about a Resource\n155 | type ObjectMeta struct {\n156 | \tNameMeta `json:\",inline\" yaml:\",inline\"`\n157 | \t// Labels is the metadata.labels field of a Resource\n158 | \tLabels map[string]string `json:\"labels,omitempty\" yaml:\"labels,omitempty\"`\n159 | \t// Anno...",
+      "latency_seconds": 0.423
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta.Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "keywords"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/slim/k8s/apis/meta/v1/meta.go\",\n        \"purpose\": \"Provides lightweight method implementations for Kubernetes meta/v1 structures (ListMeta, TypeMeta, ObjectMeta) used by Cilium's slim API. It supplies required getters/setters and ObjectKind interface compliance while omitting full k8s runtime behavior, enabling compilation without pulling the entire Kubernetes API machinery.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/c...",
+      "latency_seconds": 0.597
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": ".Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "keywords",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"kyaml/yaml/rnode.go\",\n        \"purpose\": \"RNode is the core data structure for representing and manipulating Kubernetes YAML resources in kyaml. It wraps yaml.Node with additional metadata and high-level methods for field access, metadata handling, and filtering. This file provides the foundational API for parsing, transforming, and persisting Kubernetes resource manifests. RNode is a core wrapper around YAML's Node type in kyaml, providi...",
+      "latency_seconds": 0.746
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta Annotations",
+        "channels": [
+          "purpose",
+          "keywords"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"api/types/objectmeta.go\",\n        \"purpose\": \"Defines a minimal ObjectMeta struct that mirrors Kubernetes metadata fields (name, namespace, labels, annotations) to avoid direct dependency on apimachinery while maintaining compatibility with Kubernetes resource models.\"\n      },\n      {\n        \"path\": \"internal/informers/transformers.go\",\n        \"purpose\": \"This file implements a cache transformer function for Kubernetes PartialObjectMetad...",
+      "latency_seconds": 1.113
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/api/meta/meta.go\",\n        \"purpose\": \"Provides utility functions for accessing and manipulating Kubernetes object metadata, enabling generic interaction with API objects' metadata fields such as name, namespace, labels, and annotations.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go\",\n        \"purpose\": \"Provides utility functions for co...",
+      "latency_seconds": 0.517
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta.Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/slim/k8s/apis/meta/v1/meta.go\",\n        \"purpose\": \"Provides lightweight method implementations for Kubernetes meta/v1 structures (ListMeta, TypeMeta, ObjectMeta) used by Cilium's slim API. It supplies required getters/setters and ObjectKind interface compliance while omitting full k8s runtime behavior, enabling compilation without pulling the entire Kubernetes API machinery.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/c...",
+      "latency_seconds": 0.468
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": ".Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"kyaml/yaml/rnode.go\",\n        \"purpose\": \"RNode is the core data structure for representing and manipulating Kubernetes YAML resources in kyaml. It wraps yaml.Node with additional metadata and high-level methods for field access, metadata handling, and filtering. This file provides the foundational API for parsing, transforming, and persisting Kubernetes resource manifests. RNode is a core wrapper around YAML's Node type in kyaml, providi...",
+      "latency_seconds": 0.433
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "GetMeta()",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"GetMeta()\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"paginatio...",
+      "latency_seconds": 0.882
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "GetMeta",
+        "channels": [
+          "functions",
+          "classes"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"apis/externalsecrets/v1alpha1/pushsecret_types.go\",\n        \"purpose\": \"Defines Kubernetes Custom Resource Definitions (CRDs) for PushSecret and ClusterPushSecret resources in the external-secrets project, enabling the pushing of Kubernetes secrets to external secret providers.\"\n      },\n      {\n        \"path\": \"cluster-autoscaler/cloudprovider/brightbox/k8ssdk/clients.go\",\n        \"purpose\": \"Provides client abstraction and caching for B...",
+      "latency_seconds": 0.912
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta",
+        "channels": [
+          "classes"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/meta.go\",\n        \"purpose\": \"Defines interfaces and method implementations for accessing and manipulating metadata fields of Kubernetes API objects, enabling uniform interaction with object metadata across versioned and internal APIs.\"\n      },\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/apimachinery/pkg/apis/meta/v1/types.go\",\n        \"purpose\": \"addon-resizer/vendor/k8s.i...",
+      "latency_seconds": 0.785
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "GetMeta",
+        "channels": [
+          "functions",
+          "classes"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"apis/externalsecrets/v1alpha1/pushsecret_types.go\",\n        \"purpose\": \"Defines Kubernetes Custom Resource Definitions (CRDs) for PushSecret and ClusterPushSecret resources in the external-secrets project, enabling the pushing of Kubernetes secrets to external secret providers.\"\n      },\n      {\n        \"path\": \"cluster-autoscaler/cloudprovider/brightbox/k8ssdk/clients.go\",\n        \"purpose\": \"Provides client abstraction and caching for B...",
+      "latency_seconds": 0.536
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta.Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/slim/k8s/apis/meta/v1/meta.go\",\n        \"purpose\": \"Provides lightweight method implementations for Kubernetes meta/v1 structures (ListMeta, TypeMeta, ObjectMeta) used by Cilium's slim API. It supplies required getters/setters and ObjectKind interface compliance while omitting full k8s runtime behavior, enabling compilation without pulling the entire Kubernetes API machinery.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/c...",
+      "latency_seconds": 1.087
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "0bf65098-3076-481c-940a-c65298663392",
+        "relativePath": "kyaml/yaml/types.go",
+        "fromLine": 120,
+        "toLine": 200
+      },
+      "result_preview": "# kyaml/yaml/types.go\nLines: 120 - 200 of 300\nMore: fromLine=201\n\n120 | type Filter interface {\n121 | \tFilter(object *RNode) (*RNode, error)\n122 | }\n123 | \n124 | type FilterFunc func(object *RNode) (*RNode, error)\n125 | \n126 | func (f FilterFunc) Filter(object *RNode) (*RNode, error) {\n127 | \treturn f(object)\n128 | }\n129 | \n130 | // TypeMeta partially copies apimachinery/pkg/apis/meta/v1.TypeMeta\n131 | // No need for a direct dependence; the fields are stable.\n132 | type TypeMeta struct {\n133 | ...",
+      "latency_seconds": 0.464
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": ".Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"kyaml/yaml/rnode.go\",\n        \"purpose\": \"RNode is the core data structure for representing and manipulating Kubernetes YAML resources in kyaml. It wraps yaml.Node with additional metadata and high-level methods for field access, metadata handling, and filtering. This file provides the foundational API for parsing, transforming, and persisting Kubernetes resource manifests. RNode is a core wrapper around YAML's Node type in kyaml, providi...",
+      "latency_seconds": 1.374
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "GetMeta()",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"GetMeta()\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"paginatio...",
+      "latency_seconds": 1.424
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ObjectMeta.Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/slim/k8s/apis/meta/v1/meta.go\",\n        \"purpose\": \"Provides lightweight method implementations for Kubernetes meta/v1 structures (ListMeta, TypeMeta, ObjectMeta) used by Cilium's slim API. It supplies required getters/setters and ObjectKind interface compliance while omitting full k8s runtime behavior, enabling compilation without pulling the entire Kubernetes API machinery.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/c...",
+      "latency_seconds": 0.457
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "GetMeta()",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 0,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"GetMeta()\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  },\n  \"classes\": {\n    \"data\": [],\n    \"paginatio...",
+      "latency_seconds": 0.658
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "Annotations",
+        "channels": [
+          "purpose"
+        ],
+        "path": "kyaml/yaml",
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"kyaml/yaml/kfns.go\",\n        \"purpose\": \"This file provides utility functions and types for manipulating Kubernetes resource metadata annotations and labels in YAML-based resource trees. It defines filter types (AnnotationClearer, AnnotationSetter, AnnotationGetter, LabelSetter) that implement the RNode filter interface to enable declarative annotation and label management as part of kustomize/kyaml transformation pipelines.\"\n      },\n     ...",
+      "latency_seconds": 0.948
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "meta.Annotations",
+        "channels": [
+          "functions",
+          "classes",
+          "purpose"
+        ],
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/k8s/slim/k8s/apis/meta/v1/meta.go\",\n        \"purpose\": \"Provides lightweight method implementations for Kubernetes meta/v1 structures (ListMeta, TypeMeta, ObjectMeta) used by Cilium's slim API. It supplies required getters/setters and ObjectKind interface compliance while omitting full k8s runtime behavior, enabling compilation without pulling the entire Kubernetes API machinery.\"\n      },\n      {\n        \"path\": \"staging/src/k8s.io/c...",
+      "latency_seconds": 0.456
+    }
+  ],
+  "error": ""
+}

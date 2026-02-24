@@ -1,0 +1,158 @@
+{
+  "model": "x-ai/grok-code-fast-1",
+  "answer": "### 1. Architecture Overview\nThe NetworkPolicy resource in Kubernetes defines rules for controlling ingress and egress traffic to/from pods based on selectors, ports, and IP blocks. It consists of a `NetworkPolicy` struct with `TypeMeta`, `ObjectMeta`, and `Spec` (containing `PodSelector`, `Ingress`/`Egress` rules, and `PolicyTypes`). The `Spec` includes `NetworkPolicyIngressRule` and `NetworkPolicyEgressRule` arrays, each with `Ports` and `From`/`To` peers (via `NetworkPolicyPeer`, which can reference pod selectors, namespace selectors, or `IPBlock` CIDRs).\n\nCilium, as a CNI and security platform, **parses and enforces** standard Kubernetes NetworkPolicy resources by converting them into internal Cilium policy rules (via `ParseNetworkPolicy` in `pkg/k8s/network_policy.go`). It translates selectors, ports, and IPBlocks into Cilium's rule format, handling cluster-aware selectors and CIDR exceptions. Cilium extends this with custom resources: `CiliumNetworkPolicy` (namespace-scoped, with `Spec` as `*api.Rule` or `Specs` as `api.Rules`) and `CiliumClusterwideNetworkPolicy` (cluster-scoped, similar structure). These are parsed via `Parse` methods and enforced via eBPF datapaths, with status tracking per node.\n\nIstio, as a service mesh, does not directly parse or enforce NetworkPolicy but **deploys NetworkPolicy manifests** for its own components (e.g., gateways, istiod, ztunnel) when `global.networkPolicy.enabled` is true. These manifests restrict ingress/egress for Istio pods, using standard NetworkPolicy fields like `PodSelector`, `Ingress`, and `Ports`.\n\nFlux2, as a GitOps tool, **deploys NetworkPolicy manifests** for its controllers (e.g., notification-controller, scraping) to allow egress, webhooks, and scraping traffic, again using standard NetworkPolicy structures.\n\nData flow: Kubernetes API server stores NetworkPolicy; Cilium's informers watch and parse them into eBPF maps; Istio/Flux2 Helm charts render NetworkPolicy YAMLs applied via kubectl or Flux reconciliation.\n\n### 2. Detailed Analysis\n- **Standard NetworkPolicy Struct**: Defined in Kubernetes API (`networking.k8s.io/v1`). Key fields: `PodSelector` (labels pods), `Ingress`/`Egress` (rules with `Ports` and `From`/`To` peers), `PolicyTypes` ([\"Ingress\"], [\"Egress\"], or both). Cilium parses this in `ParseNetworkPolicy` (lines 151-292 in `pkg/k8s/network_policy.go`), converting `NetworkPolicyPeer` to Cilium selectors (handling namespace/cluster scopes), `IPBlock` to CIDR rules, and ports to `PortRules`. Changes to fields like `IPBlock.Except` or `NetworkPolicyPort.EndPort` would require updates to `ipBlockToCIDRRule` and `parsePorts` functions.\n\n- **CiliumNetworkPolicy (CNP) Struct**: Extends NetworkPolicy with Cilium-specific rules. Struct: `TypeMeta`, `ObjectMeta`, `Spec` (*api.Rule), `Specs` (api.Rules), `Status` (CiliumNetworkPolicyStatus with node statuses). Parsed via `Parse` (lines 166-218 in `pkg/k8s/apis/cilium.io/v2/cnp_types.go`), validating rules and converting to internal policies. Status tracks enforcement per node. Changes to `Spec` or `Status` fields would affect parsing and status reporting.\n\n- **CiliumClusterwideNetworkPolicy (CCNP) Struct**: Cluster-scoped variant of CNP. Similar structure but no namespace. Parsed via `Parse` (lines 84-118 in `pkg/k8s/apis/cilium.io/v2/ccnp_types.go`). Used for global policies.\n\n- **Istio Handling**: No parsing logic; uses NetworkPolicy in Helm templates (e.g., `manifests/charts/gateway/templates/networkpolicy.yaml`) to restrict traffic to Istio pods. Templates reference standard fields like `PodSelector` and `Ports`. Changes to NetworkPolicy API would require template updates if fields are removed/added.\n\n- **Flux2 Handling**: Deploys NetworkPolicy via manifests (e.g., `manifests/policies/allow-egress.yaml`) for Flux components. Uses standard fields to allow traffic. Similar to Istio, changes would affect manifest validity.\n\n- **Interactions**: Cilium's `pkg/policy/k8s/network_policy.go` handles lifecycle (create/update/delete) via informers. Istio/Flux2 apply manifests declaratively. Cross-repo: No direct dependencies, but all consume Kubernetes API.\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| Cilium | pkg/k8s/apis/cilium.io/v2/cnp_types.go | Defines CiliumNetworkPolicy struct (Spec, Specs, Status) and Parse method for rule conversion. |\n| Cilium | pkg/k8s/apis/cilium.io/v2/ccnp_types.go | Defines CiliumClusterwideNetworkPolicy struct and Parse method for cluster-scoped policies. |\n| Cilium | pkg/k8s/network_policy.go | Parses standard NetworkPolicy into Cilium rules (ParseNetworkPolicy function, handles peers, ports, IPBlocks). |\n| Cilium | pkg/k8s/slim/k8s/api/networking/v1/types.go | Defines standard NetworkPolicy struct (Spec with PodSelector, Ingress/Egress rules). |\n| Cilium | pkg/policy/k8s/cilium_network_policy.go | Manages CiliumNetworkPolicy lifecycle (create/update/delete) via informers. |\n| Cilium | pkg/policy/k8s/cluster_network_policy.go | Handles CiliumClusterwideNetworkPolicy events and rule updates. |\n| Cilium | pkg/policy/k8s/network_policy.go | Handles standard NetworkPolicy events, parsing and cache updates. |\n| Cilium | pkg/k8s/cluster_network_policy.go | Parses ClusterNetworkPolicy (similar to NetworkPolicy but cluster-scoped). |\n| Cilium | pkg/k8s/cluster_network_policy_test.go | Tests ClusterNetworkPolicy parsing logic. |\n| Cilium | pkg/k8s/network_policy_test.go | Tests NetworkPolicy parsing (peer selectors, ports). |\n| Cilium | pkg/k8s/apis/cilium.io/v2/types_test.go | Tests CNP parsing and sanitization. |\n| Cilium | pkg/k8s/apis/cilium.io/v2/fuzz_test.go | Fuzz tests for CNP parsing. |\n| Cilium | pkg/k8s/factory_functions.go | Factory for transforming NetworkPolicy to Cilium types. |\n| Cilium | pkg/k8s/factory_functions_test.go | Tests factory functions for NetworkPolicy. |\n| Cilium | pkg/k8s/resource_ctors.go | Registers NetworkPolicy watchers. |\n| Cilium | pkg/k8s/watchers/watcher_test.go | Tests watcher initialization for NetworkPolicy. |\n| Cilium | pkg/policy/groups/cache.go | Caches CiliumNetworkPolicy objects. |\n| Cilium | pkg/policy/groups/helpers_test.go | Tests derivative policy creation from CNP. |\n| Cilium | pkg/policy/k8s/cilium_network_policy_test.go | Tests CNP update propagation. |\n| Cilium | pkg/policy/directory/watcher.go | Watches directory for CNP YAML files. |\n| Cilium | pkg/envoy/policy/sort.go | Sorts PortNetworkPolicy rules for Envoy. |\n| Cilium | pkg/envoy/policy/sort_test.go | Tests sorting of policy rules. |\n| Cilium | pkg/envoy/resources.go | Syncs IP-identity mappings for NetworkPolicyHosts. |\n| Cilium | pkg/envoy/secretsync_test.go | Tests secret sync for TLS in policies. |\n| Cilium | pkg/endpoint/proxy.go | Manages L7 proxy for policy redirects. |\n| Cilium | pkg/endpoint/redirect_test.go | Tests endpoint redirects for policies. |\n| Cilium | pkg/proxy/envoyproxy.go | Integrates Envoy for L7 policy enforcement. |\n| Cilium | pkg/proxy/proxy.go | Manages proxy redirects for policies. |\n| Cilium | pkg/option/features.go | Checks if NetworkPolicy enforcement is enabled. |\n| Cilium | pkg/option/features_test.go | Tests NetworkPolicyEnabled function. |\n| Cilium | operator/pkg/networkpolicy/cell.go | Registers observers for CNP/CCNP validation. |\n| Cilium | operator/pkg/networkpolicy/secretsync.go | Syncs TLS secrets for CNP/CCNP. |\n| Cilium | operator/pkg/networkpolicy/helpers/helpers.go | Collects secret refs from PortRules. |\n| Cilium | operator/policyderivative/cnp_watcher.go | Watches CNP for derivative policies. |\n| Cilium | operator/policyderivative/controller.go | Registers CNP watchers. |\n| Cilium | pkg/k8s/client/clientset/versioned/typed/cilium.io/v2/ciliumnetworkpolicy.go | Client for CNP CRUD operations. |\n| Cilium | pkg/k8s/client/clientset/versioned/typed/cilium.io/v2/ciliumclusterwidenetworkpolicy.go | Client for CCNP CRUD operations. |\n| Cilium | pkg/k8s/client/informers/externalversions/cilium.io/v2/ciliumnetworkpolicy.go | Informer for CNP watching. |\n| Cilium | pkg/k8s/client/informers/externalversions/cilium.io/v2/ciliumclusterwidenetworkpolicy.go | Informer for CCNP watching. |\n| Cilium | pkg/k8s/client/listers/cilium.io/v2/ciliumnetworkpolicy.go | Lister for CNP retrieval. |\n| Cilium | pkg/k8s/client/listers/cilium.io/v2/ciliumclusterwidenetworkpolicy.go | Lister for CCNP retrieval. |\n| Cilium | pkg/k8s/slim/k8s/client/clientset/versioned/typed/networking/v1/networkpolicy.go | Slim client for standard NetworkPolicy. |\n| Cilium | pkg/k8s/slim/k8s/client/informers/externalversions/networking/v1/networkpolicy.go | Informer for standard NetworkPolicy. |\n| Cilium | pkg/k8s/slim/k8s/client/listers/networking/v1/networkpolicy.go | Lister for standard NetworkPolicy. |\n| Cilium | cilium-cli/connectivity/builder/all_egress_deny_knp.go | Builder for Kubernetes NetworkPolicy deny tests. |\n| Cilium | cilium-cli/connectivity/builder/all_ingress_deny_knp.go | Builder for ingress deny tests. |\n| Cilium | cilium-cli/connectivity/builder/client_egress_expression_knp.go | Builder for egress expression tests. |\n| Cilium | cilium-cli/connectivity/builder/client_egress_to_cidr_cp-host-knp.yaml | Manifest for CP host egress. |\n| Cilium | cilium-cli/connectivity/builder/client_egress_to_cidr-external-knp.yaml | Manifest for external CIDR egress. |\n| Cilium | cilium-cli/connectivity/builder/client_egress_to_cidr-node-knp.yaml | Manifest for node CIDR egress. |\n| Cilium | Documentation/network/kubernetes/policy.rst | Docs on Cilium's NetworkPolicy support. |\n| Cilium | Documentation/network/kubernetes/compatibility.rst | Compatibility matrix for CNP. |\n| Cilium | Documentation/network/servicemesh/ingress-and-network-policy.rst | Docs on CNP with Istio. |\n| Cilium | Documentation/security/policy/kubernetes.rst | Docs on Kubernetes constructs in CNP. |\n| Istio | manifests/charts/gateway/templates/networkpolicy.yaml | Helm template for gateway NetworkPolicy. |\n| Istio | manifests/charts/gateways/istio-egress/templates/networkpolicy.yaml | Template for egress gateway NetworkPolicy. |\n| Istio | manifests/charts/gateways/istio-ingress/templates/networkpolicy.yaml | Template for ingress gateway NetworkPolicy. |\n| Istio | manifests/charts/istio-cni/templates/networkpolicy.yaml | Template for CNI NetworkPolicy. |\n| Istio | manifests/charts/istio-control/istio-discovery/templates/networkpolicy.yaml | Template for istiod NetworkPolicy. |\n| Istio | manifests/charts/ztunnel/templates/networkpolicy.yaml | Template for ztunnel NetworkPolicy. |\n| Istio | releasenotes/notes/56877.yaml | Release note on optional NetworkPolicy for istiod/CNI. |\n| Istio | releasenotes/notes/ztunnel-networkpolicy.yaml | Release note on ztunnel NetworkPolicy. |\n| Istio | tests/integration/iop-ambient-test-defaults.yaml | Test config with networkPolicy flag. |\n| Flux2 | manifests/policies/allow-egress.yaml | NetworkPolicy for allowing egress. |\n| Flux2 | manifests/policies/allow-scraping.yaml | NetworkPolicy for scraping traffic. |\n| Flux2 | manifests/policies/allow-webhooks.yaml | NetworkPolicy for webhook traffic. |",
+  "cost": {
+    "input_tokens": 612342,
+    "output_tokens": 5631,
+    "total_tokens": 617973,
+    "cost_usd": 0.130915
+  },
+  "status": "success",
+  "latency_seconds": 79.2,
+  "tool_calls_count": 13,
+  "agent_steps": 14,
+  "tool_calls": [
+    {
+      "tool_name": "server_info",
+      "arguments": {},
+      "result_preview": "ByteBell Knowledge Server - eval_benchmark\n\nORGANIZATION ID: \"eval_benchmark\"\n   This is your organization in the multi-org graph database.\n\nAVAILABLE TOOLS:\n\u00e2\u0080\u00a2 graph_traverse\n\u00e2\u0080\u00a2 graph_search\n\u00e2\u0080\u00a2 retrieve_file\n\u00e2\u0080\u00a2 list_knowledge\n\nPAGINATION: All operations support pagination.\n\u00e2\u0080\u00a2 Include page: 1 in requests\n\u00e2\u0080\u00a2 Check hasNextPage in response - if true, call with page: 2, 3, etc.\n\u00e2\u0080\u00a2 pageSize defaults to 20, max 100\n\nTool usage strategy and search patterns are provided in the server instructions...",
+      "latency_seconds": 0.078
+    },
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {},
+      "result_preview": "{\"orgId\":\"eval_benchmark\",\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"Knowledge 0bf65098-3076-481c-940a-c65298663392\",\"datasource\":\"GITHUB\",\"architecture\":\"This repository implements a comprehensive, declarative infrastructure-as-code ecosystem centered on Kubernetes configuration management and technical documentation. The core is Kustomize, a tool for customizing Kubernetes manifests through layered configurations (bases and overlays) without modifying origi...",
+      "latency_seconds": 0.199
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NetworkPolicy",
+        "channels": [
+          "classes",
+          "functions",
+          "semantic",
+          "imports",
+          "paths"
+        ]
+      },
+      "result_preview": "{\n  \"classes\": {\n    \"data\": [\n      {\n        \"path\": \"addon-resizer/vendor/k8s.io/api/extensions/v1beta1/types.go\",\n        \"purpose\": \"The file defines deprecated Kubernetes API resource types for the extensions/v1beta1 group, covering deployments, daemon sets, ingress, replica sets, pod security policies, and network policies. It provides the struct definitions, specifications, and status objects required for serialization and API interactions, enabling the API server to manage these resourc...",
+      "latency_seconds": 2.019
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NetworkPolicy",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"Documentation/network/kubernetes/compatibility.rst\",\n        \"purpose\": \"This file provides Cilium's Kubernetes compatibility documentation, detailing supported Kubernetes API groups, the compatibility matrix for CiliumNetworkPolicy, testing policies across Kubernetes releases, cloud provider test matrices, and CRD schema version handling. It serves as a reference for users and developers to understand which Kubernetes versions are official...",
+      "latency_seconds": 3.37
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NetworkPolicy",
+        "knowledgeId": "edd43087-bf39-42b6-85b0-ed3297ec760a",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/charts/gateway/templates/networkpolicy.yaml\",\n        \"purpose\": \"Defines a Kubernetes NetworkPolicy for the gateway component, restricting ingress to health\u00e2\u0080\u0091check, metrics, and optional service ports while allowing all egress. The resource is generated only when global.networkPolicy.enabled is true, integrating with Istio labels and Helm values.\"\n      },\n      {\n        \"path\": \"manifests/charts/gateways/istio-egress/templates...",
+      "latency_seconds": 2.926
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "NetworkPolicy",
+        "knowledgeId": "300e3464-c7b1-4d8b-954c-a9677f430faf",
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"manifests/policies/allow-egress.yaml\",\n        \"purpose\": \"Defines a Kubernetes NetworkPolicy that allows all egress traffic from pods while restricting ingress to only from other pods\"\n      },\n      {\n        \"path\": \"manifests/policies/allow-scraping.yaml\",\n        \"purpose\": \"Defines a Kubernetes NetworkPolicy to allow ingress traffic from any namespace to pods on port 8080, enabling scraping operations\"\n      },\n      {\n        \"path\":...",
+      "latency_seconds": 3.552
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/k8s/apis/cilium.io/v2/cnp_types.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/k8s/apis/cilium.io/v2/cnp_types.go\",\n      \"purpose\": \"Defines Kubernetes API types for CiliumNetworkPolicy, extending NetworkPolicy with Cilium-specific features and status tracking\",\n      \"summary\": \"{\\\"Kubernetes CRD\\\":\\\"Defines CiliumNetworkPolicy as a Kubernetes third-party resource with extended NetworkPolicy capabilities\\\",\\\"Status Track...",
+      "latency_seconds": 0.184
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePath": "pkg/k8s/apis/cilium.io/v2/cnp_types.go",
+        "fromLine": 30,
+        "toLine": 54
+      },
+      "result_preview": "# pkg/k8s/apis/cilium.io/v2/cnp_types.go\nLines: 30 - 54 of 290\nMore: fromLine=55\n\n30 | // CiliumNetworkPolicy is a Kubernetes third-party resource with an extended\n31 | // version of NetworkPolicy.\n32 | type CiliumNetworkPolicy struct {\n33 | \t// +deepequal-gen=false\n34 | \tmetav1.TypeMeta `json:\",inline\"`\n35 | \t// +deepequal-gen=false\n36 | \t// +kubebuilder:validation:Required\n37 | \tmetav1.ObjectMeta `json:\"metadata\"`\n38 | \n39 | \t// Spec is the desired Cilium specific rule specification.\n40 | \t//\n...",
+      "latency_seconds": 0.457
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/k8s/slim/k8s/api/networking/v1/types.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/k8s/slim/k8s/api/networking/v1/types.go\",\n      \"purpose\": \"Defines the Kubernetes NetworkPolicy v1 API types used by Cilium's slim client to represent, serialize, and deserialize network policy objects for enforcement and configuration within the cluster.\",\n      \"summary\": \"{\\\"NetworkPolicy type\\\":\\\"Core schema object that Cilium uses to trans...",
+      "latency_seconds": 0.123
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePath": "pkg/k8s/slim/k8s/api/networking/v1/types.go",
+        "fromLine": 19,
+        "toLine": 35
+      },
+      "result_preview": "# pkg/k8s/slim/k8s/api/networking/v1/types.go\nLines: 19 - 35 of 222\nMore: fromLine=36\n\n19 | type NetworkPolicy struct {\n20 | \tslim_metav1.TypeMeta `json:\",inline\"`\n21 | \n22 | \t// Standard object's metadata.\n23 | \t// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata\n24 | \t// +optional\n25 | \tslim_metav1.ObjectMeta `json:\"metadata,omitempty\" protobuf:\"bytes,1,opt,name=metadata\"`\n26 | \n27 | \t// spec represents the specification of the desired beh...",
+      "latency_seconds": 0.79
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePath": "pkg/k8s/slim/k8s/api/networking/v1/types.go",
+        "fromLine": 50,
+        "toLine": 95
+      },
+      "result_preview": "# pkg/k8s/slim/k8s/api/networking/v1/types.go\nLines: 50 - 95 of 222\nMore: fromLine=96\n\n50 | type NetworkPolicySpec struct {\n51 | \t// podSelector selects the pods to which this NetworkPolicy object applies.\n52 | \t// The array of rules is applied to any pods selected by this field. An empty\n53 | \t// selector matches all pods in the policy's namespace.\n54 | \t// Multiple network policies can select the same set of pods. In this case,\n55 | \t// the ingress rules for each are combined additively.\n56 | ...",
+      "latency_seconds": 0.792
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/k8s/network_policy.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/k8s/network_policy.go\",\n      \"purpose\": \"Parses Kubernetes NetworkPolicy objects into Cilium policy rules, converting k8s network policy specifications into Cilium's internal policy representation\",\n      \"summary\": \"{\\\"NetworkPolicy parsing\\\":\\\"Converts k8s NetworkPolicy spec to Cilium policy entries with proper cluster awareness and namespace...",
+      "latency_seconds": 0.123
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/k8s/apis/cilium.io/v2/ccnp_types.go"
+        ]
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"orgId\": \"eval_benchmark\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/k8s/apis/cilium.io/v2/ccnp_types.go\",\n      \"purpose\": \"Defines Kubernetes API types and logic for CiliumClusterwideNetworkPolicy, a cluster-scoped network policy resource that extends CiliumNetworkPolicy functionality\",\n      \"summary\": \"{\\\"Kubernetes API Resource\\\":\\\"Cluster-scoped network policy extending CiliumNetworkPolicy with spec and sta...",
+      "latency_seconds": 0.115
+    }
+  ],
+  "error": ""
+}
