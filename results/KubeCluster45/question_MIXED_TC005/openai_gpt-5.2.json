@@ -1,0 +1,1494 @@
+{
+  "model": "openai/gpt-5.2",
+  "answer": "## Phase 1: Planning (what I searched for)\nThis change affects **call sites of `labels.Selector.Matches(...)`** across the four repos. Since `Matches` is a method on the `labels.Selector` interface (from `k8s.io/apimachinery/pkg/labels`), I focused on:\n- files importing `k8s.io/apimachinery/pkg/labels`\n- then confirming **direct calls to `.Matches(...)`** in those files (as opposed to just using `SelectorFromSet(...).String()` etc.)\n\n---\n\n## 1. Architecture Overview\n\n`k8s.io/apimachinery/pkg/labels.Selector` is used broadly as an in-process predicate:\n- a selector is constructed (e.g., `labels.Parse`, `labels.NewSelector`, `metav1.LabelSelectorAsSelector`)\n- it\u2019s evaluated against a label/annotation map by converting that map to a `labels.Set`\n- **today:** `selector.Matches(labels.Set(m))`\n- **after your change:** every call must supply a `context.Context`, e.g. `selector.Matches(ctx, labels.Set(m))` (exact signature depends on how you add `context`, but the extra arg is the breaking part)\n\n---\n\n## 2. Detailed Analysis (confirmed `Matches()` call sites)\n\n### Repo: **helm**\n#### 1) `pkg/action/list.go`\n- **Call site:** `selector.Matches(labels.Set(rls.Labels))`\n- **Where:** `func (l *List) filterSelector(...)`  \n  Evidence: `pkg/action/list.go` lines 289\u2013299 show:\n```go\nfor _, rls := range releases {\n    if selector.Matches(labels.Set(rls.Labels)) {\n        desiredStateReleases = append(desiredStateReleases, rls)\n    }\n}\n```  \n(From `helm/pkg/action/list.go`)\n\n**Update needed:** pass a `context.Context` into `filterSelector` (or use `context.Background()`/`context.TODO()` internally), then call `selector.Matches(ctx, labels.Set(...))`.\n\n---\n\n### Repo: **argo-cd**\n#### 1) `applicationset/generators/generator_spec_processor.go`\n- **Call site:** `selector.Matches(labels.Set(flatParam))`\n- **Where:** `func Transform(...)`  \n  Evidence: `applicationset/generators/generator_spec_processor.go` line 89:\n```go\nif requestedGenerator.Selector != nil && !selector.Matches(labels.Set(flatParam)) {\n    continue\n}\n```  \n(From `argo-cd/applicationset/generators/generator_spec_processor.go`)\n\n**Update needed:** `Transform(...)` already receives no `context.Context`; you\u2019ll likely thread a `ctx` in (or use `context.TODO()` locally) for `selector.Matches(ctx, ...)`.\n\n> Note: Other Argo CD files import `labels` (e.g., metrics/listers), but in the code retrieved they don\u2019t call `.Matches()`; the above is the confirmed call site from tool output.\n\n---\n\n### Repo: **external-dns**\n#### 1) `source/annotations/filter.go`\n- **Call site:** `selector.Matches(labels.Set(item.GetAnnotations()))`\n- **Where:** `func Filter[T AnnotatedObject](...)`  \n  Evidence: `source/annotations/filter.go` lines 42\u201347:\n```go\nfor _, item := range items {\n    if selector.Matches(labels.Set(item.GetAnnotations())) {\n        filtered = append(filtered, item)\n    }\n}\n```  \n(From `external-dns/source/annotations/filter.go`)\n\n**Update needed:** either add `ctx context.Context` to `Filter(...)` or use a background context internally, then call `selector.Matches(ctx, ...)`.\n\n#### 2) `source/source.go`\n- **Call site:** `selector.Matches(labels.Set(srcAnnotations))`\n- **Where:** `func matchLabelSelector(selector labels.Selector, srcAnnotations map[string]string) bool`  \n  Evidence: `source/source.go` lines 63\u201365:\n```go\nfunc matchLabelSelector(selector labels.Selector, srcAnnotations map[string]string) bool {\n    return selector.Matches(labels.Set(srcAnnotations))\n}\n```  \n(From `external-dns/source/source.go`)\n\n**Update needed:** `matchLabelSelector` must accept a `ctx` (or choose one internally) and pass it to `Matches`.\n\n#### 3) `source/gateway.go`\n- **Call site:** `src.rtAnnotations.Matches(labels.Set(annots))`\n- **Where:** `func (src *gatewayRouteSource) Endpoints(...)`  \n  Evidence: `source/gateway.go` lines 260\u2013265:\n```go\nannots := meta.Annotations\nif !src.rtAnnotations.Matches(labels.Set(annots)) {\n    continue\n}\n```  \n(From `external-dns/source/gateway.go`)\n\n**Update needed:** this method already has `_ context.Context` as a parameter (`Endpoints(_ context.Context)`), so you can use that ctx (rename `_` to `ctx`) and call `src.rtAnnotations.Matches(ctx, ...)`.\n\n#### 4) `source/informers/indexers.go`\n- **Call sites:**\n  - `options.annotationFilter.Matches(labels.Set(entity.GetAnnotations()))`\n  - `options.labelSelector.Matches(labels.Set(entity.GetLabels()))`\n- **Where:** `func IndexerWithOptions[T metav1.Object](...) cache.Indexers`  \n  Evidence: `source/informers/indexers.go` lines 85\u201391:\n```go\nif options.annotationFilter != nil && !options.annotationFilter.Matches(labels.Set(entity.GetAnnotations())) {\n    return nil, nil\n}\n\nif options.labelSelector != nil && !options.labelSelector.Matches(labels.Set(entity.GetLabels())) {\n    return nil, nil\n}\n```  \n(From `external-dns/source/informers/indexers.go`)\n\n**Update needed:** indexer functions don\u2019t naturally receive a `context.Context`; you\u2019ll need to use `context.TODO()/Background()` or refactor to capture a ctx when creating indexers.\n\n---\n\n### Repo: **ingress-nginx**\n#### 1) `internal/ingress/controller/store/store.go`\n- **Call site:** `namespaceSelector.Matches(labels.Set(ns.Labels))`\n- **Where:** local `watchedNamespace := func(namespace string) bool { ... }` inside store initialization  \n  Evidence: `internal/ingress/controller/store/store.go` lines 366\u2013382:\n```go\nreturn namespaceSelector.Matches(labels.Set(ns.Labels))\n```  \n(From `ingress-nginx/internal/ingress/controller/store/store.go`)\n\n**Update needed:** this closure has no `ctx`; you\u2019ll likely use `context.Background()` (or thread a ctx from the store/controller setup) for `namespaceSelector.Matches(ctx, ...)`.\n\n---\n\n## 3. Relevant Files (complete list of confirmed `Matches()` callers)\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| helm | `pkg/action/list.go` | Calls `selector.Matches(labels.Set(rls.Labels))` in `filterSelector` (lines 289\u2013299). |\n| argo-cd | `applicationset/generators/generator_spec_processor.go` | Calls `selector.Matches(labels.Set(flatParam))` in `Transform(...)` (line 89). |\n| external-dns | `source/annotations/filter.go` | Calls `selector.Matches(labels.Set(item.GetAnnotations()))` in generic `Filter(...)` (line 44). |\n| external-dns | `source/source.go` | Calls `selector.Matches(labels.Set(srcAnnotations))` inside helper `matchLabelSelector(...)` (line 64). |\n| external-dns | `source/gateway.go` | Calls `src.rtAnnotations.Matches(labels.Set(annots))` in `gatewayRouteSource.Endpoints(...)` (line 263). |\n| external-dns | `source/informers/indexers.go` | Calls `.Matches(...)` twice: annotation and label selector checks in `IndexerWithOptions(...)` (lines 85, 89). |\n| ingress-nginx | `internal/ingress/controller/store/store.go` | Calls `namespaceSelector.Matches(labels.Set(ns.Labels))` in `watchedNamespace` closure (line 381). |\n\n---\n\n### Practical update pattern\nAfter adding `context.Context` to `Matches`, each of the above needs to become roughly:\n\n```go\nif selector.Matches(ctx, labels.Set(m)) { ... }\n```\n\nWhere `ctx` comes from:\n- existing method parameter (best case, e.g. external-dns Gateway source already has one but currently named `_`)\n- otherwise: plumb a context through, or use `context.Background()`/`context.TODO()` at the call site (common for indexers/closures).",
+  "llm_condensed_answer": "SUMMARY: Adding a context.Context parameter to the labels.Selector.Matches method requires updating call sites across Helm, ArgoCD, external-dns, and ingress-nginx. The analysis identified seven specific files that directly call the Matches method, each needing modification to pass a context parameter. Most call sites will need to thread an existing context or use context.Background() internally.\n\nFILES:\n- helm/pkg/action/list.go \u2014 Calls selector.Matches in filterSelector function for release filtering\n- argo-cd/applicationset/generators/generator_spec_processor.go \u2014 Calls selector.Matches in Transform function for generator selection\n- external-dns/source/annotations/filter.go \u2014 Calls selector.Matches in Filter function for annotation-based filtering\n- external-dns/source/source.go \u2014 Calls selector.Matches in matchLabelSelector helper function\n- external-dns/source/gateway.go \u2014 Calls src.rtAnnotations.Matches in gatewayRouteSource.Endpoints method\n- external-dns/source/informers/indexers.go \u2014 Calls selector.Matches twice for annotation and label selector filtering\n- ingress-nginx/internal/ingress/controller/store/store.go \u2014 Calls namespaceSelector.Matches in watchedNamespace closure",
+  "cost": {
+    "input_tokens": 2437499,
+    "output_tokens": 18544,
+    "total_tokens": 2456043,
+    "cost_usd": 4.525239
+  },
+  "status": "success",
+  "latency_seconds": 393.06,
+  "tool_calls_count": 84,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.421
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.422
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.428
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.427
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.428
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.425
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.42
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery/pkg/labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"apimachinery/pkg/labels\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.413
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"k8s.io/apimachinery/pkg/labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.955
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"k8s.io/apimachinery/pkg/labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.925
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"k8s.io/apimachinery/pkg/labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.023
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery/pkg/labels",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"k8s.io/apimachinery/pkg/labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.157
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"Helm is a layered, extensible package manager for Kubernetes that orchestrates chart acquisition, validation, dependency resolution, templating, release persistence, and deployment. The core provides a unified chart processing engine (v2/v3 support) that loads charts from directories or archives, applies a rule\u00e2\u0080\u0091based linting pipeline, resolves dependencies and values, renders manifests, and stores release state via pl...",
+      "latency_seconds": 0.694
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"Argo CD is a comprehensive GitOps platform for Kubernetes that enables declarative, version-controlled application deployment and lifecycle management across multi-cluster environments. The architecture follows a layered, modular design with a core GitOps reconciliation engine at its center, surrounded by supporting subsystems for API management, user interfaces, manifest generation, and extensibility. It integrates gen...",
+      "latency_seconds": 0.69
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"The ExternalDNS codebase implements a comprehensive, provider-agnostic DNS synchronization system for Kubernetes. Its core purpose is to automate the management of DNS records across diverse cloud providers and service meshes by translating dynamic Kubernetes resource states (Services, Ingresses, CRDs) into stable DNS configurations. The architecture is layered and event-driven, featuring a reconciliation engine that co...",
+      "latency_seconds": 0.771
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"The repository implements a comprehensive, production-grade Kubernetes Ingress Controller using NGINX as the data plane. The architecture is split into a Go-based control plane and a Lua-based data plane. The control plane (written in Go) acts as a Kubernetes controller, using informers to watch for changes to Ingress, Service, and Secret resources. It synchronizes these changes into a desired state, which is then trans...",
+      "latency_seconds": 0.698
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"internal/chart/v3/lint/rules/crds.go\",\n        \"purpose\": \"Validates Custom Resource Definitions (CRDs) in Helm charts by checking directory existence, YAML structure, API version, and kind. Ensures CRDs conform to Kubernetes expectations before chart deployment.\",\n        \"knowledge_id\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n        \"repo_name\": \"helm\"\n      },\n      {\n        \"path\": \"internal/chart/v3/lint/rules/deprecations.go\",\n     ...",
+      "latency_seconds": 1.111
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"applicationset/controllers/applicationset_controller.go\",\n        \"purpose\": \"This file implements the core reconciliation logic for Argo CD ApplicationSet resources. It watches ApplicationSet custom resources, generates desired Applications via pluggable generators, validates and syncs them to the cluster, handles deletion with progressive sync strategies (including reverse deletion), and maintains status conditions. It serves as the main ...",
+      "latency_seconds": 1.479
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"apis/v1alpha1/groupversion_info.go\",\n        \"purpose\": \"Defines the API group version and scheme registration for the externaldns.k8s.io v1alpha1 API group, enabling Kubernetes to recognize and manage DNSEndpoint resources.\",\n        \"knowledge_id\": \"f9267125-4d0d-4ca5-9dc1-dd944557f55c\",\n        \"repo_name\": \"external-dns\"\n      },\n      {\n        \"path\": \"endpoint/utils.go\",\n        \"purpose\": \"Provides utility functions for endpoint man...",
+      "latency_seconds": 1.229
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "apimachinery",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"cmd/nginx/main.go\",\n        \"purpose\": \"Main entry point for the ingress-nginx controller binary; initializes Kubernetes client, validates configuration, sets up Prometheus metrics, starts the NGINX controller, and handles graceful shutdown.\",\n        \"knowledge_id\": \"e1f53b33-e250-41ec-8793-1fb6ad99g3t9\",\n        \"repo_name\": \"ingress-nginx\"\n      },\n      {\n        \"path\": \"cmd/plugin/commands/ingresses/ingresses.go\",\n        \"purpose\": \"...",
+      "latency_seconds": 1.342
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [
+          "pkg/action/list.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 10000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n  \"files\": [\n    {\n      \"path\": \"pkg/action/list.go\",\n      \"purpose\": \"Implements the 'helm list' command by listing Helm releases with filtering, sorting, and pagination support. It manages release state masks, selector-based filtering, and version-aware deduplication to return a curated list of releases matching user-specified criteria.\",\n      \"summary\": \"{\\\"StateMask (~L36-55)\\\":\\\"Bitmask-based filtering ...",
+      "latency_seconds": 0.412
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/action/list.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/action/list.go\nLines: 1 - 260 of 335\nMore: fromLine=261\n\n1 | /*\n2 | Copyright The Helm Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WI...",
+      "latency_seconds": 0.713
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/action/list.go",
+        "fromLine": 261,
+        "toLine": 335,
+        "maxTokens": 8000
+      },
+      "result_preview": "# pkg/action/list.go\nLines: 261 - 335 of 335\n\n261 | \t\tif latestRelease, exists := latestReleases[key]; exists && latestRelease.Version > rls.Version {\n262 | \t\t\tcontinue\n263 | \t\t}\n264 | \t\tlatestReleases[key] = rls\n265 | \t}\n266 | \n267 | \tvar list = make([]*release.Release, 0, len(latestReleases))\n268 | \tfor _, rls := range latestReleases {\n269 | \t\tlist = append(list, rls)\n270 | \t}\n271 | \treturn list\n272 | }\n273 | \n274 | func (l *List) filterStateMask(releases []*release.Release) []*release.Release...",
+      "latency_seconds": 1.609
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/action/list.go\",\n        \"purpose\": \"Implements the 'helm list' command by listing Helm releases with filtering, sorting, and pagination support. It manages release state masks, selector-based filtering, and version-aware deduplication to return a curated list of releases matching user-specified criteria.\",\n        \"knowledge_id\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n        \"repo_name\": \"helm\"\n      },\n      {\n        \"path\": \"pkg/c...",
+      "latency_seconds": 0.789
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"applicationset/generators/generator_spec_processor.go\",\n        \"purpose\": \"Transforms ApplicationSet generator specifications into parameter sets and templates, enabling dynamic application generation by processing generator configurations, applying selectors, and interpolating parameters for multi-generator scenarios.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        ...",
+      "latency_seconds": 0.777
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/externaldns/types.go\",\n        \"purpose\": \"pkg/apis/externaldns/types.go#chunk0: To define the comprehensive configuration structure and default values for the external-dns application, enabling command-line flag parsing and provider-specific settings.\\npkg/apis/externaldns/types.go#chunk1: To register and configure all command-line flags for the external-dns application, mapping them to the configuration struct for runtime use.\\np...",
+      "latency_seconds": 0.902
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"internal/ingress/controller/controller.go\",\n        \"purpose\": \"Core controller logic for Kubernetes NGINX Ingress Controller; manages ingress rule parsing, configuration generation, dynamic backend reloading, and admission webhook validation. Acts as the central orchestrator between Kubernetes API objects and NGINX configuration generation.\\nThis file implements the core logic of the NGINX Ingress controller: it translates Kubernetes Ingre...",
+      "latency_seconds": 0.671
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/cmd/get_metadata.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/cmd/get_metadata.go\nLines: 1 - 117 of 117\n\n1 | /*\n2 | Copyright The Helm Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITHOUT WARRANTI...",
+      "latency_seconds": 1.616
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/kube/wait.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/kube/wait.go\nLines: 1 - 260 of 346\nMore: fromLine=261\n\n1 | /*\n2 | Copyright The Helm Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITH...",
+      "latency_seconds": 1.031
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/storage/driver/cfgmaps.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/storage/driver/cfgmaps.go\nLines: 1 - 260 of 289\nMore: fromLine=261\n\n1 | /*\n2 | Copyright The Helm Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BAS...",
+      "latency_seconds": 1.649
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/storage/driver/secrets.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/storage/driver/secrets.go\nLines: 1 - 260 of 288\nMore: fromLine=261\n\n1 | /*\n2 | Copyright The Helm Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BAS...",
+      "latency_seconds": 0.733
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "relativePaths": [],
+        "relativePath": "internal/ingress/controller/controller.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# internal/ingress/controller/controller.go\nLines: 1 - 260 of 1918\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2015 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distr...",
+      "latency_seconds": 1.375
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "relativePaths": [],
+        "relativePath": "internal/ingress/controller/store/store.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# internal/ingress/controller/store/store.go\nLines: 1 - 260 of 1258\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is dist...",
+      "latency_seconds": 1.986
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "relativePaths": [],
+        "relativePath": "internal/ingress/status/status.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# internal/ingress/status/status.go\nLines: 1 - 260 of 413\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2015 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on...",
+      "latency_seconds": 1.026
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "relativePaths": [],
+        "relativePath": "pkg/flags/flags.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/flags/flags.go\nLines: 1 - 260 of 430\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BAS...",
+      "latency_seconds": 1.046
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "relativePaths": [],
+        "relativePath": "pkg/kube/wait.go",
+        "fromLine": 261,
+        "toLine": 346,
+        "maxTokens": 9000
+      },
+      "result_preview": "# pkg/kube/wait.go\nLines: 261 - 346 of 346\n\n261 | \t_, err = watchtools.UntilWithSync(ctx, lw, &unstructured.Unstructured{}, nil, func(e watch.Event) (bool, error) {\n262 | \t\t// Make sure the incoming object is versioned as we use unstructured\n263 | \t\t// objects when we build manifests\n264 | \t\tobj := convertWithMapper(e.Object, info.Mapping)\n265 | \t\tswitch e.Type {\n266 | \t\tcase watch.Added, watch.Modified:\n267 | \t\t\t// For things like a secret or a config map, this is the best indicator\n268 | \t\t\t//...",
+      "latency_seconds": 0.703
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "Matches(",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"Matches(\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.439
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "relativePaths": [
+          "internal/ingress/controller/controller.go",
+          "internal/ingress/controller/store/store.go",
+          "internal/ingress/status/status.go",
+          "pkg/flags/flags.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 10000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e1f53b33-e250-41ec-8793-1fb6ad99g3t9\",\n  \"files\": [\n    {\n      \"path\": \"internal/ingress/controller/controller.go\",\n      \"purpose\": \"Core controller logic for Kubernetes NGINX Ingress Controller; manages ingress rule parsing, configuration generation, dynamic backend reloading, and admission webhook validation. Acts as the central orchestrator between Kubernetes API objects and NGINX configuration generation.\\nThis file implements the core logic o...",
+      "latency_seconds": 0.72
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [
+          "source/annotations/filter.go",
+          "source/annotations/processors.go",
+          "source/ingress.go",
+          "source/service.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 10000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"f9267125-4d0d-4ca5-9dc1-dd944557f55c\",\n  \"files\": [\n    {\n      \"path\": \"source/annotations/filter.go\",\n      \"purpose\": \"Provides a generic annotation-based filtering utility for Kubernetes objects, enabling selection of resources based on label selector syntax applied to their annotations. It is used by other components to filter lists of objects (like services) by annotation criteria.\",\n      \"summary\": \"{\\\"Generic Filtering Utility (~L28-50)\\\":\\...",
+      "latency_seconds": 0.412
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "applicationset/utils/selector.go",
+          "applicationset/generators/generator_spec_processor.go",
+          "util/db/secrets.go",
+          "server/server.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 1,
+        "maxTokens": 10000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"applicationset/utils/selector.go\",\n      \"purpose\": \"Implements label selector logic for ApplicationSet by converting Kubernetes LabelSelector API objects into executable selectors, supporting both exact match and set-based matching (In, NotIn, Exists, etc.) with validation and deterministic ordering.\",\n      \"summary\": \"{\\\"Requirement validation rules (~L159 to L194)\\\":\\\"Enfor...",
+      "latency_seconds": 0.753
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "relativePaths": [],
+        "relativePath": "internal/ingress/controller/store/store.go",
+        "fromLine": 280,
+        "toLine": 420,
+        "maxTokens": 12000
+      },
+      "result_preview": "# internal/ingress/controller/store/store.go\nLines: 280 - 420 of 1258\nMore: fromLine=421\n\n280 | \t}\n281 | \trecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{\n282 | \t\tComponent: \"nginx-ingress-controller\",\n283 | \t})\n284 | \tstore.recorder = recorder\n285 | \n286 | \t// k8sStore fulfills resolver.Resolver interface\n287 | \tstore.annotations = annotations.NewAnnotationExtractor(store)\n288 | \n289 | \tstore.listers.IngressWithAnnotation.Store = cache.NewStore(cache.DeletionHandlingM...",
+      "latency_seconds": 1.396
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/annotations/filter.go",
+        "fromLine": 1,
+        "toLine": 120,
+        "maxTokens": 6000
+      },
+      "result_preview": "# source/annotations/filter.go\nLines: 1 - 51 of 51\n\n1 | /*\n2 | Copyright 2025 The Kubernetes Authors.\n3 | Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | you may not use this file except in compliance with the License.\n5 | You may obtain a copy of the License at\n6 |     http://www.apache.org/licenses/LICENSE-2.0\n7 | Unless required by applicable law or agreed to in writing, software\n8 | distributed under the License is distributed on an \"AS IS\" BASIS,\n9 | WITHOUT WARRANTIES O...",
+      "latency_seconds": 0.741
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/annotations/processors.go",
+        "fromLine": 1,
+        "toLine": 180,
+        "maxTokens": 8000
+      },
+      "result_preview": "# source/annotations/processors.go\nLines: 1 - 145 of 145\n\n1 | /*\n2 | Copyright 2025 The Kubernetes Authors.\n3 | Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | you may not use this file except in compliance with the License.\n5 | You may obtain a copy of the License at\n6 |     http://www.apache.org/licenses/LICENSE-2.0\n7 | Unless required by applicable law or agreed to in writing, software\n8 | distributed under the License is distributed on an \"AS IS\" BASIS,\n9 | WITHOUT WARRAN...",
+      "latency_seconds": 0.727
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/ambassador_host.go",
+        "fromLine": 1,
+        "toLine": 240,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/ambassador_host.go\nLines: 1 - 240 of 296\nMore: fromLine=241\n\n1 | /*\n2 | Copyright 2020 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS ...",
+      "latency_seconds": 1.627
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/compatibility.go",
+        "fromLine": 1,
+        "toLine": 240,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/compatibility.go\nLines: 1 - 209 of 209\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITHO...",
+      "latency_seconds": 1.578
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/contour_httpproxy.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/contour_httpproxy.go\nLines: 1 - 255 of 255\n\n1 | /*\n2 | Copyright 2020 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | W...",
+      "latency_seconds": 1.599
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/crd.go",
+        "fromLine": 1,
+        "toLine": 240,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/crd.go\nLines: 1 - 240 of 266\nMore: fromLine=241\n\n1 | /*\n2 | Copyright 2018 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n1...",
+      "latency_seconds": 1.627
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/endpoints.go",
+        "fromLine": 1,
+        "toLine": 240,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/endpoints.go\nLines: 1 - 117 of 117\n\n1 | /*\n2 | Copyright 2025 The Kubernetes Authors.\n3 | Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | you may not use this file except in compliance with the License.\n5 | You may obtain a copy of the License at\n6 |     http://www.apache.org/licenses/LICENSE-2.0\n7 | Unless required by applicable law or agreed to in writing, software\n8 | distributed under the License is distributed on an \"AS IS\" BASIS,\n9 | WITHOUT WARRANTIES OR CONDI...",
+      "latency_seconds": 1.626
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/f5_transportserver.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/f5_transportserver.go\nLines: 1 - 191 of 191\n\n1 | /*\n2 | Copyright 2022 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | ...",
+      "latency_seconds": 1.626
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/f5_virtualserver.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/f5_virtualserver.go\nLines: 1 - 203 of 203\n\n1 | /*\n2 | Copyright 2022 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WI...",
+      "latency_seconds": 1.598
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gateway.go\nLines: 1 - 260 of 730\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASI...",
+      "latency_seconds": 1.889
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway.go",
+        "fromLine": 240,
+        "toLine": 360,
+        "maxTokens": 9000
+      },
+      "result_preview": "# source/gateway.go\nLines: 240 - 360 of 730\nMore: fromLine=361\n\n240 | \t_, _ = src.nsInformer.Informer().AddEventHandler(eventHandler)\n241 | }\n242 | \n243 | func (src *gatewayRouteSource) Endpoints(_ context.Context) ([]*endpoint.Endpoint, error) {\n244 | \tvar endpoints []*endpoint.Endpoint\n245 | \troutes, err := src.rtInformer.List(src.rtNamespace, src.rtLabels)\n246 | \tif err != nil {\n247 | \t\treturn nil, err\n248 | \t}\n249 | \tgateways, err := src.gwInformer.Lister().Gateways(src.gwNamespace).List(src...",
+      "latency_seconds": 0.999
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway_grpcroute.go",
+        "fromLine": 1,
+        "toLine": 220,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gateway_grpcroute.go\nLines: 1 - 67 of 67\n\n1 | /*\n2 | Copyright 2022 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WIT...",
+      "latency_seconds": 1.618
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway_httproute.go",
+        "fromLine": 1,
+        "toLine": 220,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gateway_httproute.go\nLines: 1 - 68 of 68\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WIT...",
+      "latency_seconds": 1.67
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway_tcproute.go",
+        "fromLine": 1,
+        "toLine": 220,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gateway_tcproute.go\nLines: 1 - 68 of 68\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITH...",
+      "latency_seconds": 0.706
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway_tlsroute.go",
+        "fromLine": 1,
+        "toLine": 220,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gateway_tlsroute.go\nLines: 1 - 68 of 68\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITH...",
+      "latency_seconds": 1.631
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gateway_udproute.go",
+        "fromLine": 1,
+        "toLine": 220,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gateway_udproute.go\nLines: 1 - 68 of 68\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITH...",
+      "latency_seconds": 1.59
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/gloo_proxy.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/gloo_proxy.go\nLines: 1 - 260 of 372\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2020n The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" ...",
+      "latency_seconds": 1.604
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/informers/indexers.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/informers/indexers.go\nLines: 1 - 114 of 114\n\n1 | /*\n2 | Copyright 2025 The Kubernetes Authors.\n3 | Licensed under the Apache License, Version 2.0 (the \"License\");\n4 | you may not use this file except in compliance with the License.\n5 | You may obtain a copy of the License at\n6 |     http://www.apache.org/licenses/LICENSE-2.0\n7 | Unless required by applicable law or agreed to in writing, software\n8 | distributed under the License is distributed on an \"AS IS\" BASIS,\n9 | WITHOUT WARRANTIES...",
+      "latency_seconds": 1.608
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/ingress.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/ingress.go\nLines: 1 - 260 of 342\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASI...",
+      "latency_seconds": 1.603
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/ingress.go",
+        "fromLine": 260,
+        "toLine": 342,
+        "maxTokens": 9000
+      },
+      "result_preview": "# source/ingress.go\nLines: 260 - 342 of 342\n\n260 | \n261 | \tttl := annotations.TTLFromAnnotations(ing.Annotations, resource)\n262 | \n263 | \ttargets := annotations.TargetsFromTargetAnnotation(ing.Annotations)\n264 | \n265 | \tif len(targets) == 0 {\n266 | \t\ttargets = targetsFromIngressStatus(ing.Status)\n267 | \t}\n268 | \n269 | \tproviderSpecific, setIdentifier := annotations.ProviderSpecificAnnotations(ing.Annotations)\n270 | \n271 | \t// Gather endpoints defined on hosts sections of the ingress\n272 | \tvar d...",
+      "latency_seconds": 1.017
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "matchLabelSelector",
+        "channels": [
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"source/source.go\",\n        \"purpose\": \"This file defines the core Source interface and supporting types for endpoint sources in the external-dns project, enabling integration between Kubernetes resources and DNS providers by standardizing how endpoints are retrieved and events are handled.\",\n        \"knowledge_id\": \"f9267125-4d0d-4ca5-9dc1-dd944557f55c\",\n        \"repo_name\": \"external-dns\"\n      }\n    ],\n    \"pagination\": {\n      \"page\": ...",
+      "latency_seconds": 0.572
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/source.go",
+        "fromLine": 1,
+        "toLine": 220,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/source.go\nLines: 1 - 72 of 72\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITHOUT WARRAN...",
+      "latency_seconds": 1.619
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/istio_virtualservice.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/istio_virtualservice.go\nLines: 1 - 260 of 433\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2020 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an...",
+      "latency_seconds": 1.041
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/kong_tcpingress.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/kong_tcpingress.go\nLines: 1 - 260 of 400\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS ...",
+      "latency_seconds": 1.018
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/node.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/node.go\nLines: 1 - 235 of 235\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WITHOUT WARRAN...",
+      "latency_seconds": 1.637
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/openshift_route.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/openshift_route.go\nLines: 1 - 257 of 257\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n12 | WIT...",
+      "latency_seconds": 1.733
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/pod.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/pod.go\nLines: 1 - 260 of 330\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2021 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,\n1...",
+      "latency_seconds": 1.614
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/service.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/service.go\nLines: 1 - 260 of 936\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASI...",
+      "latency_seconds": 1.995
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/store.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/store.go\nLines: 1 - 260 of 665\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2017 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS\" BASIS,...",
+      "latency_seconds": 2.063
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "relativePaths": [],
+        "relativePath": "source/traefik_proxy.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# source/traefik_proxy.go\nLines: 1 - 260 of 893\nMore: fromLine=261\n\n1 | /*\n2 | Copyright 2022 The Kubernetes Authors.\n3 | \n4 | Licensed under the Apache License, Version 2.0 (the \"License\");\n5 | you may not use this file except in compliance with the License.\n6 | You may obtain a copy of the License at\n7 | \n8 |     http://www.apache.org/licenses/LICENSE-2.0\n9 | \n10 | Unless required by applicable law or agreed to in writing, software\n11 | distributed under the License is distributed on an \"AS IS...",
+      "latency_seconds": 2.042
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "d49f3ae3-415a-4215-8471-eedd5ad1829b",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/action/list.go\",\n        \"purpose\": \"Implements the 'helm list' command by listing Helm releases with filtering, sorting, and pagination support. It manages release state masks, selector-based filtering, and version-aware deduplication to return a curated list of releases matching user-specified criteria.\",\n        \"knowledge_id\": \"d49f3ae3-415a-4215-8471-eedd5ad1829b\",\n        \"repo_name\": \"helm\"\n      },\n      {\n        \"path\": \"pkg/c...",
+      "latency_seconds": 0.437
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"applicationset/generators/generator_spec_processor.go\",\n        \"purpose\": \"Transforms ApplicationSet generator specifications into parameter sets and templates, enabling dynamic application generation by processing generator configurations, applying selectors, and interpolating parameters for multi-generator scenarios.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        ...",
+      "latency_seconds": 0.432
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "f9267125-4d0d-4ca5-9dc1-dd944557f55c",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/externaldns/types.go\",\n        \"purpose\": \"pkg/apis/externaldns/types.go#chunk0: To define the comprehensive configuration structure and default values for the external-dns application, enabling command-line flag parsing and provider-specific settings.\\npkg/apis/externaldns/types.go#chunk1: To register and configure all command-line flags for the external-dns application, mapping them to the configuration struct for runtime use.\\np...",
+      "latency_seconds": 0.778
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "labels",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e1f53b33-e250-41ec-8793-1fb6ad99g3t9",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"internal/ingress/controller/controller.go\",\n        \"purpose\": \"Core controller logic for Kubernetes NGINX Ingress Controller; manages ingress rule parsing, configuration generation, dynamic backend reloading, and admission webhook validation. Acts as the central orchestrator between Kubernetes API objects and NGINX configuration generation.\\nThis file implements the core logic of the NGINX Ingress controller: it translates Kubernetes Ingre...",
+      "latency_seconds": 0.434
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "pkg/client/listers/application/v1alpha1/application.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/client/listers/application/v1alpha1/application.go\nLines: 1 - 55 of 55\n\n1 | // Code generated by lister-gen. DO NOT EDIT.\n2 | \n3 | package v1alpha1\n4 | \n5 | import (\n6 | \tapplicationv1alpha1 \"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n7 | \tlabels \"k8s.io/apimachinery/pkg/labels\"\n8 | \tlisters \"k8s.io/client-go/listers\"\n9 | \tcache \"k8s.io/client-go/tools/cache\"\n10 | )\n11 | \n12 | // ApplicationLister helps list Applications.\n13 | // All objects returned here must be treated...",
+      "latency_seconds": 1.782
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "pkg/client/listers/application/v1alpha1/applicationset.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/client/listers/application/v1alpha1/applicationset.go\nLines: 1 - 55 of 55\n\n1 | // Code generated by lister-gen. DO NOT EDIT.\n2 | \n3 | package v1alpha1\n4 | \n5 | import (\n6 | \tapplicationv1alpha1 \"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n7 | \tlabels \"k8s.io/apimachinery/pkg/labels\"\n8 | \tlisters \"k8s.io/client-go/listers\"\n9 | \tcache \"k8s.io/client-go/tools/cache\"\n10 | )\n11 | \n12 | // ApplicationSetLister helps list ApplicationSets.\n13 | // All objects returned here must b...",
+      "latency_seconds": 0.831
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "pkg/client/listers/application/v1alpha1/appproject.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# pkg/client/listers/application/v1alpha1/appproject.go\nLines: 1 - 55 of 55\n\n1 | // Code generated by lister-gen. DO NOT EDIT.\n2 | \n3 | package v1alpha1\n4 | \n5 | import (\n6 | \tapplicationv1alpha1 \"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n7 | \tlabels \"k8s.io/apimachinery/pkg/labels\"\n8 | \tlisters \"k8s.io/client-go/listers\"\n9 | \tcache \"k8s.io/client-go/tools/cache\"\n10 | )\n11 | \n12 | // AppProjectLister helps list AppProjects.\n13 | // All objects returned here must be treated as...",
+      "latency_seconds": 0.822
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "applicationset/utils/applicationset_lister.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# applicationset/utils/applicationset_lister.go\nLines: 1 - 64 of 64\n\n1 | package utils\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \n6 | \t\"k8s.io/apimachinery/pkg/labels\"\n7 | \tctrlclient \"sigs.k8s.io/controller-runtime/pkg/client\"\n8 | \n9 | \t\"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n10 | \tlisters \"github.com/argoproj/argo-cd/v3/pkg/client/listers/application/v1alpha1\"\n11 | )\n12 | \n13 | // Implements AppsetLister interface with controller-runtime client\n14 | type AppsetLister struct {...",
+      "latency_seconds": 1.731
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "applicationset/generators/generator_spec_processor.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# applicationset/generators/generator_spec_processor.go\nLines: 1 - 162 of 162\n\n1 | package generators\n2 | \n3 | import (\n4 | \t\"fmt\"\n5 | \t\"reflect\"\n6 | \n7 | \t\"github.com/jeremywohl/flatten\"\n8 | \t\"sigs.k8s.io/controller-runtime/pkg/client\"\n9 | \n10 | \t\"github.com/argoproj/argo-cd/v3/applicationset/utils\"\n11 | \n12 | \t\"k8s.io/apimachinery/pkg/labels\"\n13 | \n14 | \targoprojiov1alpha1 \"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n15 | \n16 | \t\"dario.cat/mergo\"\n17 | \tlog \"github.com/sirupse...",
+      "latency_seconds": 1.586
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "applicationset/metrics/metrics.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# applicationset/metrics/metrics.go\nLines: 1 - 136 of 136\n\n1 | package metrics\n2 | \n3 | import (\n4 | \t\"time\"\n5 | \n6 | \t\"github.com/prometheus/client_golang/prometheus\"\n7 | \t\"k8s.io/apimachinery/pkg/labels\"\n8 | \t\"sigs.k8s.io/controller-runtime/pkg/metrics\"\n9 | \n10 | \targoappv1 \"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1\"\n11 | \tapplisters \"github.com/argoproj/argo-cd/v3/pkg/client/listers/application/v1alpha1\"\n12 | \tmetricsutil \"github.com/argoproj/argo-cd/v3/util/metrics\"\n13 | \t...",
+      "latency_seconds": 1.627
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "applicationset/utils/createOrUpdate.go",
+        "fromLine": 1,
+        "toLine": 260,
+        "maxTokens": 12000
+      },
+      "result_preview": "# applicationset/utils/createOrUpdate.go\nLines: 1 - 204 of 204\n\n1 | package utils\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"encoding/json\"\n6 | \tstderrors \"errors\"\n7 | \t\"fmt\"\n8 | \n9 | \tlog \"github.com/sirupsen/logrus\"\n10 | \t\"k8s.io/apimachinery/pkg/api/errors\"\n11 | \t\"k8s.io/apimachinery/pkg/api/resource\"\n12 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n13 | \t\"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured\"\n14 | \t\"k8s.io/apimachinery/pkg/conversion\"\n15 | \t\"k8s.io/apimachinery/pkg/fields\"\n16 | \t...",
+      "latency_seconds": 1.592
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "controller/clusterinfoupdater.go",
+        "fromLine": 1,
+        "toLine": 280,
+        "maxTokens": 12000
+      },
+      "result_preview": "# controller/clusterinfoupdater.go\nLines: 1 - 182 of 182\n\n1 | package controller\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"fmt\"\n6 | \t\"time\"\n7 | \n8 | \t\"github.com/argoproj/argo-cd/v3/common\"\n9 | \n10 | \t\"github.com/argoproj/gitops-engine/pkg/cache\"\n11 | \t\"github.com/argoproj/gitops-engine/pkg/utils/kube\"\n12 | \tlog \"github.com/sirupsen/logrus\"\n13 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n14 | \t\"k8s.io/apimachinery/pkg/labels\"\n15 | \n16 | \t\"github.com/argoproj/argo-cd/v3/util/env\"\n17 | \n18 | \t\"gi...",
+      "latency_seconds": 1.628
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "controller/metrics/metrics.go",
+        "fromLine": 1,
+        "toLine": 280,
+        "maxTokens": 12000
+      },
+      "result_preview": "# controller/metrics/metrics.go\nLines: 1 - 280 of 475\nMore: fromLine=281\n\n1 | package metrics\n2 | \n3 | import (\n4 | \t\"context\"\n5 | \t\"errors\"\n6 | \t\"fmt\"\n7 | \t\"net/http\"\n8 | \t\"os\"\n9 | \t\"slices\"\n10 | \t\"strconv\"\n11 | \t\"time\"\n12 | \n13 | \t\"github.com/argoproj/gitops-engine/pkg/health\"\n14 | \t\"github.com/prometheus/client_golang/prometheus\"\n15 | \t\"github.com/prometheus/client_golang/prometheus/promhttp\"\n16 | \t\"github.com/robfig/cron/v3\"\n17 | \tlog \"github.com/sirupsen/logrus\"\n18 | \t\"k8s.io/apimachinery/p...",
+      "latency_seconds": 0.698
+    }
+  ],
+  "error": ""
+}

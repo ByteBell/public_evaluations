@@ -1,0 +1,342 @@
+{
+  "model": "google/gemini-3.1-pro-preview",
+  "answer": "### 1. Architecture Overview & Impact Analysis\n\nIn Kubernetes, `metav1.ObjectMeta` is embedded into **every single resource type** (Pods, Secrets, Deployments, Custom Resources, etc.). Currently, the `Labels` field is defined as a standard Go map: `Labels map[string]string`. \n\nIf `Labels` is changed to a new named type `LabelMap` that requires accessor methods (e.g., `GetLabels()`, `SetLabel(k, v)`), it introduces a massive breaking change across the entire cloud-native ecosystem. \n\nSpecifically, the following common Go patterns will immediately cause compilation failures:\n1. **Direct Map Assignment:** `obj.Labels = map[string]string{\"app\": \"foo\"}`\n2. **Map Indexing:** `obj.Labels[\"key\"] = \"value\"` or `val := obj.Labels[\"key\"]`\n3. **Map Built-ins:** `len(obj.Labels)` or `delete(obj.Labels, \"key\")`\n4. **Iteration:** `for k, v := range obj.Labels`\n5. **Type Passing:** Passing `obj.Labels` to any function expecting a `map[string]string`.\n\nBecause all six of these projects are Kubernetes-native controllers, operators, or discovery agents, they constantly read, merge, and mutate Kubernetes resource labels. **Hundreds of files will break.** Below is a detailed analysis of the critical subsystems and specific files in each repository that would be impacted.\n\n---\n\n### 2. Detailed Analysis by Repository\n\n#### **ArgoCD**\nArgoCD relies heavily on labels to track which resources belong to which Application (Resource Tracking) and to generate resources dynamically via ApplicationSets.\n*   **Resource Tracking:** ArgoCD injects tracking labels (e.g., `app.kubernetes.io/instance`) into live manifests. Code that merges these labels into `unstructured.Unstructured` or typed objects will break.\n*   **ApplicationSets:** The controllers that stamp out `Application` CRDs from templates directly assign maps to the `Labels` field of the generated objects.\n\n#### **cert-manager**\ncert-manager creates temporary Kubernetes resources (Pods, Services, Ingresses) to solve ACME challenges (like HTTP-01). It also relies heavily on generated client code (`applyconfigurations`).\n*   **ACME Challenge Solvers:** When creating the solver Pods and Services, cert-manager directly assigns label maps to link the solver resources back to the Challenge CRD.\n*   **Client-Gen Code:** Kubernetes `client-gen` generates Apply Configuration structs that expose `Labels map[string]string`. All of these generated files would become invalid and require upstream generator updates.\n\n#### **External Secrets Operator**\nESO reads external APIs and creates Kubernetes `Secret` objects. It needs to merge labels from the `ExternalSecret` CRD down to the generated `Secret`.\n*   **Metadata Merging:** ESO has specific logic to handle label and annotation merging policies (e.g., `Merge`, `Ignore`) when pushing or syncing secrets.\n*   **Templating:** ESO allows users to define Go templates that dynamically generate labels for the target secrets.\n\n#### **Prometheus**\nPrometheus uses Kubernetes Service Discovery (SD) to find scrape targets. It reads the labels of Kubernetes objects (Pods, Nodes, Endpoints) and translates them into Prometheus model labels (e.g., `__meta_kubernetes_pod_label_<labelname>`).\n*   **Kubernetes SD:** The discovery engine iterates over `pod.Labels` and `svc.Labels` using `for k, v := range` to build the target metadata.\n*   **Label Processing:** Prometheus has extensive internal libraries for deduplicating, slicing, and formatting labels that expect standard Go maps or slices.\n\n#### **Loki**\nLoki's ecosystem includes the Loki Operator (which deploys Loki components) and Promtail (which discovers targets).\n*   **Loki Operator:** The operator generates manifests for Loki's microservices (Gateway, Distributor, Querier, Table Manager). Every manifest generation function initializes `ObjectMeta.Labels` with a map.\n*   **Promtail:** Similar to Prometheus, Promtail's Kubernetes discovery reads pod labels to attach metadata to log streams.\n\n#### **OpenTelemetry Operator**\nThe OTel Operator injects sidecars and deploys OpenTelemetry Collectors. It must label these resources so they can be managed and monitored.\n*   **Manifest Generation:** The operator has a dedicated `manifestutils` package that constructs the standard labels (name, instance, version) as a `map[string]string` and assigns them to Deployments, DaemonSets, and Services.\n*   **Target Allocator:** The allocator discovers Prometheus targets and processes their labels for sharding.\n\n---\n\n### 3. Relevant Files\n\nHere is a targeted list of the most critical files across all six repositories that would break due to this change. *(Note: This is a representative list of the core breaking points; generated clients and test files would also break en masse).*\n\n| Repo | File Path | Why it breaks |\n|------|-----------|---------------|\n| **argo-cd** | `util/argo/resource_tracking.go` | Iterates and assigns labels to track Kubernetes resources back to their parent ArgoCD Application. |\n| **argo-cd** | `util/kube/kube.go` | Validates and mutates `ObjectMeta.Labels` to ensure compliance with Kubernetes naming conventions. |\n| **argo-cd** | `applicationset/controllers/applicationset_controller.go` | Directly assigns label maps when generating new `Application` CRDs from ApplicationSet templates. |\n| **argo-cd** | `cmd/util/app.go` | Constructs application sources and assigns CLI-provided labels to the `Application` object. |\n| **cert-manager** | `pkg/issuer/acme/http/pod.go` | Creates HTTP-01 challenge solver Pods and directly assigns `pod.Labels = map[string]string{...}`. |\n| **cert-manager** | `pkg/issuer/acme/http/service.go` | Creates HTTP-01 challenge solver Services and assigns routing labels. |\n| **cert-manager** | `pkg/controller/acmeorders/selectors/labels.go` | Performs map lookups and iterations on `ObjectMeta.Labels` to match ACME orders to certificates. |\n| **cert-manager** | `pkg/client/applyconfigurations/acme/v1/acmechallengesolverhttp01ingresspodobjectmeta.go` | Generated client code that explicitly types `Labels` as `map[string]string`. |\n| **external-secrets** | `providers/v1/kubernetes/metadata.go` | Contains the core logic for merging `map[string]string` labels from `ExternalSecret` CRDs to target Kubernetes Secrets. |\n| **external-secrets** | `runtime/template/v2/template.go` | Executes Go templates that dynamically construct and assign label maps to generated secrets. |\n| **external-secrets** | `pkg/controllers/metrics/labels.go` | Reads resource labels to attach them as Prometheus metric dimensions. |\n| **prometheus** | `discovery/kubernetes/pod.go` | Iterates over `pod.Labels` (`for k, v := range pod.Labels`) to generate `__meta_kubernetes_pod_label_*` discovery metadata. |\n| **prometheus** | `model/labels/labels_dedupelabels.go` | Internal label processing utilities that expect standard Go map/slice semantics. |\n| **prometheus** | `schema/labels.go` | Handles the translation of Kubernetes labels into Prometheus TSDB schema labels. |\n| **loki** | `operator/internal/manifests/gateway.go` | Generates the Loki Gateway Deployment/Service and assigns standard component labels via map literals. |\n| **loki** | `operator/internal/manifests/distributor.go` | Generates the Loki Distributor manifests and assigns `ObjectMeta.Labels`. |\n| **loki** | `operator/internal/handlers/internal/rules/secrets.go` | Creates Kubernetes Secrets for alerting rules and assigns labels for the ruler to discover them. |\n| **opentelemetry-operator** | `internal/manifests/manifestutils/labels.go` | Centralized utility that returns `map[string]string` for standard OTel labels, which are then assigned to `ObjectMeta.Labels`. |\n| **opentelemetry-operator** | `internal/manifests/collector/deployment.go` | Creates the Collector Deployment and assigns the map returned by `manifestutils.Labels()`. |\n| **opentelemetry-operator** | `internal/manifests/collector/service.go` | Creates the Collector Service and assigns label maps for selector routing. |\n| **opentelemetry-operator** | `cmd/otel-allocator/internal/target/target.go` | Reads and mutates target labels during the Prometheus scrape target allocation phase. |",
+  "llm_condensed_answer": "SUMMARY: Changing the ObjectMeta.Labels field from map[string]string to a new named type would break compilation across all six Kubernetes-native projects. This change would invalidate common Go patterns like direct map assignment, indexing, iteration, and built-in functions used to read and mutate labels. The impact is widespread because these projects constantly generate, merge, and process labels for resource tracking, service discovery, and manifest generation.\n\nFILES:\n- argo-cd/util/argo/resource_tracking.go \u2014 Iterates and assigns labels to track resources back to ArgoCD Applications.\n- argo-cd/util/kube/kube.go \u2014 Validates and mutates ObjectMeta.Labels for Kubernetes naming compliance.\n- argo-cd/applicationset/controllers/applicationset_controller.go \u2014 Directly assigns label maps when generating Application CRDs from templates.\n- argo-cd/cmd/util/app.go \u2014 Constructs application sources and assigns CLI-provided labels to Application objects.\n- cert-manager/pkg/issuer/acme/http/pod.go \u2014 Creates HTTP-01 challenge solver Pods and directly assigns label maps.\n- cert-manager/pkg/issuer/acme/http/service.go \u2014 Creates HTTP-01 challenge solver Services and assigns routing labels.\n- cert-manager/pkg/controller/acmeorders/selectors/labels.go \u2014 Performs map lookups and iterations on ObjectMeta.Labels to match ACME orders.\n- cert-manager/pkg/client/applyconfigurations/acme/v1/acmechallengesolverhttp01ingresspodobjectmeta.go \u2014 Generated client code that types Labels as map[string]string.\n- external-secrets/providers/v1/kubernetes/metadata.go \u2014 Contains core logic for merging map[string]string labels from ExternalSecret CRDs to target Secrets.\n- external-secrets/runtime/template/v2/template.go \u2014 Executes Go templates that dynamically construct and assign label maps to generated secrets.\n- external-secrets/pkg/controllers/metrics/labels.go \u2014 Reads resource labels to attach them as Prometheus metric dimensions.\n- prometheus/discovery/kubernetes/pod.go \u2014 Iterates over pod.Labels to generate __meta_kubernetes_pod_label_* discovery metadata.\n- prometheus/model/labels/labels_dedupelabels.go \u2014 Internal label processing utilities expecting standard Go map/slice semantics.\n- prometheus/schema/labels.go \u2014 Handles translation of Kubernetes labels into Prometheus TSDB schema labels.\n- loki/operator/internal/manifests/gateway.go \u2014 Generates Loki Gateway manifests and assigns standard component labels via map literals.\n- loki/operator/internal/manifests/distributor.go \u2014 Generates Loki Distributor manifests and assigns ObjectMeta.Labels.\n- loki/operator/internal/handlers/internal/rules/secrets.go \u2014 Creates Kubernetes Secrets for alerting rules and assigns labels for the ruler.\n- opentelemetry-operator/internal/manifests/manifestutils/labels.go \u2014 Centralized utility returning map[string]string for standard OTel labels.\n- opentelemetry-operator/internal/manifests/collector/deployment.go \u2014 Creates Collector Deployment and assigns the map returned by manifestutils.Labels().\n- opentelemetry-operator/internal/manifests/collector/service.go \u2014 Creates Collector Service and assigns label maps for selector routing.\n- opentelemetry-operator/cmd/otel-allocator/internal/target/target.go \u2014 Reads and mutates target labels during Prometheus scrape target allocation.",
+  "cost": {
+    "input_tokens": 574072,
+    "output_tokens": 10241,
+    "total_tokens": 584313,
+    "cost_usd": 1.271036
+  },
+  "status": "success",
+  "latency_seconds": 199.11,
+  "tool_calls_count": 22,
+  "agent_steps": 13,
+  "tool_calls": [
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": ".Labels",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e"
+      },
+      "result_preview": "{\n  \"query\": \".Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 22,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"resource_customizations/numaflow.numaproj.io/InterStepBufferService/actions/force-promote/action.lua\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.55,\n      \"matched_channels\":...",
+      "latency_seconds": 1.462
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": ".Labels",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28"
+      },
+      "result_preview": "{\n  \"query\": \".Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 8,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/util/solverpicker/solverpicker.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.3,\n      \"matched_channels\": [\n        \"keywords\",\n        \"semantic\"\n      ]\n    }...",
+      "latency_seconds": 1.576
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": ".Labels",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456"
+      },
+      "result_preview": "{\n  \"query\": \".Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.546
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "query": ".Labels",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ]
+      },
+      "result_preview": "{\n  \"query\": \".Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 22,\n  \"repos_matched\": [\n    \"prometheus\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"model/labels/labels_slicelabels.go\",\n      \"repo_name\": \"prometheus\",\n      \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"keywords\"\n      ]\n    },\n   ...",
+      "latency_seconds": 1.563
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": ".Labels",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd"
+      },
+      "result_preview": "{\n  \"query\": \".Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 117,\n  \"repos_matched\": [\n    \"loki\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/util/flagext/labelset.go\",\n      \"repo_name\": \"loki\",\n      \"knowledge_id\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"purpose\",\n        \"keywords\",\n        \"semantic\"\n      ]\n    },\n  ...",
+      "latency_seconds": 1.573
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": ".Labels"
+      },
+      "result_preview": "{\n  \"query\": \".Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 14,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"internal/manifests/collector/networkpolicy.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0.3,\n      \"matched_channels\": [\n        \"keywords\",\n   ...",
+      "latency_seconds": 1.701
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "query": "Labels",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "channels": [
+          "keywords",
+          "semantic"
+        ]
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"deploy/charts/external-secrets/templates/serviceaccount.yaml\",\n        \"purpose\": \"This file defines a Kubernetes ServiceAccount resource for the external-secrets controller. It conditionally creates the ServiceAccount based on Helm chart values, allowing customization of labels and annotations for integration with Kubernetes RBAC and other cluster components.\",\n        \"knowledge_id\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n        \"repo_...",
+      "latency_seconds": 0.83
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "query": ".Labels["
+      },
+      "result_preview": "{\n  \"query\": \".Labels[\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.117
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "query": ".Labels["
+      },
+      "result_preview": "{\n  \"query\": \".Labels[\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.1
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "query": ".Labels[",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ]
+      },
+      "result_preview": "{\n  \"query\": \".Labels[\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.11
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "query": ".Labels["
+      },
+      "result_preview": "{\n  \"query\": \".Labels[\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.096
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "query": ".Labels["
+      },
+      "result_preview": "{\n  \"query\": \".Labels[\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.097
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "query": ".Labels["
+      },
+      "result_preview": "{\n  \"query\": \".Labels[\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.107
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "channels": [
+          "imports"
+        ],
+        "query": "k8s.io/apimachinery/pkg/apis/meta/v1",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e"
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/apimachinery/pkg/apis/meta/v1\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.423
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "channels": [
+          "imports"
+        ],
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": "metav1"
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [\n      {\n        \"path\": \"applicationset/controllers/applicationset_controller.go\",\n        \"purpose\": \"This file implements the core reconciliation logic for Argo CD ApplicationSet resources. It watches ApplicationSet custom resources, generates desired Applications via pluggable generators, validates and syncs them to the cluster, handles deletion with progressive sync strategies (including reverse deletion), and maintains status conditions. It serves as the main ...",
+      "latency_seconds": 0.631
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "channels": [
+          "functions"
+        ],
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": "Labels"
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"applicationset/services/pull_request/gitea.go\",\n        \"purpose\": \"Implements a Gitea-specific pull request service that fetches open PRs from a Gitea repository, filtering by labels. It satisfies the PullRequestService interface and handles authentication, TLS configuration, and label-based filtering.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        \"path\": \"applic...",
+      "latency_seconds": 0.472
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "Labels",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28"
+      },
+      "result_preview": "{\n  \"query\": \"Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 220,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/controller/acmeorders/selectors/labels.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.9,\n      \"matched_channels\": [\n        \"purpose\",\n        \"classes\",\n     ...",
+      "latency_seconds": 1.154
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": "Labels"
+      },
+      "result_preview": "{\n  \"query\": \"Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 213,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"internal/manifests/manifestutils/labels.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0.9,\n      \"matched_channels\": [\n        \"purpose\",\n       ...",
+      "latency_seconds": 1.121
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "Labels",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ]
+      },
+      "result_preview": "{\n  \"query\": \"Labels\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 513,\n  \"repos_matched\": [\n    \"prometheus\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"schema/labels.go\",\n      \"repo_name\": \"prometheus\",\n      \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n      \"score\": 1.075,\n      \"matched_channels\": [\n        \"purpose\",\n        \"classes\",\n        \"functions\",\n        \"import...",
+      "latency_seconds": 0.886
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "channels": [
+          "paths"
+        ],
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": "discovery/kubernetes/pod.go",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f"
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [\n      {\n        \"path\": \"discovery/kubernetes/pod.go\",\n        \"purpose\": \"Provides a Prometheus discovery component that watches Kubernetes Pods (and optionally Nodes and Namespaces) via informers, processes events, and emits target groups with enriched labels for monitoring.\",\n        \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n        \"repo_name\": \"prometheus\"\n      }\n    ],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\":...",
+      "latency_seconds": 0.711
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "query": "discovery/kubernetes"
+      },
+      "result_preview": "{\n  \"query\": \"discovery/kubernetes\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.847
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "knowledgeId": "318cc2a0-5cf1-43bd-b606-1b77f6e724cd",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "query": "kubernetes"
+      },
+      "result_preview": "{\n  \"query\": \"kubernetes\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 331,\n  \"repos_matched\": [\n    \"loki\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"operator/api/loki/v1/alertingrule_types.go\",\n      \"repo_name\": \"loki\",\n      \"knowledge_id\": \"318cc2a0-5cf1-43bd-b606-1b77f6e724cd\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"purpose\",\n        \"classes\",\n        \"functions\"\n...",
+      "latency_seconds": 1.746
+    }
+  ],
+  "error": ""
+}

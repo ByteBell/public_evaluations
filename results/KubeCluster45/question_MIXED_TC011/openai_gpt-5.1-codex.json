@@ -1,0 +1,483 @@
+{
+  "model": "openai/gpt-5.1-codex",
+  "answer": "### 1. Architecture Overview\nThe new `TransactionStore` and `QueueWithBatch` interfaces sit underneath practically every controller loop that relies on client-go\u2019s informer/store/queue stack. Controllers register a `cache.SharedIndexInformer` to watch specific Kubernetes resources, which fills an internal `cache.Store`/`cache.Indexer` while enqueuing reconcile keys into a `cache.Queue` or `cache.FIFO`. Downstream processors drain those queues to reconcile objects.  \nWithin the audited codebases, we see this pattern:\n\n- **Argo CD** builds filtered informers over Secrets/ConfigMaps for notification settings, delegating to `cache.SharedIndexInformer` constructors from client-go (`informersv1.NewFilteredSecretInformer` / `NewFilteredConfigMapInformer`) and using the shared indexer/queue infrastructure for event delivery and resyncs.[^argo-informers]\n- **cert-manager** wraps client-go informers with bespoke factories. `internal/informers/core_filteredsecrets.go` creates dual caches (typed + metadata-only) built on top of client-go `cache.SharedIndexInformer`s, providing custom list/get semantics while still delegating to the underlying store/indexer, while `core_basic.go` exposes unmodified upstream informers.[^cm-filtered][^cm-basic]\n- **Cilium** exposes a typed `Store` interface backed directly by `cache.Store`/`cache.Indexer`, so every consumer of `pkg/k8s/resource.Store[T]` ultimately depends on the new transactional store semantics in client-go.[^cilium-store]\n\nBecause the new feature hooks into `cache.Store` and `cache.Queue` semantics, each of these files will start seeing transactional/batch behavior once the `InOrderInformersBatchProcess` gate is enabled.\n\n### 2. Detailed Analysis\n\n#### Argo CD (`argo-cd.git`)\n- **`util/notification/k8s/informers.go`**  \n  Defines `NewSecretInformer` and `NewConfigMapInformer` helpers that return `cache.SharedIndexInformer` instances created via `informersv1.NewFilteredSecretInformer` / `NewFilteredConfigMapInformer`. These informers inherit client-go\u2019s FIFO queue and store behavior under the hood, so any transactional changes to cache locking/queue popping will affect Argo\u2019s notification settings watchers.[^argo-informers]\n\n- **`pkg/client/informers/externalversions/factory.go`** (metadata)  \n  Implements Argo CD\u2019s informer factory, managing `SharedIndexInformer` lifecycles, mutexes, and caching logic for every CRD Argo manages. Because it centralizes informer creation, the transactional store/queue changes will propagate through this factory to all generated informers (Applications, ApplicationSets, etc.).[^argo-factory-meta]\n\n#### cert-manager (`cert-manager.git`)\n- **`internal/informers/core_filteredsecrets.go`**  \n  Builds a filtered secret informer factory. It constructs both typed and metadata `cache.SharedIndexInformer`s, registers combined event handlers, and wraps the lister to mix data from client-go\u2019s caches and live API calls. The `filteredSecretInformer` exposes `Informer()` and `Lister()` built entirely on top of client-go cache primitives, so transactional semantics on `cache.Store`/`cache.Indexer` directly affect how cert-manager batches secret updates and keeps caches coherent.[^cm-filtered]\n\n- **`internal/informers/core_basic.go`**  \n  Provides a simpler `baseFactory`/`baseSecretInformer` that directly returns the upstream `cache.SharedIndexInformer` and `cache.SharedInformerFactory` for Secrets, Ingresses, and CSRs. Because it is a thin adapter, any change to client-go\u2019s store or queue behavior immediately impacts these controllers\u2019 reconciliation cadence and batching.[^cm-basic]\n\n#### Cilium (`cilium.git`)\n- **`pkg/k8s/resource/store.go`**  \n  Implements a generic `Store[T]` wrapper around `cache.Store` and `cache.Indexer`. Methods such as `List`, `Get/ GetByKey`, `IndexKeys`, `ByIndex`, and `CacheStore()` delegate straight to the underlying client-go store, exposing it to the rest of the agent. This means the new `TransactionStore` semantics will surface through `typedStore`\u2019s methods, and any components using `Store[T]` will run inside the new transaction boundary when the feature gate is on.[^cilium-store]\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| argo-cd | util/notification/k8s/informers.go | Creates filtered `cache.SharedIndexInformer`s for Secrets/ConfigMaps via client-go helpers, so it directly consumes the informer/store/queue stack affected by the new transactional interfaces.[^argo-informers] |\n| argo-cd | pkg/client/informers/externalversions/factory.go | Central informer factory (per metadata) that instantiates and manages all `SharedIndexInformer`s used by Argo CD; any feature-gated transactional behavior flows through here.[^argo-factory-meta] |\n| cert-manager | internal/informers/core_filteredsecrets.go | Wraps client-go `SharedIndexInformer`s for Secrets with dual caches and custom listers, so its typed/meta caches depend on `cache.Store` semantics.[^cm-filtered] |\n| cert-manager | internal/informers/core_basic.go | Thin adapter exposing upstream `cache.SharedIndexInformer`s for Secrets/Ingresses/CSRs; inherits the transactional queue/store behavior directly.[^cm-basic] |\n| cilium | pkg/k8s/resource/store.go | Provides a typed wrapper over `cache.Store`/`cache.Indexer`, exposing `List`, `Get`, `ByIndex`, etc., so every consumer of this store participates in the new `TransactionStore` behavior.[^cilium-store] |\n\n---\n\n[^argo-informers]: `util/notification/k8s/informers.go`, lines\u202f16\u201124 (Argo CD).\n[^argo-factory-meta]: `pkg/client/informers/externalversions/factory.go` metadata summary (Argo CD).\n[^cm-filtered]: `internal/informers/core_filteredsecrets.go`, lines\u202f69\u2011340 (cert-manager).\n[^cm-basic]: `internal/informers/core_basic.go` metadata summary (cert-manager).\n[^cilium-store]: `pkg/k8s/resource/store.go`, lines\u202f12\u2011114 (Cilium).",
+  "llm_condensed_answer": "SUMMARY: Kubernetes client-go introduces TransactionStore and QueueWithBatch interfaces to enable transactional and batch processing within informer/store/queue stacks. These new interfaces extend existing cache.Store, cache.Queue, and cache.FIFO primitives used by virtually all Kubernetes controllers. The feature is gated behind InOrderInformersBatchProcess and will affect any code that wraps or uses these client-go interfaces.\n\nFILES:\n- argo-cd/util/notification/k8s/informers.go \u2014 Creates filtered cache.SharedIndexInformers for Secrets/ConfigMaps using client-go helpers, directly consuming the informer/store/queue stack affected by the new transactional interfaces.\n- argo-cd/pkg/client/informers/externalversions/factory.go \u2014 Central informer factory that instantiates and manages all SharedIndexInformers used by Argo CD, so transactional behavior flows through here.\n- cert-manager/internal/informers/core_filteredsecrets.go \u2014 Wraps client-go SharedIndexInformers for Secrets with dual caches and custom listers, depending on cache.Store semantics.\n- cert-manager/internal/informers/core_basic.go \u2014 Thin adapter exposing upstream cache.SharedIndexInformers for Secrets/Ingresses/CSRs, inheriting transactional queue/store behavior directly.\n- cilium/pkg/k8s/resource/store.go \u2014 Provides a typed wrapper over cache.Store/cache.Indexer, exposing List, Get, ByIndex, etc., so every consumer participates in the new TransactionStore behavior.",
+  "cost": {
+    "input_tokens": 990734,
+    "output_tokens": 8322,
+    "total_tokens": 999056,
+    "cost_usd": 1.321638
+  },
+  "status": "success",
+  "latency_seconds": 150.8,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "list_knowledge",
+      "arguments": {
+        "page": 1
+      },
+      "result_preview": "{\"knowledgeBases\":[{\"knowledgeId\":\"0bf65098-3076-481c-940a-c65298663392\",\"name\":\"kustomize.git\",\"keyPatterns\":[\"Declarative Configuration (Kustomization Schema)\",\"Filter-Based Pipeline (Reader-Filter-Writer)\",\"Plugin Architecture (Built-in, Exec, KRM Function)\",\"Base/Overlay Composition with Component Reuse\",\"Resource Identity Management (ResId/GVKN)\",\"Event Sourcing / Provenance Tracking\",\"Static Site Generation (Hugo + Docsy)\",\"Golden File Testing\",\"Semantic Versioning & Monorepo Release Engin...",
+      "latency_seconds": 0.721
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.Store",
+        "knowledgeId": "",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"cache.Store\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 52,\n  \"repos_matched\": [\n    \"cilium\",\n    \"opentelemetry-collector-contrib\",\n    \"kubernetes\",\n    \"ingress-nginx\",\n    \"autoscaler\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/k8s/resource/store.go\",\n      \"repo_name\": \"cilium\",\n      \"knowledge_id\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n      \"score\": 0.9,\n   ...",
+      "latency_seconds": 1.254
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "cache.SharedInformer",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"cache.SharedInformer\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {...",
+      "latency_seconds": 0.432
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/client/informers/externalversions/factory.go\",\n        \"purpose\": \"Factory for creating shared Kubernetes informers for ArgoCD custom resources, managing lifecycle and caching of resource watchers across namespaces.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n        \"pu...",
+      "latency_seconds": 0.749
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "cache.Store",
+        "channels": [
+          "keywords",
+          "purpose",
+          "paths"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"cache.Store\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"p...",
+      "latency_seconds": 0.508
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "cache.Queue",
+        "channels": [
+          "purpose",
+          "keywords"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"cache.Queue\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  },\n  \"keywords\": {\n    \"data\": [],\n    \"pag...",
+      "latency_seconds": 0.447
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/client-go/tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/client-go/tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.617
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "tools/cache",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"tools/cache\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.907
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/client-go/tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/client-go/tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.426
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 21,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.625,\n      \"matched_channels\": [\n      ...",
+      "latency_seconds": 0.583
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [
+          "util/notification/k8s/informers.go",
+          "pkg/client/informers/externalversions/factory.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 2,
+        "maxTokens": 1000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n  \"files\": [\n    {\n      \"path\": \"util/notification/k8s/informers.go\",\n      \"purpose\": \"Provides Kubernetes informer factories for watching specific Secret and ConfigMap resources within a namespace. Enables efficient, event-driven reconciliation by filtering on resource name and using shared informer infrastructure with configurable resync duration.\",\n      \"summary\": \"{\\\"Filtered Informer Pattern (~L16-26)\\\"...",
+      "latency_seconds": 0.404
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "relativePaths": [],
+        "relativePath": "util/notification/k8s/informers.go",
+        "fromLine": 1,
+        "toLine": 120,
+        "maxTokens": 2000
+      },
+      "result_preview": "# util/notification/k8s/informers.go\nLines: 1 - 27 of 27\n\n1 | package k8s\n2 | \n3 | import (\n4 | \t\"time\"\n5 | \n6 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n7 | \tinformersv1 \"k8s.io/client-go/informers/core/v1\"\n8 | \t\"k8s.io/client-go/kubernetes\"\n9 | \t\"k8s.io/client-go/tools/cache\"\n10 | )\n11 | \n12 | const (\n13 | \tsettingsResyncDuration = 3 * time.Minute\n14 | )\n15 | \n16 | func NewSecretInformer(clientset kubernetes.Interface, namespace string, secretName string) cache.SharedIndexInformer {\n17 |...",
+      "latency_seconds": 1.576
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "ResourceEventHandlerFuncs",
+        "channels": [
+          "keywords",
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"keywords\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 20,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[keywords] 0 results for \\\"ResourceEventHandlerFuncs\\\". OrgKeywords are indexed domain concepts. Try shorter, simpler terms (e.g. \\\"auth\\\" instead of \\\"authentication flow\\\"). Or try the purpose channel for natural-language queries.\"\n  },\n  \"purpose\": {\n    \"data\": [],\n    \"paginatio...",
+      "latency_seconds": 0.985
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "tools/cache",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"tools/cache\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.469
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 28,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.6,\n      \"matched_channels\": ...",
+      "latency_seconds": 0.496
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "internal/informers/core_filteredsecrets.go",
+          "internal/informers/core_basic.go",
+          "pkg/controller/certificaterequests/sync.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 2,
+        "maxTokens": 1000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"internal/informers/core_filteredsecrets.go\",\n      \"purpose\": \"This file implements a filtered Kubernetes Secret informer that separates cert-manager-labeled Secrets from unlabeled ones using dual caches (typed and metadata-only) to reduce memory usage. It enables efficient, label-aware Secret access while preserving compatibility with standard informer/lister interfaces.\",\n   ...",
+      "latency_seconds": 1.048
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [],
+        "relativePath": "internal/informers/core_filteredsecrets.go",
+        "fromLine": 48,
+        "toLine": 220,
+        "maxTokens": 4000
+      },
+      "result_preview": "# internal/informers/core_filteredsecrets.go\nLines: 48 - 220 of 341\nMore: fromLine=221\n\n48 | // This file contains all the functionality for implementing core informers with a filter for Secrets\n49 | // https://github.com/cert-manager/cert-manager/blob/master/design/20221205-memory-management.md\n50 | var (\n51 | \tisCertManageSecretLabelSelector     labels.Selector\n52 | \tisNotCertManagerSecretLabelSelector labels.Selector\n53 | )\n54 | \n55 | func init() {\n56 | \tr, err := labels.NewRequirement(cmapi....",
+      "latency_seconds": 1.717
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [],
+        "relativePath": "internal/informers/core_filteredsecrets.go",
+        "fromLine": 220,
+        "toLine": 340,
+        "maxTokens": 4000
+      },
+      "result_preview": "# internal/informers/core_filteredsecrets.go\nLines: 220 - 340 of 341\nMore: fromLine=341\n\n220 | func (sl *secretLister) Secrets(namespace string) corev1listers.SecretNamespaceLister {\n221 | \treturn &secretNamespaceLister{\n222 | \t\tnamespace:             namespace,\n223 | \t\tpartialMetadataLister: sl.partialMetadataLister,\n224 | \t\ttypedLister:           sl.typedLister,\n225 | \t\ttypedClient:           sl.typedClient,\n226 | \t\tctx:                   sl.ctx,\n227 | \t}\n228 | }\n229 | \n230 | var _ corev1liste...",
+      "latency_seconds": 1.025
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "NewFIFO",
+        "knowledgeId": "",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"NewFIFO\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 10,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"thanos\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/client-go/tools/cache/fifo.go\",\n      \"repo_name\": \"kubernetes\",\n      \"knowledge_id\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"...",
+      "latency_seconds": 0.595
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.Queue",
+        "knowledgeId": "",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"cache.Queue\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.505
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformerFactory",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformerFactory\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 17,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"classes\",\n        \"function...",
+      "latency_seconds": 0.475
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 86,\n  \"repos_matched\": [\n    \"cilium\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/k8s/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"cilium\",\n      \"knowledge_id\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n      \"score\": 0.9,\n      \"matched_channels\": [\n        \"purpose\",\n        \"classes\",\n   ...",
+      "latency_seconds": 0.463
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [
+          "pkg/k8s/resource/store.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 2,
+        "maxTokens": 1000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"ab057f46-1b78-43c7-84b3-bc98fd2c5101\",\n  \"files\": [\n    {\n      \"path\": \"pkg/k8s/resource/store.go\",\n      \"purpose\": \"Provides a generic, read\u00e2\u0080\u0091only wrapper around a Kubernetes cache.Store, exposing typed List, Get, Index and iteration methods for any k8s runtime object. Used by other Cilium components to safely access cached resources without type assertions.\",\n      \"summary\": \"{\\\"Design Pattern\\\":\\\"Adapter pattern wrapping generic cache.Store w...",
+      "latency_seconds": 0.38
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "relativePaths": [],
+        "relativePath": "pkg/k8s/resource/store.go",
+        "fromLine": 1,
+        "toLine": 160,
+        "maxTokens": 3000
+      },
+      "result_preview": "# pkg/k8s/resource/store.go\nLines: 1 - 114 of 114\n\n1 | // SPDX-License-Identifier: Apache-2.0\n2 | // Copyright Authors of Cilium\n3 | \n4 | package resource\n5 | \n6 | import (\n7 | \tcorev1 \"k8s.io/api/core/v1\"\n8 | \tk8sRuntime \"k8s.io/apimachinery/pkg/runtime\"\n9 | \t\"k8s.io/client-go/tools/cache\"\n10 | )\n11 | \n12 | // Store is a read-only typed wrapper for cache.Store.\n13 | type Store[T k8sRuntime.Object] interface {\n14 | \t// List returns all items currently in the store.\n15 | \tList() []T\n16 | \n17 | \t/...",
+      "latency_seconds": 0.72
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.NewIndexerInformer",
+        "knowledgeId": "ab057f46-1b78-43c7-84b3-bc98fd2c5101",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"cache.NewIndexerInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.453
+    }
+  ],
+  "error": ""
+}

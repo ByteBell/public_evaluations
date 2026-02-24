@@ -22,6 +22,93 @@ import requests
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+DATASET_DIR = BASE_DIR / "dataset" / "Kubecluster"
+
+# Known repo aliases → canonical directory name in dataset/Kubecluster/
+REPO_ALIASES = {
+    "argocd": "argo-cd", "argo-cd": "argo-cd", "argo_cd": "argo-cd",
+    "cert-manager": "cert-manager", "certmanager": "cert-manager",
+    "external-dns": "external-dns", "externaldns": "external-dns",
+    "external-secrets": "external-secrets", "externalsecrets": "external-secrets",
+    "ingress-nginx": "ingress-nginx", "ingressnginx": "ingress-nginx",
+    "opentelemetry-collector": "opentelemetry-collector",
+    "opentelemetry-collector-contrib": "opentelemetry-collector-contrib",
+    "opentelemetry-operator": "opentelemetry-operator",
+    "otel-collector": "opentelemetry-collector",
+    "otel-collector-contrib": "opentelemetry-collector-contrib",
+    "karpenter": "karpenter", "karpenter-provider-aws": "karpenter",
+    "loki-operator": "loki",
+}
+
+
+def _resolve_repo(repo_name: str) -> str:
+    """Resolve a repo name (or alias) to the canonical directory name."""
+    low = repo_name.lower().strip()
+    if low in REPO_ALIASES:
+        return REPO_ALIASES[low]
+    # Exact match against existing dirs
+    if (DATASET_DIR / low).is_dir():
+        return low
+    # Fallback: return as-is
+    return low
+
+
+def verify_file_paths(condensed_answer: str) -> dict:
+    """Extract file paths from a condensed answer and verify against the dataset.
+
+    Returns dict with keys: verified (list of existing paths),
+    hallucinated (list of non-existing paths), total.
+    """
+    verified = []
+    hallucinated = []
+
+    if not condensed_answer:
+        return {"verified": verified, "hallucinated": hallucinated, "total": 0}
+
+    # Parse "- repo/path/to/file — reason" lines from FILES: section
+    in_files = False
+    for line in condensed_answer.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("FILES:"):
+            in_files = True
+            continue
+        if not in_files:
+            continue
+        if not stripped.startswith("- "):
+            if stripped and not stripped.startswith("#"):
+                continue
+            continue
+
+        # Remove leading "- "
+        entry = stripped[2:].strip()
+        # Split on " — " or " - " to separate path from reason
+        for sep in [" — ", " – ", " - "]:
+            if sep in entry:
+                entry = entry.split(sep, 1)[0].strip()
+                break
+
+        # entry should now be like "repo/path/to/file.go"
+        if "/" not in entry:
+            continue
+
+        parts = entry.split("/", 1)
+        repo_raw = parts[0].strip()
+        file_path = parts[1].strip() if len(parts) > 1 else ""
+        if not file_path:
+            continue
+
+        repo = _resolve_repo(repo_raw)
+        full_path = DATASET_DIR / repo / file_path
+        if full_path.is_file():
+            verified.append(f"{repo}/{file_path}")
+        else:
+            hallucinated.append(f"{repo}/{file_path}")
+
+    return {
+        "verified": verified,
+        "hallucinated": hallucinated,
+        "total": len(verified) + len(hallucinated),
+    }
 
 
 # ─── Model answer loading ─────────────────────────────────────────────────────
@@ -111,18 +198,33 @@ def process_question_folder(folder_path: Path) -> dict | None:
 
 
 def _build_model_section(model_answer: dict) -> str:
-    """Build the prompt section for one model's condensed answer for the judge."""
+    """Build the prompt section for one model's condensed answer for the judge.
+
+    Includes filesystem verification: how many listed files actually exist
+    in dataset/Kubecluster/ and which ones are hallucinated (don't exist).
+    """
     model = model_answer["model"]
     tool_calls = model_answer.get("tool_calls_count", 0)
     # Use condensed answer if available, otherwise fall back to full answer
     answer = model_answer.get("llm_condensed_answer") or model_answer.get("answer", "").strip() or "(empty)"
 
+    # Verify file paths against the actual dataset
+    fv = verify_file_paths(answer)
+    n_verified = len(fv["verified"])
+    n_hallucinated = len(fv["hallucinated"])
+    n_total = fv["total"]
+
     lines = [
         f"--- {model} ---",
         f"Tool calls used: {tool_calls}",
-        "Answer:",
-        answer,
+        f"File paths verified against dataset: {n_verified}/{n_total} exist, {n_hallucinated} hallucinated",
     ]
+    if fv["hallucinated"]:
+        lines.append("Hallucinated paths (DO NOT EXIST on disk):")
+        for hp in fv["hallucinated"]:
+            lines.append(f"  ✗ {hp}")
+    lines.append("Answer:")
+    lines.append(answer)
 
     return "\n".join(lines)
 
@@ -228,18 +330,23 @@ def generate_comparative_analysis(
         "Score each model's answer INDEPENDENTLY as a percentage accuracy (0-100).\n"
         "Each model gets its own score — scores are NOT relative to each other.\n\n"
         "Weighted criteria:\n\n"
-        "1. FILE ACCURACY (60% of score):\n"
+        "1. GROUND TRUTH RECALL (50% of score):\n"
         "   - Compare each model's listed files against the GROUND TRUTH expected files\n"
         "   - What fraction of the ground truth files did the model find?\n"
         "   - Did the model identify the correct affected repositories and files?\n\n"
-        "2. REASONING QUALITY (30% of score):\n"
+        "2. EXTRA CORRECT FILES (20% of score — BONUS):\n"
+        "   - Each model section shows how many of its listed file paths were VERIFIED to exist on disk\n"
+        "   - Award points for extra files beyond the ground truth that actually exist and are relevant to the question\n"
+        "   - Test files, YAML configs, and other supplementary files count as correct if they exist and relate to the change\n"
+        "   - More verified extra files = higher bonus\n\n"
+        "3. REASONING QUALITY (20% of score):\n"
         "   - Did the model explain WHY each file is affected (interface implementation, dependency chain, data flow)?\n"
         "   - Did it describe what specifically needs to change in each file?\n"
         "   - Is the analysis thorough — covering architecture, cross-repo impact, and breaking changes?\n\n"
-        "3. PRECISION PENALTY (10% of score — deduct for errors):\n"
-        "   - Did the model list files/repos that are clearly NOT in the ground truth and irrelevant (hallucination)?\n"
-        "   - A concise, accurate answer is better than a verbose, unfocused one\n"
-        "   - Models that pad their answer with irrelevant files should score lower\n\n"
+        "4. HALLUCINATION PENALTY (10% of score — DEDUCT for errors):\n"
+        "   - Each model section lists which file paths are HALLUCINATED (do not exist on disk)\n"
+        "   - Deduct points proportional to the number of hallucinated paths\n"
+        "   - Zero hallucinated paths = full 10 points. Many hallucinated paths = 0 points\n\n"
         "IMPORTANT: Each score is an independent percentage (0-100). Multiple models CAN have the same score.\n"
         "A perfect answer = 100. A completely wrong answer = 0. Most answers fall between 20-80.\n"
         f"Models to score (use EXACTLY these names): {json.dumps(model_names)}\n\n"

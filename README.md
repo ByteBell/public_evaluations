@@ -117,13 +117,14 @@ This condensation happens in two places:
 
 ### Scoring Criteria
 
-The LLM judge (`judge_model` in `models.json`, currently `anthropic/claude-haiku-4.5`) scores each model using a **60/30/10** weighted criteria:
+The LLM judge (`judge_model` in `models.json`, currently `anthropic/claude-sonnet-4.6`) scores each model using a **50/20/20/10** weighted criteria. Before scoring, every file path in each model's answer is **verified against the actual filesystem** in `dataset/Kubecluster/` — the judge sees exactly which paths exist and which are hallucinated:
 
 | Weight | Criteria | What It Measures |
 |:------:|----------|------------------|
-| **60%** | File Accuracy | Did the model identify the correct affected repositories and files? Are the listed files actually relevant to the interface change? |
-| **30%** | Reasoning Quality | Did the model explain *why* each file is affected — interface implementation, dependency chain, data flow? Did it describe what specifically needs to change? |
-| **10%** | Precision Penalty | Did the model list clearly irrelevant files (hallucination)? Models that pad answers with irrelevant files score lower. |
+| **50%** | Ground Truth Recall | What fraction of the ground truth expected files did the model find? |
+| **20%** | Extra Correct Files | Bonus for listing additional files beyond ground truth that actually exist on disk and are relevant (test files, configs, etc. all count) |
+| **20%** | Reasoning Quality | Did the model explain *why* each file is affected — interface implementation, dependency chain, data flow? |
+| **10%** | Hallucination Penalty | Deduction for file paths that do not exist on disk. Zero hallucinated paths = full points. |
 
 Each model is scored **independently** as a percentage accuracy (0-100%). Scores are not normalized across models — multiple models can receive the same score.
 

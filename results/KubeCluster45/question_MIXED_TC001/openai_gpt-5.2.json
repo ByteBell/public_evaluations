@@ -1,0 +1,1073 @@
+{
+  "model": "openai/gpt-5.2",
+  "answer": "### 1. Architecture Overview\n\nAdding `WaitForCacheSync(ctx context.Context) bool` to `k8s.io/client-go/tools/cache.SharedInformer` is a **compile-time breaking change** for any code that **implements** `cache.SharedInformer` (or `cache.SharedIndexInformer`, which embeds `SharedInformer`). Most projects *consume* informers created by client-go (so they won\u2019t need changes), but **test fakes, mocks, and wrapper types** that satisfy these interfaces **must add the new method**.\n\nAcross the requested repos, the \u201cwatch/cache\u201d flows show up in two main shapes:\n\n1. **Generated informer factories** (Argo CD and cert-manager) that create/return `cache.SharedIndexInformer` instances (client-go implementation) and expose them through their own interfaces.\n2. **Hand-written Kubernetes discovery/watchers** (Prometheus) and **watcher code** (OpenTelemetry Operator target allocator) that may include **fake informers in tests**.\n\n---\n\n### 2. Detailed Analysis (grounded in discovered files)\n\n#### A) Argo CD (`argo-cd`)\n\nThese files are relevant because Argo CD contains **generated informer factory code** that returns `cache.SharedIndexInformer` and references cache-sync behavior:\n\n- `pkg/client/informers/externalversions/factory.go`  \n  *Evidence:* appears in searches for `SharedInformer`, `SharedIndexInformer`, `WaitForCacheSync`, `NewSharedInformerFactory`.  \n  *Why it\u2019s impacted:* if this file (or closely related generated code) defines any **local fake/mock** that implements `cache.SharedInformer` / `cache.SharedIndexInformer`, it must add the new method. Even if production code only returns client-go informers, generated informer scaffolding commonly has companion fake implementations in tests.\n\n- `pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go`  \n  *Evidence:* appears in searches for `SharedInformer` and `SharedIndexInformer`.  \n  *Why it\u2019s impacted:* it defines internal interfaces used to construct/return `cache.SharedIndexInformer`. Any **struct in Argo CD** satisfying these interfaces by implementing informer methods (especially in tests) would be forced to implement the added `SharedInformer` method.\n\nAdditional Argo CD codepaths that interact with informers and are therefore likely \u201cadaptation points\u201d (especially for tests/wrappers):\n\n- `util/notification/k8s/informers.go` (*hit for `SharedIndexInformer`*)  \n- `util/settings/cluster_informer.go` (*hit under \u201cfake informer\u201d search; indicates custom informer usage/wrapping*)  \n\n#### B) cert-manager (`cert-manager`)\n\ncert-manager has a larger surface of informer-related code, including generated factories and **internal informer wrappers**:\n\n- `pkg/client/informers/externalversions/factory.go`  \n  *Evidence:* hits for `SharedInformer`, `SharedIndexInformer`, `WaitForCacheSync`, `NewSharedInformerFactory`.  \n  *Why it\u2019s impacted:* same rationale as Argo CD\u2014generated factory code returns `cache.SharedIndexInformer`; any local fakes implementing these interfaces must now implement `WaitForCacheSync(context.Context) bool`.\n\n- `pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go`  \n  *Evidence:* hits for `SharedInformer` and `SharedIndexInformer` (also purpose-search confirms it defines informer-creation interfaces).  \n  *Why it\u2019s impacted:* factory interface layer commonly has test doubles; those would break if they implement `cache.SharedIndexInformer` (which now requires the new `SharedInformer` method).\n\n- `internal/informers/core_basic.go` and `internal/informers/core_filteredsecrets.go`  \n  *Evidence:* both hit for `SharedInformer` and `WaitForCacheSync`.  \n  *Why it\u2019s impacted:* unlike purely generated clients, these \u201cinternal/informers\u201d files are strong candidates for **custom wrapper types** around informers and/or custom synchronization helpers. If any wrapper type is intended to satisfy `cache.SharedInformer` / `cache.SharedIndexInformer`, it must be extended with the new method.\n\nOther generated informer files (each may expose/return `cache.SharedIndexInformer`, and therefore are hotspots for fakes/mocks in tests):\n\n- `pkg/client/informers/externalversions/certmanager/v1/certificate.go`\n- `pkg/client/informers/externalversions/certmanager/v1/certificaterequest.go`\n- `pkg/client/informers/externalversions/certmanager/v1/clusterissuer.go`\n- `pkg/client/informers/externalversions/certmanager/v1/issuer.go`\n- `pkg/client/informers/externalversions/acme/v1/order.go`\n- `pkg/client/informers/externalversions/acme/v1/challenge.go`\n\n*(All of the above were returned by the `SharedInformer` / `SharedIndexInformer` searches and/or purpose search.)*\n\n#### C) Prometheus (`prometheus`)\n\nPrometheus\u2019s Kubernetes service discovery is where informers are used to watch/cache Kubernetes resources.\n\nRelevant files (direct `SharedInformer` / `SharedIndexInformer` hits):\n\n- `discovery/kubernetes/kubernetes.go` (*hits for `SharedInformer` and `SharedIndexInformer`*)\n- `discovery/kubernetes/service.go` (*hits for `SharedInformer`*)\n- `discovery/kubernetes/endpointslice.go` (*hits for `SharedInformer`, and also for `cache.SharedInformer` query*)\n- `discovery/kubernetes/node.go` (*hits for `SharedInformer`, and also for `cache.SharedInformer` query*)\n\n**Most likely breakage point in Prometheus:** tests defining fake informers.\n- `discovery/kubernetes/kubernetes_test.go` (*strong \u201cfake informer\u201d hit cluster; indicates it likely defines fakes/mocks for informer-driven behavior*)  \n\nIf that test file defines a fake that satisfies `cache.SharedInformer` / `cache.SharedIndexInformer`, it will need to add:\n```go\nWaitForCacheSync(ctx context.Context) bool\n```\n\n#### D) OpenTelemetry Operator (`opentelemetry-operator`)\n\nThe operator repo did **not** return direct `SharedInformer`/`SharedIndexInformer` hits in the searches performed, but it does contain watcher code using client-go cache primitives:\n\n- `cmd/otel-allocator/internal/watcher/promOperator.go`  \n  *Evidence:* found via `ListWatch` search (a client-go cache building block frequently used to construct informers).  \n  *Why it\u2019s impacted:* if this watcher (or its test) implements custom/fake informer types (common in unit tests), they may need to implement the new `SharedInformer` method.\n\n- `cmd/otel-allocator/internal/watcher/promOperator_test.go`  \n  *Evidence:* appears prominently in \u201cfake informer\u201d search results.  \n  *Why it\u2019s impacted:* test fakes around watch/list or informer-like behavior are the most likely place where a `cache.SharedInformer`/`cache.SharedIndexInformer` interface is implemented locally.\n\nBecause the repo didn\u2019t directly surface `SharedInformer` identifiers in the searches, the safest grounded conclusion is: **adaptation is most likely in the target allocator watcher tests** rather than in production operator controllers.\n\n---\n\n### 3. Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| argo-cd | `pkg/client/informers/externalversions/factory.go` | Direct hits for `SharedInformer`, `SharedIndexInformer`, `WaitForCacheSync`, `NewSharedInformerFactory`; generated informer factory layer is a common place for fakes/mocks to satisfy informer interfaces. |\n| argo-cd | `pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go` | Direct hits for `SharedInformer`/`SharedIndexInformer`; defines informer-creation interfaces that return `cache.SharedIndexInformer` (breaks if any local implementation exists). |\n| argo-cd | `util/notification/k8s/informers.go` | Hit in `SharedIndexInformer` search; indicates custom informer use/wrapping that may include local implementations in tests. |\n| argo-cd | `util/settings/cluster_informer.go` | Appears in \u201cfake informer\u201d search cluster; likely contains wrapper/testing constructs around informers. |\n| cert-manager | `pkg/client/informers/externalversions/factory.go` | Hits for `SharedInformer`, `SharedIndexInformer`, `WaitForCacheSync`, `NewSharedInformerFactory`; generated informer factory code path. |\n| cert-manager | `pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go` | Hits for `SharedInformer`/`SharedIndexInformer`; interface layer likely to have test doubles that would need the new method. |\n| cert-manager | `internal/informers/core_basic.go` | Hits for `SharedInformer` and `WaitForCacheSync`; suggests internal/custom informer wrapper logic where implementing types may need to add the new method. |\n| cert-manager | `internal/informers/core_filteredsecrets.go` | Hits for `SharedInformer` and `WaitForCacheSync`; another internal informer wrapper likely impacted if it implements informer interfaces. |\n| cert-manager | `pkg/client/informers/externalversions/acme/v1/challenge.go` | Returned in informer searches/purpose; generated informer returning `cache.SharedIndexInformer` (fakes/mocks may exist). |\n| cert-manager | `pkg/client/informers/externalversions/acme/v1/order.go` | Same as above; informer generator surface. |\n| cert-manager | `pkg/client/informers/externalversions/certmanager/v1/certificate.go` | Same as above; informer generator surface. |\n| cert-manager | `pkg/client/informers/externalversions/certmanager/v1/certificaterequest.go` | Same as above; informer generator surface. |\n| cert-manager | `pkg/client/informers/externalversions/certmanager/v1/clusterissuer.go` | Same as above; informer generator surface. |\n| cert-manager | `pkg/client/informers/externalversions/certmanager/v1/issuer.go` | Same as above; informer generator surface. |\n| prometheus | `discovery/kubernetes/kubernetes.go` | Direct hits for `SharedInformer` and `SharedIndexInformer`; core Kubernetes SD code likely consuming informers (and tests nearby may implement fakes). |\n| prometheus | `discovery/kubernetes/service.go` | Direct `SharedInformer` hit; Kubernetes SD informer usage. |\n| prometheus | `discovery/kubernetes/endpointslice.go` | Direct `SharedInformer` and `cache.SharedInformer` hits; Kubernetes SD informer usage. |\n| prometheus | `discovery/kubernetes/node.go` | Direct `SharedInformer` and `cache.SharedInformer` hits; Kubernetes SD informer usage. |\n| prometheus | `discovery/kubernetes/kubernetes_test.go` | Strong \u201cfake informer\u201d hit; most likely location of local informer interface implementations that must add `WaitForCacheSync(ctx)` to compile. |\n| opentelemetry-operator | `cmd/otel-allocator/internal/watcher/promOperator.go` | Found via `ListWatch` search; uses client-go cache watch/list primitives (potentially constructs informer-like objects). |\n| opentelemetry-operator | `cmd/otel-allocator/internal/watcher/promOperator_test.go` | Appears in \u201cfake informer\u201d search; most likely place for local fakes that would need to implement the new informer method. |\n\n---\n\nIf you want a precise \u201cwill definitely fail to compile\u201d list, the next step (normally) would be to inspect the **test files** above (Prometheus `kubernetes_test.go`, OTel `promOperator_test.go`, and cert-manager/Argo informer-related tests if present) to confirm whether they define structs that explicitly implement `cache.SharedInformer` / `cache.SharedIndexInformer`.",
+  "llm_condensed_answer": "SUMMARY: Adding WaitForCacheSync to the SharedInformer interface is a compile-time breaking change for any code that implements it, such as test fakes, mocks, and wrapper types. The primary impact is on test files and custom informer wrappers across the projects, while production code that consumes client-go informers remains unaffected.\n\nFILES:\n- argo-cd/pkg/client/informers/externalversions/factory.go \u2014 Generated informer factory; any local fakes implementing the interface must add the new method.\n- argo-cd/pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go \u2014 Defines informer-creation interfaces; test doubles implementing these would break.\n- argo-cd/util/notification/k8s/informers.go \u2014 Custom informer usage/wrapping; may contain local implementations in tests.\n- argo-cd/util/settings/cluster_informer.go \u2014 Likely contains wrapper/testing constructs around informers.\n- cert-manager/pkg/client/informers/externalversions/factory.go \u2014 Generated informer factory; local fakes implementing the interface must be updated.\n- cert-manager/pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go \u2014 Interface layer for informers; test doubles would need the new method.\n- cert-manager/internal/informers/core_basic.go \u2014 Internal/custom informer wrapper logic; implementing types may need the new method.\n- cert-manager/internal/informers/core_filteredsecrets.go \u2014 Internal informer wrapper; likely impacted if it implements informer interfaces.\n- cert-manager/pkg/client/informers/externalversions/acme/v1/challenge.go \u2014 Generated informer surface; fakes/mocks may exist.\n- cert-manager/pkg/client/informers/externalversions/acme/v1/order.go \u2014 Generated informer surface; fakes/mocks may exist.\n- cert-manager/pkg/client/informers/externalversions/certmanager/v1/certificate.go \u2014 Generated informer surface; fakes/mocks may exist.\n- cert-manager/pkg/client/informers/externalversions/certmanager/v1/certificaterequest.go \u2014 Generated informer surface; fakes/mocks may exist.\n- cert-manager/pkg/client/informers/externalversions/certmanager/v1/clusterissuer.go \u2014 Generated informer surface; fakes/mocks may exist.\n- cert-manager/pkg/client/informers/externalversions/certmanager/v1/issuer.go \u2014 Generated informer surface; fakes/mocks may exist.\n- prometheus/discovery/kubernetes/kubernetes.go \u2014 Core Kubernetes SD code; tests may implement fakes that need the new method.\n- prometheus/discovery/kubernetes/service.go \u2014 Kubernetes SD informer usage; potential for local fakes in tests.\n- prometheus/discovery/kubernetes/endpointslice.go \u2014 Kubernetes SD informer usage; potential for local fakes in tests.\n- prometheus/discovery/kubernetes/node.go \u2014 Kubernetes SD informer usage; potential for local fakes in tests.\n- prometheus/discovery/kubernetes/kubernetes_test.go \u2014 Strong \u201cfake informer\u201d hit; most likely location of local informer implementations that must add the new method.\n- opentelemetry-operator/cmd/otel-allocator/internal/watcher/promOperator.go \u2014 Uses client-go cache watch/list primitives; may construct informer-like objects.\n- opentelemetry-operator/cmd/otel-allocator/internal/watcher/promOperator_test.go \u2014 Appears in \u201cfake informer\u201d search; most likely place for local fakes needing the new method.",
+  "cost": {
+    "input_tokens": 1056526,
+    "output_tokens": 14141,
+    "total_tokens": 1070667,
+    "cost_usd": 2.046895
+  },
+  "status": "success",
+  "latency_seconds": 325.44,
+  "tool_calls_count": 59,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 17,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"classes\",\n        \"functions\",\n   ...",
+      "latency_seconds": 1.648
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 70,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"classes\",\n        \"funct...",
+      "latency_seconds": 1.507
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 8,\n  \"repos_matched\": [\n    \"prometheus\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"discovery/kubernetes/kubernetes.go\",\n      \"repo_name\": \"prometheus\",\n      \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"keywords\"\n      ]\n    ...",
+      "latency_seconds": 1.186
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformer",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.282
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 21,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.625,\n      \"matched_channels\": [\n      ...",
+      "latency_seconds": 1.23
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 28,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.6,\n      \"matched_channels\": ...",
+      "latency_seconds": 1.233
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 6,\n  \"repos_matched\": [\n    \"prometheus\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"discovery/kubernetes/kubernetes.go\",\n      \"repo_name\": \"prometheus\",\n      \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"keywords\"\n      ]...",
+      "latency_seconds": 0.917
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.323
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/client-go/tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/client-go/tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.379
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/client-go/tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/client-go/tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.416
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/client-go/tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/client-go/tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.407
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "k8s.io/client-go/tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"k8s.io/client-go/tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.415
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.381
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.383
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.385
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "tools/cache",
+        "channels": [
+          "imports"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"imports\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[imports] 0 results for \\\"tools/cache\\\". Try just the library/module name without path prefix (e.g. \\\"express\\\" not \\\"node_modules/express\\\"). Searches both internal and external imports.\"\n  }\n}",
+      "latency_seconds": 0.387
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "WaitForCacheSync",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 2,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"keywords\"\n  ...",
+      "latency_seconds": 1.914
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "WaitForCacheSync",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 6,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"ke...",
+      "latency_seconds": 1.713
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "WaitForCacheSync",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.897
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "WaitForCacheSync",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.808
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.WaitForCacheSync",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"cache.WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.686
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.WaitForCacheSync",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"cache.WaitForCacheSync\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.689
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "InformerSynced",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"InformerSynced\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.441
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "client-go",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"client-go\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.506
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "k8s.io/apimachinery",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"query\": \"k8s.io/apimachinery\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.916
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"Argo CD is a comprehensive GitOps platform for Kubernetes that enables declarative, version-controlled application deployment and lifecycle management across multi-cluster environments. The architecture follows a layered, modular design with a core GitOps reconciliation engine at its center, surrounded by supporting subsystems for API management, user interfaces, manifest generation, and extensibility. It integrates gen...",
+      "latency_seconds": 0.418
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"The cert-manager codebase is a comprehensive, Kubernetes-native certificate management system designed to automate TLS certificate lifecycle (issuance, renewal, distribution) across diverse certificate authorities. It follows a layered, modular architecture built on Kubernetes controller patterns, with a strong emphasis on declarative configuration, pluggable issuer backends, and robust testing. The system abstracts com...",
+      "latency_seconds": 0.414
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"A layered, type\u00e2\u0080\u0091safe monitoring platform that combines a Mantine\u00e2\u0080\u0091styled React front\u00e2\u0080\u0091end with a Prometheus\u00e2\u0080\u0091based backend. The UI is built from composable components, uses React Suspense, React Query, and Redux Toolkit for data fetching, caching, and state. The backend provides a TSDB storage engine, PromQL parser and executor, service\u00e2\u0080\u0091discovery plugins, remote\u00e2\u0080\u0091storage adapters, and a facaded HTTP API with aut...",
+      "latency_seconds": 0.42
+    },
+    {
+      "tool_name": "graph_traverse",
+      "arguments": {
+        "operation": "repo",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "level": 0,
+        "semanticFilter": {
+          "ontology_concepts": [],
+          "business_entities": [],
+          "responsibilities": []
+        },
+        "batchNumber": 0,
+        "folderPath": "",
+        "page": 1,
+        "pageSize": 20
+      },
+      "result_preview": "{\n  \"operation\": \"repo\",\n  \"data\": {\n    \"purpose\": \"\",\n    \"architecture\": \"This repository implements a comprehensive Kubernetes-native observability platform centered around an OpenTelemetry Operator. The architecture is designed to automate the deployment, configuration, and lifecycle management of OpenTelemetry Collectors, Instrumentation, Target Allocators, and OpAMP Bridges. It uses a declarative, operator-driven pattern where Custom Resource Definitions (CRDs) define the desired state, a...",
+      "latency_seconds": 0.414
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "controller-runtime",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"controller-runtime\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.541
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "main.go",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"main.go\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 18,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"tests/test-e2e-apps/golang/main.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0.5,\n      \"matched_channels\": [\n        \"purpose\",\n        \"paths\"...",
+      "latency_seconds": 0.498
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "k8s.io",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"k8s.io\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 211,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"bundle/openshift/manifests/opentelemetry-operator-prometheus_rbac.authorization.k8s.io_v1_role.yaml\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0....",
+      "latency_seconds": 1.399
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "tools/cache",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"tools/cache\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.668
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "client-go",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"client-go\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.783
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "NewSharedInformerFactory",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"NewSharedInformerFactory\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 2,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n        \"keyw...",
+      "latency_seconds": 0.881
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "NewSharedInformerFactory",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"NewSharedInformerFactory\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 6,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/factory.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.4,\n      \"matched_channels\": [\n        \"functions\",\n   ...",
+      "latency_seconds": 0.877
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "NewSharedInformerFactory",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"NewSharedInformerFactory\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.893
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "NewSharedInformerFactory",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"NewSharedInformerFactory\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.89
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "channels": [
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n        \"purpose\": \"Defines interfaces for creating Kubernetes informers in a way that avoids import cycles in the Argo CD client library. It provides a factory pattern for generating SharedIndexInformers for versioned client sets.\",\n        \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n        \"repo_name\": \"argo-cd\"\n      },\n      {\n        \"path\": \"...",
+      "latency_seconds": 0.41
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "channels": [
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/client/informers/externalversions/certmanager/v1/certificaterequest.go\",\n        \"purpose\": \"Provides a shared informer factory for CertificateRequest resources in the cert-manager Kubernetes controller. It creates and manages cache.SharedIndexInformer instances for watching and listing CertificateRequest objects, enabling efficient client-side caching and event-driven processing within the controller runtime.\",\n        \"knowledge_id\": ...",
+      "latency_seconds": 0.402
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "SharedIndexInformer",
+        "channels": [
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "fileRole": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 100,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"SharedIndexInformer\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  }\n}",
+      "latency_seconds": 0.395
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedIndexInformer",
+        "knowledgeId": "",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 236,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"cert-manager\",\n    \"grafana\",\n    \"argo-cd\",\n    \"cilium\",\n    \"autoscaler\",\n    \"gatekeeper\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/internal/generic/interface.go\",\n      \"repo_name\": \"kubernetes...",
+      "latency_seconds": 0.82
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedInformer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.815
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedInformer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.836
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedInformer",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 4,\n  \"repos_matched\": [\n    \"prometheus\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"discovery/kubernetes/endpointslice.go\",\n      \"repo_name\": \"prometheus\",\n      \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n      \"score\": 0.3,\n      \"matched_channels\": [\n        \"keywords\",\n        \"semantic\"\n    ...",
+      "latency_seconds": 0.827
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedInformer",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 100
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.839
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedIndexInformer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 12,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"test/e2e/fixture/applicationsets/actions.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.3,\n      \"matched_channels\": [\n        \"keywords\",\n        \"semantic...",
+      "latency_seconds": 0.586
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "cache.SharedIndexInformer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"cache.SharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 8,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/internalinterfaces/factory_interfaces.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.6,\n      \"matched_channe...",
+      "latency_seconds": 0.682
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "FakeSharedIndexInformer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"FakeSharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.816
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "FakeSharedIndexInformer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"FakeSharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.813
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "FakeSharedIndexInformer",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"FakeSharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.816
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "FakeSharedIndexInformer",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"FakeSharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.827
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "fake informer",
+        "knowledgeId": "cceba948-304a-4f00-8ac6-4dd57dab816e",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"fake informer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 354,\n  \"repos_matched\": [\n    \"argo-cd\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/client/informers/externalversions/application/v1alpha1/application.go\",\n      \"repo_name\": \"argo-cd\",\n      \"knowledge_id\": \"cceba948-304a-4f00-8ac6-4dd57dab816e\",\n      \"score\": 0.9,\n      \"matched_channels\": [\n        \"purpose\",...",
+      "latency_seconds": 1.465
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "fake informer",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"fake informer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 452,\n  \"repos_matched\": [\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"pkg/controller/test/context_builder.go\",\n      \"repo_name\": \"cert-manager\",\n      \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n      \"score\": 0.85,\n      \"matched_channels\": [\n        \"purpose\",\n        \"functions\",\n  ...",
+      "latency_seconds": 1.471
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "fake informer",
+        "knowledgeId": "21712971-2584-493f-ab45-77a6b68c5e9f",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"fake informer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 53,\n  \"repos_matched\": [\n    \"prometheus\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"discovery/kubernetes/kubernetes_test.go\",\n      \"repo_name\": \"prometheus\",\n      \"knowledge_id\": \"21712971-2584-493f-ab45-77a6b68c5e9f\",\n      \"score\": 0.95,\n      \"matched_channels\": [\n        \"purpose\",\n        \"classes\",\n        ...",
+      "latency_seconds": 1.158
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "fake informer",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"fake informer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 59,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"cmd/otel-allocator/internal/watcher/promOperator_test.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0.85,\n      \"matched_channels\": [\n     ...",
+      "latency_seconds": 1.152
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SharedInformerFactory",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"SharedInformerFactory\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.178
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "NewSharedIndexInformer",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"NewSharedIndexInformer\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.307
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "ListWatch",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"query\": \"ListWatch\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 2,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"cmd/otel-allocator/internal/watcher/promOperator.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0.35,\n      \"matched_channels\": [\n        \"import...",
+      "latency_seconds": 0.457
+    }
+  ],
+  "error": ""
+}

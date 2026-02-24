@@ -1,0 +1,515 @@
+{
+  "model": "openai/gpt-5.1-codex",
+  "answer": "### 1. Architecture Overview\nAll four projects follow the standard Kubernetes scheme-registration pipeline:\n\n1. **GroupVersion definition** \u2013 each `register.go` or `groupversion_info.go` file defines a `schema.GroupVersion` for the CRD API group (e.g., `SchemeGroupVersion = schema.GroupVersion{Group: \"cert-manager.io\", Version: \"v1\"}`).  \n2. **SchemeBuilder wiring** \u2013 a `runtime.SchemeBuilder` (or controller-runtime\u2019s `scheme.Builder`) is set up with an `addKnownTypes` function and exported `AddToScheme`.  \n3. **Type registration** \u2013 every `addKnownTypes` implementation accepts `scheme *runtime.Scheme` and calls `scheme.AddKnownTypes(SchemeGroupVersion, &MyType{}, &MyTypeList{}, \u2026)` (e.g., `pkg/apis/certmanager/v1/register.go` lines 48\u201159).  \n4. **Consumers** \u2013 controllers, webhooks, and API servers invoke `AddToScheme` to ensure their `runtime.Scheme` can encode/decode these CRDs before reconcilers or admission webhooks touch them.\n\nChanging `runtime.Scheme.AddKnownTypes` from variadic `Object` parameters to a typed `TypeRegistration` struct breaks every one of these `addKnownTypes` functions because they all pass raw pointers directly into the old variadic method.\n\n### 2. Detailed Analysis\n#### cert-manager.git\nAll of cert-manager\u2019s API registration layers (external `pkg/apis/**` and internal `internal/apis/**`) embed the direct `scheme.AddKnownTypes(SchemeGroupVersion, \u2026)` call inside `addKnownTypes`. Representative example:\n\n- `pkg/apis/certmanager/v1/register.go` lines 48\u201159 call `scheme.AddKnownTypes(SchemeGroupVersion, &Certificate{}, &CertificateList{}, \u2026)` before adding the group version to `metav1` ([metadata + content](pkg/apis/certmanager/v1/register.go L48-L59)).  \n- The same pattern exists for configuration APIs (`pkg/apis/config/webhook/v1alpha1/register.go L48-L56`, `pkg/apis/config/controller/v1alpha1/register.go L49-L56`, `pkg/apis/config/cainjector/v1alpha1/register.go L48-L56`) and protocol-specific groups (`pkg/apis/acme/v1/register.go L48-L58`, `pkg/acme/webhook/apis/acme/v1alpha1/register.go L50-L57`).  \n- Internal registration mirrors the external ones (`internal/apis/meta/register.go L39-L44`, `internal/apis/config/{webhook,controller,cainjector}/register.go L39-L46`, `internal/apis/{certmanager,acme}/register.go L39-L53`).  \n\nAll of these functions must be rewritten to construct the future `runtime.TypeRegistration{GroupVersion: SchemeGroupVersion, Types: []runtime.Object{\u2026}}` (or equivalent), otherwise the project fails to compile once `AddKnownTypes` drops the variadic form.\n\n#### external-secrets.git\nThe API packages for External Secrets also rely on the legacy signature:\n\n- `apis/externalsecrets/v1beta1/register.go` defines the `SchemeBuilder` and finishes with `SchemeBuilder.Register(&ExternalSecret{}, \u2026)` which, under the hood, calls their local `addKnownTypes` invoking `scheme.AddKnownTypes` with individual objects (`summary` references type metadata and Scheme registration in lines 32\u201180).  \n- `apis/externalsecrets/v1alpha1/register.go` uses the same approach for PushSecret/ClusterPushSecret (see section map L32\u201167).  \n\nAny attempt to build against the new `runtime.Scheme` API will break because these files still pass discrete objects to `scheme.AddKnownTypes`.\n\n#### grafana.git\nGrafana\u2019s Kubernetes API server extension ships dozens of CRD groups, each with its own `register.go`. Every one of them implements:\n\n```go\nfunc addKnownTypes(scheme *runtime.Scheme) error {\n    scheme.AddKnownTypes(SchemeGroupVersion,\n        &<CRD>{},\n        &<CRD>List{},\n        \u2026,\n    )\n    metav1.AddToGroupVersion(scheme, SchemeGroupVersion)\n    return nil\n}\n```\n\nExamples include query/service/folder API packages and all application-specific CRDs:\n\n- `pkg/registry/apis/{query,service,folders}/register.go` (section maps highlight schema installation areas around L56\u201172 and type registration helpers around L49\u201165).\n- Aggregation APIs: `pkg/aggregator/apis/aggregation/v0alpha1/register.go` and `pkg/aggregator/apis/aggregation/register.go`.\n- User-facing CRDs: `pkg/apis/{userstorage,service,iam}/v0alpha1/register.go`.\n- Application bundles: `apps/{secret,scope,provisioning,preferences}/pkg/apis/.../register.go`, all dashboard API versions (`apps/dashboard/pkg/apis/dashboard/{v0alpha1,v1beta1,v2alpha1,v2beta1}/register.go`) and collections (`apps/collections/pkg/apis/collections/v1alpha1/register.go`).\n\nBecause each of these files wires their `SchemeBuilder` through an `addKnownTypes` that calls the soon-to-be-removed signature, Grafana\u2019s Kubernetes aggregator build will fail until every registration is updated to the new `TypeRegistration` form.\n\n#### opentelemetry-operator.git\nOpenTelemetry Operator follows Kubebuilder conventions: `apis/v1alpha1/groupversion_info.go` and `apis/v1beta1/groupversion_info.go` export `SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}`. The generated type files (e.g., `apis/v1alpha1/opentelemetrycollector_types.go`) register themselves through `SchemeBuilder.Register(&OpenTelemetryCollector{}, &OpenTelemetryCollectorList{}, \u2026)`, which internally still performs `scheme.AddKnownTypes(GV, objs...)`. Consequently, all API versions in this repo become incompatible with the new `runtime.Scheme` without adjustments to the generated registration helpers to supply the new struct payload.\n\n### 3. Relevant Files\n| Repo | File Path | Why |\n|------|-----------|-----|\n| cert-manager.git | pkg/apis/certmanager/v1/register.go | `addKnownTypes` (L48-L59) directly calls `scheme.AddKnownTypes` with variadic CRD pointers, so it must switch to the new `TypeRegistration` struct. |\n| cert-manager.git | pkg/apis/acme/v1/register.go | Same pattern for ACME Orders/Challenges (section map L48-L58). |\n| cert-manager.git | pkg/acme/webhook/apis/acme/v1alpha1/register.go | Webhook payload registration still uses the variadic `AddKnownTypes` (section map L50-L57). |\n| cert-manager.git | pkg/apis/meta/v1/register.go | Defines meta API group registration with an `addKnownTypes` hook that will fail after the signature change (section map L47-L51). |\n| cert-manager.git | pkg/apis/config/webhook/v1alpha1/register.go | Registers WebhookConfiguration by passing discrete objects to `scheme.AddKnownTypes` (L48-L56). |\n| cert-manager.git | pkg/apis/config/controller/v1alpha1/register.go | Controller configuration registration uses the legacy call (L49-L56). |\n| cert-manager.git | pkg/apis/config/cainjector/v1alpha1/register.go | CAInjector configuration uses `AddKnownTypes` variadically (L48-L56). |\n| cert-manager.git | internal/apis/meta/install/install.go? (if relevant) but not retrieved; we list actual ones from metadata: internal/apis/meta/register.go | Internal meta group still hooks `addKnownTypes` into the old API (L39-L44). |\n| cert-manager.git | internal/apis/config/webhook/register.go | Same issue for internal webhook configuration (L39-L46). |\n| cert-manager.git | internal/apis/config/controller/register.go | Internal controller config uses the old signature (L39-L46). |\n| cert-manager.git | internal/apis/config/cainjector/register.go | Internal CA injector config uses old signature (L39-L46). |\n| cert-manager.git | internal/apis/certmanager/register.go | Internal core types registered via legacy call (L39-L53). |\n| cert-manager.git | internal/apis/acme/register.go | Internal ACME API uses `scheme.AddKnownTypes` variadically (L39-L48). |\n| external-secrets.git | apis/externalsecrets/v1beta1/register.go | `SchemeBuilder` registers all v1beta1 CRDs by calling `AddKnownTypes` with raw objects (section map L26-L80). |\n| external-secrets.git | apis/externalsecrets/v1alpha1/register.go | v1alpha1 PushSecret registration still invokes `AddKnownTypes` variadically (section map L32-L67). |\n| grafana.git | pkg/registry/apis/query/register.go | Query API builder installs schema by calling `scheme.AddKnownTypes` (section map L55-L72 & API group implementation). |\n| grafana.git | pkg/registry/apis/service/register.go | Service API registration uses `scheme.AddKnownTypes` in `InstallSchema` (section map L55-L72). |\n| grafana.git | pkg/registry/apis/folders/register.go | Folder API\u2019s schema installation block uses `scheme.AddKnownTypes` (section map L107-L211). |\n| grafana.git | pkg/aggregator/apis/aggregation/v0alpha1/register.go | Defines `addKnownTypes` that calls the soon-to-change method (section map L34-L46). |\n| grafana.git | pkg/aggregator/apis/aggregation/register.go | Internal aggregation registration relies on the legacy signature (section map L24-L35). |\n| grafana.git | pkg/apis/userstorage/v0alpha1/register.go | UserStorage CRD registration uses the old call (section map L58-L66). |\n| grafana.git | pkg/apis/service/v0alpha1/register.go | Service ExternalName CRDs call `scheme.AddKnownTypes` directly (section map L57-L65). |\n| grafana.git | pkg/apis/iam/v0alpha1/register.go | IAM CRDs register types via `scheme.AddKnownTypes` (section map L55-L66). |\n| grafana.git | apps/secret/pkg/apis/secret/v1beta1/register.go | SecureValue/Keeper types registered via legacy method (section map L59-L73). |\n| grafana.git | apps/scope/pkg/apis/scope/v0alpha1/register.go | Scope CRDs add known types with the old signature (section map L146-L163). |\n| grafana.git | apps/provisioning/pkg/apis/provisioning/v0alpha1/register.go | Provisioning CRDs use `scheme.AddKnownTypes` within `addKnownTypes` (section map L181-L203). |\n| grafana.git | apps/preferences/pkg/apis/preferences/v1alpha1/register.go | Preferences CRD registration uses legacy `AddKnownTypes` (section map L48-L56). |\n| grafana.git | apps/dashboard/pkg/apis/dashboard/v0alpha1/register.go | Dashboard v0alpha1 `addKnownTypes` still variadic (section map L114-L132). |\n| grafana.git | apps/dashboard/pkg/apis/dashboard/v1beta1/register.go | Dashboard v1beta1 registration uses old signature (section map L50-L77). |\n| grafana.git | apps/dashboard/pkg/apis/dashboard/v2alpha1/register.go | Dashboard v2alpha1 `addKnownTypes` uses legacy call (section map L57-L68). |\n| grafana.git | apps/dashboard/pkg/apis/dashboard/v2beta1/register.go | Dashboard v2beta1 registration still variadic (section map L57-L68). |\n| grafana.git | apps/collections/pkg/apis/collections/v1alpha1/register.go | Stars CRD registration uses `scheme.AddKnownTypes` (section map L46-L54). |\n| opentelemetry-operator.git | apis/v1alpha1/groupversion_info.go | Kubebuilder\u2019s `SchemeBuilder` ultimately relies on the variadic `scheme.AddKnownTypes`; every generated type file registers through it (lines 14\u201123). |\n| opentelemetry-operator.git | apis/v1beta1/groupversion_info.go | Same pattern for the v1beta1 API group (lines 14\u201123). |\n\n*Note:* Additional Grafana API packages (e.g., `apps/secret`, `apps/scope`, etc.) follow the identical pattern; every listed file must be updated to construct the new `TypeRegistration` payload before invoking `scheme.AddKnownTypes`.",
+  "llm_condensed_answer": "SUMMARY: Changing runtime.Scheme.AddKnownTypes from variadic Object arguments to a typed TypeRegistration struct will break every project that registers custom CRD types. All four projects (cert-manager, external-secrets, Grafana, OpenTelemetry Operator) use the legacy variadic signature in their addKnownTypes functions or generated registration code.\n\nFILES:\n- cert-manager/pkg/apis/certmanager/v1/register.go \u2014 Direct variadic call to scheme.AddKnownTypes for cert-manager CRDs\n- cert-manager/pkg/apis/acme/v1/register.go \u2014 Direct variadic call for ACME Orders/Challenges\n- cert-manager/pkg/acme/webhook/apis/acme/v1alpha1/register.go \u2014 Webhook payload registration uses variadic AddKnownTypes\n- cert-manager/pkg/apis/meta/v1/register.go \u2014 Meta API group registration with variadic AddKnownTypes\n- cert-manager/pkg/apis/config/webhook/v1alpha1/register.go \u2014 Webhook configuration uses variadic AddKnownTypes\n- cert-manager/pkg/apis/config/controller/v1alpha1/register.go \u2014 Controller config uses variadic AddKnownTypes\n- cert-manager/pkg/apis/config/cainjector/v1alpha1/register.go \u2014 CAInjector config uses variadic AddKnownTypes\n- cert-manager/internal/apis/meta/register.go \u2014 Internal meta group uses variadic AddKnownTypes\n- cert-manager/internal/apis/config/webhook/register.go \u2014 Internal webhook config uses variadic AddKnownTypes\n- cert-manager/internal/apis/config/controller/register.go \u2014 Internal controller config uses variadic AddKnownTypes\n- cert-manager/internal/apis/config/cainjector/register.go \u2014 Internal CA injector config uses variadic AddKnownTypes\n- cert-manager/internal/apis/certmanager/register.go \u2014 Internal cert-manager types use variadic AddKnownTypes\n- cert-manager/internal/apis/acme/register.go \u2014 Internal ACME API uses variadic AddKnownTypes\n- external-secrets/apis/externalsecrets/v1beta1/register.go \u2014 v1beta1 CRDs registered via variadic AddKnownTypes\n- external-secrets/apis/externalsecrets/v1alpha1/register.go \u2014 v1alpha1 PushSecret registration uses variadic AddKnownTypes\n- grafana/pkg/registry/apis/query/register.go \u2014 Query API schema installation uses variadic AddKnownTypes\n- grafana/pkg/registry/apis/service/register.go \u2014 Service API registration uses variadic AddKnownTypes\n- grafana/pkg/registry/apis/folders/register.go \u2014 Folder API schema installation uses variadic AddKnownTypes\n- grafana/pkg/aggregator/apis/aggregation/v0alpha1/register.go \u2014 Aggregation v0alpha1 uses variadic AddKnownTypes\n- grafana/pkg/aggregator/apis/aggregation/register.go \u2014 Internal aggregation registration uses variadic AddKnownTypes\n- grafana/pkg/apis/userstorage/v0alpha1/register.go \u2014 UserStorage CRD uses variadic AddKnownTypes\n- grafana/pkg/apis/service/v0alpha1/register.go \u2014 Service ExternalName CRDs use variadic AddKnownTypes\n- grafana/pkg/apis/iam/v0alpha1/register.go \u2014 IAM CRDs use variadic AddKnownTypes\n- grafana/apps/secret/pkg/apis/secret/v1beta1/register.go \u2014 SecureValue/Keeper types use variadic AddKnownTypes\n- grafana/apps/scope/pkg/apis/scope/v0alpha1/register.go \u2014 Scope CRDs use variadic AddKnownTypes\n- grafana/apps/provisioning/pkg/apis/provisioning/v0alpha1/register.go \u2014 Provisioning CRDs use variadic AddKnownTypes\n- grafana/apps/preferences/pkg/apis/preferences/v1alpha1/register.go \u2014 Preferences CRD uses variadic AddKnownTypes\n- grafana/apps/dashboard/pkg/apis/dashboard/v0alpha1/register.go \u2014 Dashboard v0alpha1 uses variadic AddKnownTypes\n- grafana/apps/dashboard/pkg/apis/dashboard/v1beta1/register.go \u2014 Dashboard v1beta1 uses variadic AddKnownTypes\n- grafana/apps/dashboard/pkg/apis/dashboard/v2alpha1/register.go \u2014 Dashboard v2alpha1 uses variadic AddKnownTypes\n- grafana/apps/dashboard/pkg/apis/dashboard/v2beta1/register.go \u2014 Dashboard v2beta1 uses variadic AddKnownTypes\n- grafana/apps/collections/pkg/apis/collections/v1alpha1/register.go \u2014 Stars CRD uses variadic AddKnownTypes\n- opentelemetry-operator/apis/v1alpha1/groupversion_info.go \u2014 Generated registration relies on variadic AddKnownTypes\n- opentelemetry-operator/apis/v1beta1/groupversion_info.go \u2014 Generated registration relies on variadic AddKnownTypes",
+  "cost": {
+    "input_tokens": 1062014,
+    "output_tokens": 13912,
+    "total_tokens": 1075926,
+    "cost_usd": 1.466637
+  },
+  "status": "success",
+  "latency_seconds": 232.82,
+  "tool_calls_count": 25,
+  "agent_steps": 26,
+  "tool_calls": [
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "AddKnownTypes runtime.Scheme TypeRegistration",
+        "knowledgeId": "",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"AddKnownTypes runtime.Scheme TypeRegistration\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 404,\n  \"repos_matched\": [\n    \"kubernetes\",\n    \"crossplane\",\n    \"autoscaler\",\n    \"cert-manager\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"staging/src/k8s.io/api/core/v1/register.go\",\n      \"repo_name\": \"kubernetes\",\n      \"knowledge_id\": \"861aece6-9526-4522-8e22-4699961b1c9c\",\n   ...",
+      "latency_seconds": 1.002
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "channels": [
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/registry/apis/query/register.go\",\n        \"purpose\": \"Registers the Grafana Query API as a Kubernetes API server extension, providing a unified query endpoint for datasources and expressions. It acts as the entry point for the query service, configuring storage, authorization, and OpenAPI schema generation.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\":...",
+      "latency_seconds": 0.499
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "channels": [
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/apis/meta/v1/register.go\",\n        \"purpose\": \"This file defines the API group version and registration logic for the cert-manager meta/v1 API package. It sets up the schema group version and provides a placeholder for registering known types, which is typically used for shared metadata types across cert-manager resources.\",\n        \"knowledge_id\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n        \"repo_name\": \"cert-manager\"\n      },\n  ...",
+      "latency_seconds": 0.474
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "channels": [
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [\n      {\n        \"path\": \"pkg/registry/apis/query/register.go\",\n        \"purpose\": \"Registers the Grafana Query API as a Kubernetes API server extension, providing a unified query endpoint for datasources and expressions. It acts as the entry point for the query service, configuring storage, authorization, and OpenAPI schema generation.\",\n        \"knowledge_id\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n        \"repo_name\": \"grafana\"\n      },\n      {\n        \"path\":...",
+      "latency_seconds": 0.766
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "channels": [
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 50,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"AddKnownTypes\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  }\n}",
+      "latency_seconds": 0.973
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"AddKnownTypes\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.446
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SchemeBuilder",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SchemeBuilder\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 6,\n  \"repos_matched\": [\n    \"external-secrets\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"apis/externalsecrets/v1beta1/register.go\",\n      \"repo_name\": \"external-secrets\",\n      \"knowledge_id\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"purpose\",\n        \"keyword...",
+      "latency_seconds": 0.456
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "channels": [
+          "functions"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"functions\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 50,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[functions] 0 results for \\\"AddKnownTypes\\\". Try a PARTIAL function name (e.g. \\\"parse\\\" instead of \\\"parseConfigFromYAML\\\"). Match is case-insensitive CONTAINS. If unsure of the exact name, try the purpose or keywords channel instead.\"\n  }\n}",
+      "latency_seconds": 0.435
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "AddKnownTypes",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"AddKnownTypes\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.463
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SchemeBuilder",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SchemeBuilder\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 7,\n  \"repos_matched\": [\n    \"opentelemetry-operator\"\n  ],\n  \"top_results\": [\n    {\n      \"path\": \"apis/v1beta1/groupversion_info.go\",\n      \"repo_name\": \"opentelemetry-operator\",\n      \"knowledge_id\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n      \"score\": 0.6,\n      \"matched_channels\": [\n        \"purpose\",\n        \"ke...",
+      "latency_seconds": 0.45
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "scheme.AddKnownTypes",
+        "channels": [
+          "purpose"
+        ],
+        "path": "",
+        "glob": "",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"purpose\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 50,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[purpose] 0 results for \\\"scheme.AddKnownTypes\\\". Try broader or alternative terms. Purpose searches file summaries and ontology concepts. For exact code elements, use classes or functions channel. For path-based lookup, use paths or glob channel.\"\n  }\n}",
+      "latency_seconds": 0.448
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "addKnownTypes",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"addKnownTypes\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.548
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "pkg/apis/meta/v1/register.go",
+          "pkg/apis/config/webhook/v1alpha1/register.go",
+          "pkg/apis/config/controller/v1alpha1/register.go",
+          "pkg/apis/config/cainjector/v1alpha1/register.go",
+          "pkg/apis/certmanager/v1/register.go",
+          "pkg/apis/acme/v1/register.go",
+          "pkg/acme/webhook/apis/acme/v1alpha1/register.go",
+          "internal/apis/meta/register.go",
+          "internal/apis/config/webhook/register.go",
+          "internal/apis/config/controller/register.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 200,
+        "maxTokens": 4000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"pkg/apis/meta/v1/register.go\",\n      \"purpose\": \"This file defines the API group version and registration logic for the cert-manager meta/v1 API package. It sets up the schema group version and provides a placeholder for registering known types, which is typically used for shared metadata types across cert-manager resources.\",\n      \"summary\": \"{\\\"SchemeGroupVersion (~L26-27)\\\"...",
+      "latency_seconds": 0.402
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [
+          "internal/apis/config/cainjector/register.go",
+          "internal/apis/certmanager/register.go",
+          "internal/apis/acme/register.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 200,
+        "maxTokens": 4000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"5c4b66d9-0f53-433d-92f1-fc923dbb2a28\",\n  \"files\": [\n    {\n      \"path\": \"internal/apis/config/cainjector/register.go\",\n      \"purpose\": \"Registers the cainjector API types with Kubernetes' runtime scheme, enabling serialization/deserialization and type discovery for internal configuration objects like CAInjectorConfiguration. It defines the GroupVersion used to qualify resources and provides a helper function to construct GroupResource identifiers.\"...",
+      "latency_seconds": 0.395
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "5c4b66d9-0f53-433d-92f1-fc923dbb2a28",
+        "relativePaths": [],
+        "relativePath": "pkg/apis/certmanager/v1/register.go",
+        "fromLine": 47,
+        "toLine": 70,
+        "maxTokens": 2000
+      },
+      "result_preview": "# pkg/apis/certmanager/v1/register.go\nLines: 47 - 63 of 63\n\n47 | \n48 | // Adds the list of known types to api.Scheme.\n49 | func addKnownTypes(scheme *runtime.Scheme) error {\n50 | \tscheme.AddKnownTypes(SchemeGroupVersion,\n51 | \t\t&Certificate{},\n52 | \t\t&CertificateList{},\n53 | \t\t&Issuer{},\n54 | \t\t&IssuerList{},\n55 | \t\t&ClusterIssuer{},\n56 | \t\t&ClusterIssuerList{},\n57 | \t\t&CertificateRequest{},\n58 | \t\t&CertificateRequestList{},\n59 | \t)\n60 | \tmetav1.AddToGroupVersion(scheme, SchemeGroupVersion)\n61 |...",
+      "latency_seconds": 0.782
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "\"AddKnownTypes\"",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"\\\"AddKnownTypes\\\"\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.463
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "pkg/registry/apis/query/register.go",
+          "pkg/registry/apis/service/register.go",
+          "pkg/registry/apis/folders/register.go",
+          "pkg/aggregator/apis/aggregation/v0alpha1/register.go",
+          "pkg/aggregator/apis/aggregation/register.go",
+          "pkg/apis/userstorage/v0alpha1/register.go",
+          "pkg/apis/service/v0alpha1/register.go",
+          "pkg/apis/iam/v0alpha1/register.go",
+          "apps/secret/pkg/apis/secret/v1beta1/register.go",
+          "apps/scope/pkg/apis/scope/v0alpha1/register.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 200,
+        "maxTokens": 4000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"pkg/registry/apis/query/register.go\",\n      \"purpose\": \"Registers the Grafana Query API as a Kubernetes API server extension, providing a unified query endpoint for datasources and expressions. It acts as the entry point for the query service, configuring storage, authorization, and OpenAPI schema generation.\",\n      \"summary\": \"{\\\"API Group Registration (~L170-210)\\\":\\\"Impleme...",
+      "latency_seconds": 0.454
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "e0a5c5ee-310a-4bff-ab29-ef18eaab0826",
+        "relativePaths": [
+          "apps/provisioning/pkg/apis/provisioning/v0alpha1/register.go",
+          "apps/preferences/pkg/apis/preferences/v1alpha1/register.go",
+          "apps/dashboard/pkg/apis/dashboard/v2beta1/register.go",
+          "apps/dashboard/pkg/apis/dashboard/v2alpha1/register.go",
+          "apps/dashboard/pkg/apis/dashboard/v1beta1/register.go",
+          "apps/dashboard/pkg/apis/dashboard/v0alpha1/register.go",
+          "apps/collections/pkg/apis/collections/v1alpha1/register.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 200,
+        "maxTokens": 4000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"e0a5c5ee-310a-4bff-ab29-ef18eaab0826\",\n  \"files\": [\n    {\n      \"path\": \"apps/provisioning/pkg/apis/provisioning/v0alpha1/register.go\",\n      \"purpose\": \"Registers custom Kubernetes API resources for the provisioning group, defining resource metadata, table columns for kubectl output, and adding types to the runtime scheme for API server integration.\",\n      \"summary\": \"{\\\"RepositoryResourceInfo (~L20-61)\\\":\\\"Defines table columns and reader for Rep...",
+      "latency_seconds": 0.397
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "df9200e3-5480-4b75-9de1-40ee66ad6456",
+        "relativePaths": [
+          "apis/externalsecrets/v1beta1/register.go",
+          "apis/externalsecrets/v1alpha1/register.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 200,
+        "maxTokens": 4000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"df9200e3-5480-4b75-9de1-40ee66ad6456\",\n  \"files\": [\n    {\n      \"path\": \"apis/externalsecrets/v1beta1/register.go\",\n      \"purpose\": \"Registers the v1beta1 API group and version for the External Secrets Operator, defining scheme metadata and type registration for Kubernetes custom resources.\",\n      \"summary\": \"{\\\"Scheme Registration (~L32-41)\\\":\\\"Defines the GroupVersion and SchemeBuilder for registering v1beta1 API types with Kubernetes\\\",\\\"Type M...",
+      "latency_seconds": 0.409
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "metadata",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePaths": [
+          "apis/v1beta1/groupversion_info.go",
+          "apis/v1alpha1/groupversion_info.go"
+        ],
+        "relativePath": "",
+        "fromLine": 1,
+        "toLine": 200,
+        "maxTokens": 4000
+      },
+      "result_preview": "{\n  \"operation\": \"metadata\",\n  \"knowledgeId\": \"809b2635-0808-42d8-a5a8-0eee31698cfd\",\n  \"files\": [\n    {\n      \"path\": \"apis/v1beta1/groupversion_info.go\",\n      \"purpose\": \"Defines the group version and scheme builder for the v1beta1 API group in OpenTelemetry, enabling registration of Kubernetes custom resources and integration with the controller-runtime scheme.\",\n      \"summary\": \"{\\\"GroupVersion (~L16)\\\":\\\"Constant defining the API group 'opentelemetry.io' and version 'v1beta1' for Kubernet...",
+      "latency_seconds": 0.396
+    },
+    {
+      "tool_name": "graph_search",
+      "arguments": {
+        "query": "register.go",
+        "channels": [
+          "paths"
+        ],
+        "path": "apis",
+        "glob": "",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "fileRole": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "similarTo": {
+          "knowledgeId": "",
+          "relativePath": ""
+        },
+        "page": 1,
+        "pageSize": 50
+      },
+      "result_preview": "{\n  \"paths\": {\n    \"data\": [],\n    \"pagination\": {\n      \"page\": 1,\n      \"pageSize\": 50,\n      \"totalItems\": 0,\n      \"totalPages\": 1,\n      \"hasNextPage\": false,\n      \"hasPrevPage\": false\n    },\n    \"_error\": \"[paths] 0 results for \\\"register.go\\\". Full paths are brittle \u00e2\u0080\u0094 the stored relative_path may differ by prefix or structure. Try searching with just the FILENAME (e.g. \\\"shared_informer.go\\\" instead of \\\"staging/src/k8s.io/client-go/tools/cache/shared_informer.go\\\"). Or switch to the g...",
+      "latency_seconds": 0.514
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePaths": [],
+        "relativePath": "apis/v1alpha1/groupversion_info.go",
+        "fromLine": 1,
+        "toLine": 80,
+        "maxTokens": 2000
+      },
+      "result_preview": "# apis/v1alpha1/groupversion_info.go\nLines: 1 - 24 of 24\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | // Package v1alpha1 contains API Schema definitions for the core v1alpha1 API group.\n5 | // +kubebuilder:object:generate=true\n6 | // +groupName=opentelemetry.io\n7 | package v1alpha1\n8 | \n9 | import (\n10 | \t\"k8s.io/apimachinery/pkg/runtime/schema\"\n11 | \t\"sigs.k8s.io/controller-runtime/pkg/scheme\"\n12 | )\n13 | \n14 | var (\n15 | \t// GroupVersion is g...",
+      "latency_seconds": 0.718
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SchemeBuilder.Register",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [
+          "tests",
+          "vendor",
+          "generated"
+        ],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SchemeBuilder.Register\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 0.564
+    },
+    {
+      "tool_name": "smart_search",
+      "arguments": {
+        "query": "SchemeBuilder.Register",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "path": "",
+        "exclude": [],
+        "page": 1,
+        "pageSize": 30
+      },
+      "result_preview": "{\n  \"query\": \"SchemeBuilder.Register\",\n  \"channels_used\": [\n    \"purpose\",\n    \"classes\",\n    \"functions\",\n    \"imports\",\n    \"keywords\",\n    \"paths\",\n    \"semantic\"\n  ],\n  \"total_matches\": 0,\n  \"repos_matched\": [],\n  \"top_results\": [],\n  \"clusters\": []\n}",
+      "latency_seconds": 1.094
+    },
+    {
+      "tool_name": "retrieve_file",
+      "arguments": {
+        "operation": "content",
+        "knowledgeId": "809b2635-0808-42d8-a5a8-0eee31698cfd",
+        "relativePaths": [],
+        "relativePath": "apis/v1alpha1/opentelemetrycollector_types.go",
+        "fromLine": 1,
+        "toLine": 60,
+        "maxTokens": 2000
+      },
+      "result_preview": "# apis/v1alpha1/opentelemetrycollector_types.go\nLines: 1 - 60 of 616\nMore: fromLine=61\n\n1 | // Copyright The OpenTelemetry Authors\n2 | // SPDX-License-Identifier: Apache-2.0\n3 | \n4 | package v1alpha1\n5 | \n6 | import (\n7 | \tappsv1 \"k8s.io/api/apps/v1\"\n8 | \tautoscalingv2 \"k8s.io/api/autoscaling/v2\"\n9 | \tv1 \"k8s.io/api/core/v1\"\n10 | \tnetworkingv1 \"k8s.io/api/networking/v1\"\n11 | \tmetav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n12 | \t\"k8s.io/apimachinery/pkg/util/intstr\"\n13 | \n14 | \t\"github.com/open-te...",
+      "latency_seconds": 1.046
+    }
+  ],
+  "error": ""
+}
