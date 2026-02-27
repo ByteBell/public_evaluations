@@ -76,7 +76,7 @@ raw_score = sum(per_fact_scores) + sum(false_positive_bonuses) - sum(hallucinati
 Where:
 - `per_fact_scores` = sum of (File Detection + Breaking Pattern + Severity + Fix Quality) for each correctly detected impacted file
 - `false_positive_bonuses` = +2 for each false positive correctly omitted
-- `hallucination_penalties` = -5 for each file listed by the model that isn't in `impacted_files`
+- `hallucination_penalties` = -2 for each file listed by the model that isn't in `impacted_files`
 
 ### Final Percentage
 
@@ -98,11 +98,11 @@ Ground truth: 18 impacted files, 3 false positives. Max possible = 186.
   - Average per-fact score: 8.5/10 (good pattern identification, mostly correct fixes)
   - Subtotal: 15 × 8.5 = **+127.5**
 - Correctly omits all 3 false positives: 3 × 2 = **+6**
-- Hallucinated 2 wrong files: 2 × -5 = **-10**
+- Hallucinated 2 wrong files: 2 × -2 = **-4**
 
 ```
-raw = 127.5 + 6 - 10 = 123.5
-final = 123.5 / 186 × 100% = 66.4%
+raw = 127.5 + 6 - 4 = 125.5
+final = 125.5 / 186 × 100% = 
 ```
 
 ### Example 2: Weak Model with Heavy Hallucination
@@ -113,11 +113,11 @@ Ground truth: 18 impacted files, 3 false positives. Max possible = 186.
   - Average per-fact score: 6/10
   - Subtotal: 5 × 6 = **+30**
 - Lists 2 of the 3 false positives as impacted (only 1 correctly omitted): **+2**
-- Hallucinated 12 wrong files (including the 2 false positives): 12 × -5 = **-60**
+- Hallucinated 12 wrong files (including the 2 false positives): 12 × -2 = **-60**
 
 ```
-raw = 30 + 2 - 60 = -28
-final = -28 / 186 × 100% = -15.1%
+raw = 30 + 2 - 24 = 8
+final = 8 / 186 × 100% = 
 ```
 
 ### Example 3: Conservative Model
@@ -130,10 +130,6 @@ Ground truth: 18 impacted files, 3 false positives. Max possible = 186.
 - Correctly omits all 3 false positives: 3 × 2 = **+6**
 - Zero hallucinated files: **-0**
 
-```
-raw = 72 + 6 - 0 = 78
-final = 78 / 186 × 100% = 41.9%
-```
 
 This model is precise but has low recall — it only found 8/18 files. The scoring correctly reflects that: safe but incomplete.
 
@@ -170,14 +166,7 @@ The LLM judge is used in a **constrained** capacity — only for two sub-dimensi
 When comparing a model's listed files against the ground truth:
 
 ### Exact Match
-A model's file matches a ground truth entry when both `repo` and `file` path match.
-
-### Repo Alias Resolution
-Common aliases should be normalized before matching:
-- `argocd` → `argo-cd`
-- `otel-collector` → `opentelemetry-collector`
-- `otel-collector-contrib` → `opentelemetry-collector-contrib`
-- `k8s` → `kubernetes`
+A model's file matches a ground truth entry when `file` path match.
 
 ### Path Normalization
 - Leading `/` or `./` should be stripped
