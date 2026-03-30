@@ -1,0 +1,120 @@
+{
+  "id": "OBS_TC009",
+  "question": "Add a new method HealthCheck(ctx context.Context) error to the Discoverer interface in prometheus/discovery. Discoverer is used by Thanos and Prometheus to find scrape targets dynamically. Any custom service discovery implementation must now implement HealthCheck.",
+  "answer": "## Architecture Overview\n\nThe `Discoverer` interface is defined in `discovery/discovery.go` (line 35) in the prometheus repo. It currently has a single method: `Run(ctx context.Context, up chan<- []*targetgroup.Group)`. Adding `HealthCheck(ctx context.Context) error` requires every type satisfying this interface to implement the new method.\n\nThere are two categories of implementors:\n1. **Direct implementors** — types with their own `Run` method that must explicitly add `HealthCheck`.\n2. **Embedding types** — types that embed `*refresh.Discovery` and inherit both `Run` and `HealthCheck` automatically once `refresh.Discovery` gets the new method.\n\nThe `discovery.Manager` in `discovery/manager.go` orchestrates providers via `startProvider()` (line 324), calling `p.d.Run(ctx, updates)`. It would also likely need to call `HealthCheck` on providers, e.g. before starting them or as part of health reporting.\n\n## Detailed Analysis\n\n### Prometheus — Interface Definition\n\n- **`discovery/discovery.go`** — Defines the `Discoverer` interface (line 35-40) where `HealthCheck` must be added. Also contains `staticDiscoverer` (line 159) which directly implements `Discoverer` via its own `Run` method (line 161) and needs `HealthCheck`.\n\n### Prometheus — Direct Implementors (own Run method, need explicit HealthCheck)\n\n- **`discovery/refresh/refresh.go`** — `refresh.Discovery` struct (line 38) implements `Discoverer` with its own `Run` (line 67). This is the **base type** embedded by ~20 SD mechanisms (azure, docker, dockerswarm, http, digitalocean, dns, ec2, gce, hetzner, ionos, linode, marathon, nomad, openstack, ovhcloud, puppetdb, scaleway, triton, uyuni, vultr, etc.). Adding `HealthCheck` here propagates to all embedders automatically.\n- **`discovery/consul/consul.go`** — `consul.Discovery` struct (line 172) has its own fields (no refresh embedding) and its own `Run` method. Needs explicit `HealthCheck`.\n- **`discovery/kubernetes/kubernetes.go`** — `kubernetes.Discovery` struct (line 255) has its own `Run` method and manages sub-discoverers (`discoverers []discovery.Discoverer`, line 261). Needs explicit `HealthCheck`.\n- **`discovery/kubernetes/pod.go`** — `Pod` struct (line 46) implements `Discoverer` as a k8s sub-discoverer. Needs `HealthCheck`.\n- **`discovery/kubernetes/node.go`** — `Node` struct implements `Discoverer` as a k8s sub-discoverer. Needs `HealthCheck`.\n- **`discovery/kubernetes/service.go`** — `Service` struct implements `Discoverer` as a k8s sub-discoverer. Needs `HealthCheck`.\n- **`discovery/kubernetes/endpoints.go`** — `Endpoints` struct implements `Discoverer` as a k8s sub-discoverer. Needs `HealthCheck`.\n- **`discovery/kubernetes/endpointslice.go`** — `EndpointSlice` struct implements `Discoverer` as a k8s sub-discoverer. Needs `HealthCheck`.\n- **`discovery/kubernetes/ingress.go`** — `Ingress` struct implements `Discoverer` as a k8s sub-discoverer. Needs `HealthCheck`.\n- **`discovery/file/file.go`** — `file.Discovery` struct has its own `Run` method (no refresh embedding). Needs explicit `HealthCheck`.\n- **`discovery/zookeeper/zookeeper.go`** — `zookeeper.Discovery` struct (line 140) has its own `Run` method (line 200). Both `NewServersetDiscovery` and `NewNerveDiscovery` return this type. Needs `HealthCheck`.\n- **`discovery/xds/xds.go`** — `fetchDiscovery` struct (line 99) has its own `Run` method (line 111). Used by Kuma SD. Needs `HealthCheck`.\n- **`discovery/manager_test.go`** — `testDiscoverer` (line 1520) and `lockStaticDiscoverer` test types implement `Discoverer` directly. Need `HealthCheck`.\n\n### Prometheus — Manager / Orchestration\n\n- **`discovery/manager.go`** — `Manager.startProvider` (line 324) calls `p.d.Run(ctx, updates)` on `Discoverer` instances. The `Provider` struct (line 39) holds `d Discoverer` (line 41). May need to call `HealthCheck` before starting providers or for health reporting.\n\n### Prometheus — Embedding Types (auto-inherit from refresh.Discovery)\n\nThese embed `*refresh.Discovery` and automatically inherit `HealthCheck` once it's added to `refresh.Discovery`. No explicit code change needed unless they want custom health check behavior:\n- `discovery/azure/azure.go` — `azure.Discovery` (line 172, embeds at line 173)\n- `discovery/moby/docker.go` — `DockerDiscovery` (line 121, embeds at line 122)\n- `discovery/moby/dockerswarm.go` — `moby.Discovery` (line 117, embeds at line 118)\n- `discovery/http/http.go` — `http.Discovery` (line 107, embeds at line 108)\n- And ~15+ more SD mechanisms (digitalocean, dns, ec2, gce, hetzner, ionos, linode, marathon, nomad, openstack, ovhcloud, puppetdb, scaleway, triton, uyuni, vultr, etc.)\n\n### External — OpenTelemetry Operator\n\n- **`cmd/otel-allocator/internal/target/discovery.go`** — The OTel allocator imports `github.com/prometheus/prometheus/discovery` (line 19) and uses `discovery.Manager` to manage SD providers. While it has its own `Discoverer` struct (line 33), this is NOT an implementation of prometheus's `Discoverer` interface — it wraps a `discovery.Manager`. Impact is indirect: upgrading the prometheus dependency would pull in the new interface, affecting any custom SD providers registered with the manager.\n\n### External — Thanos\n\nThanos does NOT directly implement the prometheus `Discoverer` interface. Thanos has its own discovery package (`pkg/discovery/`) with DNS and memcache resolvers that use different interfaces. The Thanos sidecar interacts with Prometheus at the HTTP API level, not by implementing `Discoverer`. No direct code changes needed in Thanos for this interface change.\n\n## Relevant Files\n\n| Repo | File Path | Why |\n|------|-----------|-----|\n| prometheus | discovery/discovery.go | Discoverer interface definition (line 35) + staticDiscoverer implementor (line 159) |\n| prometheus | discovery/refresh/refresh.go | refresh.Discovery base type (line 38) — adding HealthCheck here propagates to ~20 embedding SDs |\n| prometheus | discovery/consul/consul.go | consul.Discovery (line 172) — direct implementor with own Run method |\n| prometheus | discovery/kubernetes/kubernetes.go | kubernetes.Discovery (line 255) — direct implementor managing sub-discoverers |\n| prometheus | discovery/kubernetes/pod.go | Pod sub-discoverer (line 46) — implements Discoverer |\n| prometheus | discovery/kubernetes/node.go | Node sub-discoverer — implements Discoverer |\n| prometheus | discovery/kubernetes/service.go | Service sub-discoverer — implements Discoverer |\n| prometheus | discovery/kubernetes/endpoints.go | Endpoints sub-discoverer — implements Discoverer |\n| prometheus | discovery/kubernetes/endpointslice.go | EndpointSlice sub-discoverer — implements Discoverer |\n| prometheus | discovery/kubernetes/ingress.go | Ingress sub-discoverer — implements Discoverer |\n| prometheus | discovery/file/file.go | file.Discovery — direct implementor with own Run method |\n| prometheus | discovery/zookeeper/zookeeper.go | zookeeper.Discovery (line 140) — direct implementor with own Run (line 200) |\n| prometheus | discovery/xds/xds.go | fetchDiscovery (line 99) — direct implementor with own Run (line 111) |\n| prometheus | discovery/manager.go | Manager.startProvider (line 324) orchestrates Discoverer instances |\n| prometheus | discovery/manager_test.go | testDiscoverer (line 1520) and lockStaticDiscoverer test implementations |\n| opentelemetry-operator | cmd/otel-allocator/internal/target/discovery.go | Uses discovery.Manager (line 35); indirect impact via dependency update |",
+  "expected_files": [
+    {
+      "repo": "prometheus",
+      "files": ["discovery/discovery.go"],
+      "reason": "Discoverer interface definition (line 35) where HealthCheck must be added, plus staticDiscoverer (line 159) which implements Discoverer directly"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/refresh/refresh.go"],
+      "reason": "refresh.Discovery base type (line 38) implements Discoverer — adding HealthCheck here auto-propagates to ~20 embedding SD mechanisms"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/consul/consul.go"],
+      "reason": "consul.Discovery (line 172) directly implements Discoverer with own Run method, needs explicit HealthCheck"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/kubernetes.go"],
+      "reason": "kubernetes.Discovery (line 255) directly implements Discoverer, manages sub-discoverers (line 261)"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/pod.go"],
+      "reason": "Pod sub-discoverer (line 46) implements Discoverer interface as kubernetes sub-role"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/node.go"],
+      "reason": "Node sub-discoverer implements Discoverer interface as kubernetes sub-role"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/service.go"],
+      "reason": "Service sub-discoverer implements Discoverer interface as kubernetes sub-role"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/endpoints.go"],
+      "reason": "Endpoints sub-discoverer implements Discoverer interface as kubernetes sub-role"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/endpointslice.go"],
+      "reason": "EndpointSlice sub-discoverer implements Discoverer interface as kubernetes sub-role"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/kubernetes/ingress.go"],
+      "reason": "Ingress sub-discoverer implements Discoverer interface as kubernetes sub-role"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/file/file.go"],
+      "reason": "file.Discovery directly implements Discoverer with own Run method"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/zookeeper/zookeeper.go"],
+      "reason": "zookeeper.Discovery (line 140) directly implements Discoverer with own Run (line 200), used by both Serverset and Nerve"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/xds/xds.go"],
+      "reason": "fetchDiscovery (line 99) directly implements Discoverer with own Run (line 111), used by Kuma SD"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/manager.go"],
+      "reason": "Manager.startProvider (line 324) orchestrates Discoverer instances via Provider.d field (line 41)"
+    },
+    {
+      "repo": "prometheus",
+      "files": ["discovery/manager_test.go"],
+      "reason": "testDiscoverer (line 1520) and lockStaticDiscoverer test types directly implement Discoverer"
+    },
+    {
+      "repo": "opentelemetry-operator",
+      "files": ["cmd/otel-allocator/internal/target/discovery.go"],
+      "reason": "Uses discovery.Manager (line 35) to orchestrate SD providers; indirect impact via prometheus dependency update"
+    }
+  ],
+  "model": "claude-opus-4-6-mcp",
+  "tool_calls_count": 28,
+  "tool_calls": [
+    "smart_search (prometheus, Discoverer interface discovery)",
+    "keyword_lookup (cross-repo, Discoverer HAS_CLASS)",
+    "retrieve_file content (prometheus, discovery/discovery.go:1-100)",
+    "keyword_lookup (cross-repo, HAS_IMPORT_EXTERNAL prometheus/discovery)",
+    "smart_search (thanos, Discoverer interface Run)",
+    "retrieve_file content (prometheus, discovery/discovery.go:100-169)",
+    "graph_search (prometheus, Run functions in discovery/)",
+    "graph_traverse folder_tree (prometheus, discovery/)",
+    "retrieve_file content (prometheus, discovery/manager.go:1-80)",
+    "retrieve_file content (prometheus, discovery/refresh/refresh.go:1-80)",
+    "retrieve_file content (prometheus, discovery/consul/consul.go:1-50)",
+    "retrieve_file content (prometheus, discovery/manager.go:200-280)",
+    "retrieve_file content (prometheus, discovery/consul/consul.go:80-160)",
+    "retrieve_file content (prometheus, discovery/azure/azure.go:1-60)",
+    "retrieve_file content (prometheus, discovery/moby/docker.go:1-80)",
+    "retrieve_file content (prometheus, discovery/consul/consul.go:160-230)",
+    "retrieve_file content (prometheus, discovery/azure/azure.go:100-160)",
+    "retrieve_file content (prometheus, discovery/moby/docker.go:80-160)",
+    "retrieve_file content (prometheus, discovery/azure/azure.go:165-240)",
+    "smart_search (thanos, prometheus discovery Discoverer Run)",
+    "retrieve_file content (thanos, pkg/testutil/e2eutil/prometheus.go:1-60)",
+    "retrieve_file content (prometheus, discovery/manager.go:280-400)",
+    "retrieve_file content (prometheus, discovery/zookeeper/zookeeper.go:1-80, 130-220)",
+    "retrieve_file content (prometheus, discovery/xds/xds.go:1-80, 80-168)",
+    "retrieve_file content (prometheus, discovery/moby/dockerswarm.go:1-80, 80-160)",
+    "retrieve_file content (prometheus, discovery/manager_test.go:1-80, 1520-1625)",
+    "retrieve_file content (prometheus, discovery/http/http.go:60-120)",
+    "retrieve_file content (prometheus, discovery/kubernetes/kubernetes.go:200-320, pod.go:1-60)"
+  ],
+  "status": "success"
+}
