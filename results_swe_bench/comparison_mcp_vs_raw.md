@@ -66,15 +66,17 @@
 
 ## Aggregate Statistics (21 Common Tasks)
 
-| Metric | MCP (21) | Raw (21 common) | Ratio | Winner |
-|--------|----------|-----------------|-------|--------|
+> Raw times from `claude_opus_4.6_raw_v2/` JSON files (a separate, faster run than the original raw eval report).
+
+| Metric | MCP (21) | Raw v2 (21 common) | Ratio | Winner |
+|--------|----------|---------------------|-------|--------|
 | Accuracy | 199/210 (94.8%) | 201/210 (95.7%) | 0.99× | Raw |
-| Total time | 2,570 s (42.8 min) | 3,677 s (61.3 min) | 0.70× | **MCP** |
-| Avg time/task | **122.4 s** | 175.1 s | **0.70×** | **MCP** |
-| Total tool calls | 200 | 353 | 0.57× | **MCP** |
+| Total time | 2,570 s (42.8 min) | **1,751 s (29.2 min)** | 1.47× | **Raw** |
+| Avg time/task | 122.4 s | **83.4 s** | 1.47× | **Raw** |
+| Total tool calls | **200** | 353 | 0.57× | **MCP** |
 | Avg tool calls/task | **9.5** | 16.8 | **0.57×** | **MCP** |
-| Fastest task | 19 s (`14309`) | 55 s (`7336`) | — | MCP |
-| Slowest task | 415 s (`14369`) | 395 s (`7671`) | — | — |
+| Fastest task | 19 s (`14309`) | 44 s (`14539`) | — | MCP |
+| Slowest task | 415 s (`14369`) | 184 s (`13236`) | — | Raw |
 
 ### Data Integrity Warning: Fabricated Thinking Tokens
 
@@ -150,16 +152,15 @@ This means MCP's reported thinking tokens ($7.65) are inflated — the real thin
 
 ## What Worked Well with MCP
 
-### 1. Speed & Efficiency
-- **38% faster** per task (122s vs 199s average)
-- **43% fewer tool calls** (9.5 vs 16.8 average)
-- The MCP knowledge graph enables targeted file retrieval — the model spends less time on orientation (no `git log`, `ls`, `git remote` overhead)
+### 1. Fewer Tool Calls
+- **43% fewer tool calls** (9.5 vs 16.8 average) — the knowledge graph returns more context per call
+- However, MCP is **47% slower overall** (2,570s vs 1,751s) because each MCP tool call has ~3s of network/retrieval latency vs Raw's near-instant grep
 
 ### 2. Root Cause Analysis is Flawless
 - 21/21 tasks (100%) — identical to raw. The MCP's pre-indexed summaries and keyword lookups help the model zero in on the bug mechanism quickly
 
 ### 3. Strong on Complex Multi-File Tasks
-- Task `13398` (1–4 hour difficulty, 6-file change): MCP scored 9/10 with 157s, vs raw's 9/10 with 324s — **same accuracy, half the time**
+- Task `13398` (1–4 hour difficulty, 6-file change): MCP scored 9/10 with 157s, vs Raw's 9/10 with 151s — same accuracy, comparable time
 
 ### 4. Improved on Three Tasks Raw Got Wrong
 - `14995`/`14595` (NDData mask): MCP produced exact match `operand.mask is None`. Raw used broader `operand is None or operand.mask is None`
@@ -185,8 +186,8 @@ A recurring pattern: MCP correctly identifies all required changes in its analys
 - `13453`: Duplicated `_set_col_formats()` logic manually instead of calling the existing method
 
 ### 3. Thinking Token Cost Dominance
-- **70.1%** of total MCP cost ($7.65 of $10.92) is thinking tokens
-- The model "overthinks" on straightforward bugs — e.g., `13033` consumed $0.634 in thinking tokens and still got a worse answer than raw
+- ~69% of total MCP cost ($7.40 of $10.67) is adjusted thinking tokens
+- The model "overthinks" on straightforward bugs — e.g., `13033` had 154s of adjusted thinking time and still got a worse answer than Raw
 - Several exact-match tasks (score 10/10) still had high thinking costs, suggesting the reasoning could be more efficient
 
 ### 4. Cost Structure
@@ -203,7 +204,7 @@ A recurring pattern: MCP correctly identifies all required changes in its analys
 ## Pattern Analysis
 
 ### MCP Failure Mode: "Analysis-Complete, Patch-Incomplete"
-In 5 of 8 MCP deductions, the model's written analysis correctly identified all required changes, but the final patch omitted one or more. This suggests the MCP's faster workflow (fewer tool calls, less time) may sometimes cause the model to rush the patch synthesis step.
+In 5 of 8 MCP deductions, the model's written analysis correctly identified all required changes, but the final patch omitted one or more. The MCP's fewer-tool-calls workflow may sometimes cause the model to rush the patch synthesis step.
 
 ### Raw Failure Mode: "Wrong Abstraction Choice"
 In 3 of 6 raw deductions, the model chose a functionally different approach that works for the specific test case but changes semantics for edge cases (`kind in 'iu'`, `NotImplemented` vs `False`, `operand is None or ...`). Raw seems more prone to choosing "clever" alternative fixes rather than matching the ground truth approach.
@@ -220,9 +221,9 @@ In 3 of 6 raw deductions, the model chose a functionally different approach that
 | Dimension | Winner | Margin |
 |-----------|--------|--------|
 | Accuracy (21 common) | Raw | 201 vs 199 (+2 pts, +0.9 pp) |
-| Speed (21 common) | **MCP** | **30% faster (2,570s vs 3,677s)** |
+| Speed (21 common) | **Raw** | **32% faster (1,751s vs 2,570s)** |
 | Tool efficiency | **MCP** | **43% fewer calls (200 vs 353)** |
-| Cost (adjusted thinking) | **Raw** | **$7.66 vs $10.67 (28% cheaper)** |
+| Cost (adjusted thinking) | **Raw** | **28% cheaper ($7.66 vs $10.67)** |
 | Patch precision | Raw | 87.3% vs 84.1% |
 | Root cause / Files | Tie | Both 100% |
 | Tasks MCP won | **MCP** | **3 tasks (+4 pts)** |
@@ -230,4 +231,6 @@ In 3 of 6 raw deductions, the model chose a functionally different approach that
 | Worst single failure | Raw better | MCP's 7/10 vs Raw's 8/10 |
 | Best improvement | MCP better | MCP fixed `8872` (10 vs 8) |
 
-**On 21 common tasks, Raw leads by just 2 points (201 vs 199) while MCP is 30% faster and uses 43% fewer tool calls.** MCP outperformed Raw on 3 tasks (including exact-matching the NDData mask bug where Raw was only near-perfect). The tradeoff is **28% higher cost** ($10.67 vs $7.66) driven by 7× more input tokens from knowledge graph retrieval, plus one persistent regression on task `13033`.
+**Raw wins on accuracy (+2 pts), speed (32% faster), and cost (28% cheaper).** MCP's only advantage is 43% fewer tool calls — but each MCP call is slower (knowledge graph latency) and returns 10× more tokens, so the fewer calls don't translate to speed or cost savings.
+
+MCP outperformed Raw on 3 tasks (`8872`, `7671`, `14995`) but regressed on 6. The knowledge graph adds ~$1.88 in input token overhead per run without improving accuracy. For this benchmark, **Raw `grep`/`fgrep` on source code is faster, cheaper, and marginally more accurate.**
