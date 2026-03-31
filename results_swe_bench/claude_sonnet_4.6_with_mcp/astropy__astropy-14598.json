@@ -1,0 +1,130 @@
+{
+  "issue_id": "astropy__astropy-14598",
+  "commit": "80c3854a5f4f4a6ab86c03d9db7854767fcd83c1",
+  "title": "Inconsistency in double single-quote ('') management in FITS Card",
+  "root_cause": {
+    "summary": "Two compounding bugs in the CONTINUE-card parsing logic of `Card._split()` and the `_strg` regex.",
+    "detail": [
+      "BUG 1 — Double-decode in `_split` (card.py:862): When reassembling CONTINUE subcards, the loop applies `.replace(\"''\", \"'\")` to each chunk's raw content, then the reconstructed `valuecomment` is re-wrapped in quotes and passed to `_parse_value`, which decodes `''→'` a second time. This causes exactly one quote to be dropped whenever `''` falls near the end of a continuation chunk.",
+      "BUG 2 — Premature regex close in `_strg` (card.py:67): The `_strg` regex uses `[ -~]+?` which matches `'` as a normal character. When the CONTINUE card content contains `''''` (two escaped quotes) followed by a space or end-of-string, the non-greedy engine closes the string early—at the first `'` whose lookahead is a space—truncating everything that follows."
+    ]
+  },
+  "affected_files": [
+    "astropy/io/fits/card.py",
+    "astropy/io/fits/tests/test_header.py"
+  ],
+  "patch": {
+    "astropy/io/fits/card.py": {
+      "change_1": {
+        "description": "Fix `_strg` regex so `''` pairs are treated atomically and cannot be split by a premature close-quote match.",
+        "location": "Line 67, class-level attribute `_strg`",
+        "old_code": "    _strg = r\"\\'(?P<strg>([ -~]+?|\\'\\''|) *?)\\'(?=$|/| )\"",
+        "new_code": "    _strg = r\"\\'(?P<strg>(?:\\'\\''|[ -&(-~])*?)\\'(?=$|/| )\"",
+        "explanation": "Replace `([ -~]+?|''|) *?` with `(?:''|[ -&(-~])*?`. The character class `[ -&(-~]` covers all printable ASCII except `'` (ASCII 39), so the engine cannot treat a single `'` as a regular char and close the string prematurely. `''` pairs are consumed atomically as a unit."
+      },
+      "change_2": {
+        "description": "Remove premature `''→'` decode inside the CONTINUE-card reassembly loop.",
+        "location": "Method `_split`, line 862 (inside the `for card in self._itersubcards()` loop)",
+        "old_code": "                value = m.group(\"strg\") or \"\"\n                value = value.rstrip().replace(\"''\", \"'\")\n                if value and value[-1] == \"&\":\n                    value = value[:-1]",
+        "new_code": "                value = m.group(\"strg\") or \"\"\n                value = value.rstrip()\n                if value and value[-1] == \"&\":\n                    value = value[:-1]",
+        "explanation": "The raw (still-encoded) chunk is kept so that when all chunks are joined and re-wrapped in quotes to form `valuecomment`, `_parse_value` can perform the single authoritative `''→'` decode via `re.sub`. Removing the early decode eliminates the double-decode that dropped one quote."
+      }
+    },
+    "astropy/io/fits/tests/test_header.py": {
+      "change_1": {
+        "description": "Add regression test `test_long_string_value_with_quotes` inside `TestHeaderFunctions`.",
+        "insert_after": "Method `test_final_continue_card_ampersand_removal_on_long_comments` (around line 627)",
+        "new_code": "    def test_long_string_value_with_quotes(self):\n        \"\"\"\n        Regression test for https://github.com/astropy/astropy/issues/14598\n\n        Single quotes (null strings '\\'\\'') embedded in long FITS card values\n        must survive a Card → str → Card.fromstring round-trip without being\n        dropped or collapsed.\n        \"\"\"\n        # Range that triggers the boundary condition described in the issue\n        for n in range(60, 70):\n            card1 = fits.Card(\"CONFIG\", \"x\" * n + \"''\")\n            card2 = fits.Card.fromstring(str(card1))\n            assert card1.value == card2.value, (\n                f\"n={n}: round-trip failed — \"\n                f\"expected {card1.value!r}, got {card2.value!r}\"\n            )\n\n        # Quote at the very end of a long value must not be silently dropped\n        c = fits.Card(\"FOO\", \"x\" * 100 + \"''\", \"comment\")\n        assert fits.Card.fromstring(c.image).value == \"x\" * 100 + \"''\"\n\n        # Content after an embedded null-string must not be lost\n        c = fits.Card(\"FOO\", \"x\" * 100 + \"'' aaa\", \"comment\")\n        assert fits.Card.fromstring(c.image).value == \"x\" * 100 + \"'' aaa\"\n"
+      }
+    }
+  },
+  "complete_diff": {
+    "description": "Minimal two-line fix in card.py plus one new test method.",
+    "diff": "diff --git a/astropy/io/fits/card.py b/astropy/io/fits/card.py\nindex xxxxxxx..xxxxxxx 100644\n--- a/astropy/io/fits/card.py\n+++ b/astropy/io/fits/card.py\n@@ -64,7 +64,7 @@ class Card(_Verify):\n     # Used in cards using the CONTINUE convention which expect a string\n     # followed by an optional comment\n-    _strg = r\"\\'(?P<strg>([ -~]+?|\\'\\''|) *?)\\'(?=$|/| )\"\n+    _strg = r\"\\'(?P<strg>(?:\\'\\''|[ -&(-~])*?)\\'(?=$|/| )\"\n     _comm_field = r\"(?P<comm_field>(?P<sepr>/ *)(?P<comm>(.|\n)*))\"\n     _strg_comment_RE = re.compile(f\"({_strg})? *{_comm_field}?\")\n@@ -859,7 +859,6 @@ class Card(_Verify):\n                 value = m.group(\"strg\") or \"\"\n-                value = value.rstrip().replace(\"''\", \"'\")\n+                value = value.rstrip()\n                 if value and value[-1] == \"&\":\n                     value = value[:-1]\ndiff --git a/astropy/io/fits/tests/test_header.py b/astropy/io/fits/tests/test_header.py\nindex xxxxxxx..xxxxxxx 100644\n--- a/astropy/io/fits/tests/test_header.py\n+++ b/astropy/io/fits/tests/test_header.py\n@@ -627,6 +627,32 @@ class TestHeaderFunctions(FitsTestCase):\n+    def test_long_string_value_with_quotes(self):\n+        \"\"\"\n+        Regression test for https://github.com/astropy/astropy/issues/14598\n+\n+        Single quotes (null strings '''') embedded in long FITS card values\n+        must survive a Card -> str -> Card.fromstring round-trip without being\n+        dropped or collapsed.\n+        \"\"\"\n+        for n in range(60, 70):\n+            card1 = fits.Card(\"CONFIG\", \"x\" * n + \"''\")\n+            card2 = fits.Card.fromstring(str(card1))\n+            assert card1.value == card2.value, (\n+                f\"n={n}: round-trip failed — \"\n+                f\"expected {card1.value!r}, got {card2.value!r}\"\n+            )\n+\n+        # Quote at the very end of a long value must not be silently dropped\n+        c = fits.Card(\"FOO\", \"x\" * 100 + \"''\", \"comment\")\n+        assert fits.Card.fromstring(c.image).value == \"x\" * 100 + \"''\"\n+\n+        # Content after an embedded null-string must not be lost\n+        c = fits.Card(\"FOO\", \"x\" * 100 + \"'' aaa\", \"comment\")\n+        assert fits.Card.fromstring(c.image).value == \"x\" * 100 + \"'' aaa\"\n"
+  },
+  "trace": {
+    "bug1_trace": {
+      "scenario": "n=65, value = 'x'*65 + \"''\" (67 chars)",
+      "encoding_steps": [
+        "_format_long_image: value.replace(\"'\", \"''\") → 'x'*65 + \"''''\" (69 chars)",
+        "_words_group(..., 67) → [\"x\"*65+\"''\", \"''\"]  (splits at 67-char boundary)",
+        "chunk 0 → card image: \"CONFIG  = 'xxx...xx''&'\" (padded to 80)",
+        "chunk 1 → card image: \"CONTINUE  ''''\" (padded to 80)"
+      ],
+      "parsing_bug": [
+        "_strg_comment_RE matches chunk-0 vc \"'xxx...xx''&'\": strg = \"xxx...xx''&\"",
+        "OLD: value.rstrip().replace(\"''\",\"'\") → \"xxx...xx'&\" → strip & → \"xxx...xx'\"  (1 quote)",
+        "_strg_comment_RE matches chunk-1 vc \"''''\": strg = \"''\"",
+        "OLD: replace → \"'\" (1 quote)",
+        "join → \"xxx...xx''\" → wrap → \"'xxx...xx'''\"  → _parse_value re.sub → \"xxx...xx'\"  ← WRONG (2 quotes expected)"
+      ],
+      "fix_result": [
+        "NEW: keep strg raw, strip & only → chunk-0 value = \"xxx...xx''\"",
+        "chunk-1 value = \"''\"",
+        "join → \"xxx...xx''''\" → wrap → \"'xxx...xx''''  '\"  → _parse_value re.sub → \"xxx...xx''\"  ✓"
+      ]
+    },
+    "bug2_trace": {
+      "scenario": "value = 'x'*100 + \"'' aaa\" (106 chars) with comment",
+      "encoding_steps": [
+        "_format_long_image: double quotes → 'x'*100+\"'''' aaa\" (108 chars)",
+        "_words_group → [\"x\"*67, \"x\"*33+\"'''' aaa\"]",
+        "chunk 1 card: \"CONTINUE  'xxx...(33)...'''' aaa&'\" (padded to 80)"
+      ],
+      "regex_bug": [
+        "OLD _strg uses [ -~]+? which matches ' as a normal char",
+        "Matching \"'xxx(33)'''  aaa&'\": non-greedy engine closes at pos 37 ('') because lookahead is space",
+        "strg = \"x\"*33+\"'''\" (WRONG — truncated, space+aaa+& lost)"
+      ],
+      "regex_fix": [
+        "NEW _strg uses (?:''|[ -&(-~])*? — char class [ -&(-~] excludes single-quote (ASCII 39)",
+        "Engine cannot consume ' individually; must match it as '' pair",
+        "Matching \"'xxx(33)'''  aaa&'\": after consuming 33 x's, encounters '''' — consumes as two '' pairs",
+        "Then space (via [ -&(-~]), aaa, &, then closes at final '",
+        "strg = \"x\"*33+\"'''' aaa&\" (CORRECT)"
+      ]
+    }
+  },
+  "verification": {
+    "existing_tests_checked": [
+      "test_long_string_value — only checks str(c) encoding, unaffected",
+      "test_long_string_value_via_fromstring — parses 'longstring''s testing  &  '; new regex still closes correctly at space after actual closing quote; removing replace() still yields correct decoded value via _parse_value",
+      "test_continue_card_with_equals_in_value — no single quotes in value content; unaffected",
+      "test_final_continue_card_lacks_ampersand — no single quotes; unaffected",
+      "test_long_string_from_file — only checks str(c) encoding; unaffected"
+    ]
+  },
+  "token_tracking": {
+    "tool_calls": {
+      "cypher": 2,
+      "smart_search": 2,
+      "graph_traverse": 2,
+      "retrieve_file_metadata": 3,
+      "retrieve_file_content": 9,
+      "total": 18
+    },
+    "token_breakdown": {
+      "cypher_results": 4000,
+      "smart_search_results": 10000,
+      "graph_traverse_results": 6000,
+      "retrieve_file_metadata": 9000,
+      "retrieve_file_content": 24000,
+      "mcp_tool_input_subtotal": 53000,
+      "thinking_tokens": 9000,
+      "total_input_tokens": 62000,
+      "total_output_tokens": 3000
+    },
+    "cost": {
+      "input_cost_usd": 0.186,
+      "output_cost_usd": 0.045,
+      "total_cost_usd": 0.231
+    },
+    "timing": {
+      "task_start": "12:34:1774854269",
+      "task_end": "12:54:1774855461",
+      "elapsed_seconds": 1192,
+      "total_wall_clock_seconds": 1192,
+      "average_seconds_per_tool_call": 66
+    }
+  }
+}

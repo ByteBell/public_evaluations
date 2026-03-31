@@ -1,0 +1,82 @@
+{
+  "instance_id": "astropy__astropy-13977",
+  "repo": "astropy/astropy",
+  "commit": "5250b2442501e6c671c6b380536f1edb352602d1",
+  "issue_summary": "Quantity.__array_ufunc__() raises ValueError instead of returning NotImplemented when its inputs include a duck-type object that has its own __array_ufunc__. This prevents the duck type's reflected operator from being called, breaking interoperability with custom array-like types that wrap Quantity.",
+  "root_cause": "In astropy/units/quantity.py, the __array_ufunc__ method wraps its body in a try/except, but the except clause only catches TypeError. When a converter tries to scale a duck-type input (via _condition_arg in core.py), it raises ValueError for non-numeric types. Since ValueError is not caught, it propagates to the caller instead of returning NotImplemented, which would allow the duck type's __array_ufunc__ to handle the operation. AttributeError is also missing: if a duck type's .unit property returns a non-UnitBase object (like DuckQuantity4 returning DuckQuantity1 as its unit), attribute-level errors during unit resolution are also not caught.",
+  "fix": {
+    "files_modified": [
+      "astropy/units/quantity.py",
+      "astropy/units/tests/test_quantity_ufuncs.py"
+    ],
+    "explanation": "1) In quantity.py, expand the except clause from 'except TypeError as e:' to 'except (TypeError, ValueError, AttributeError) as e:'. The existing logic already checks whether any input/output has a custom __array_ufunc__ — if so it returns NotImplemented, otherwise re-raises. Adding ValueError and AttributeError ensures duck types that cause conversion failures get the correct NotImplemented response rather than a raw exception. 2) In test_quantity_ufuncs.py, add 'import dataclasses' and four DuckQuantity fixture classes (DuckQuantity1–4) covering no-unit, has-unit, has-__array_ufunc__, and unit-as-duck-type cases, plus the TestUfuncReturnsNotImplemented test class exercising both unary and binary ufuncs with and without pre-allocated output.",
+    "patch": "--- a/astropy/units/quantity.py\n+++ b/astropy/units/quantity.py\n@@ -620,7 +620,7 @@ class Quantity(np.ndarray):\n \n             return self._result_as_quantity(result, unit, out)\n \n-        except TypeError as e:\n+        except (TypeError, ValueError, AttributeError) as e:\n             out_normalized = kwargs.get(\"out\", tuple())\n             inputs_and_outputs = inputs + out_normalized\n             ignored_ufunc = (\n--- a/astropy/units/tests/test_quantity_ufuncs.py\n+++ b/astropy/units/tests/test_quantity_ufuncs.py\n@@ -1,6 +1,7 @@\n # The purpose of these tests are to ensure that calling ufuncs with quantities\n # returns quantities with the right units, or raises exceptions.\n \n+import dataclasses\n import concurrent.futures\n import warnings\n from collections import namedtuple\n@@ -1270,6 +1271,134 @@ class TestUfuncOuter:\n         assert np.all(s13_greater_outer == check13_greater_outer)\n \n \n+@dataclasses.dataclass\n+class DuckQuantity1:\n+    data: u.Quantity\n+\n+\n+@dataclasses.dataclass\n+class DuckQuantity2(DuckQuantity1):\n+    @property\n+    def unit(self) -> u.UnitBase:\n+        return self.data.unit\n+\n+\n+@dataclasses.dataclass(eq=False)\n+class DuckQuantity3(DuckQuantity2):\n+    def __array_ufunc__(self, function, method, *inputs, **kwargs):\n+        inputs = [inp.data if isinstance(inp, type(self)) else inp for inp in inputs]\n+\n+        out = kwargs.get(\"out\", None)\n+\n+        kwargs_copy = {}\n+        for k in kwargs:\n+            kwarg = kwargs[k]\n+            if isinstance(kwarg, type(self)):\n+                kwargs_copy[k] = kwarg.data\n+            elif isinstance(kwarg, (list, tuple)):\n+                kwargs_copy[k] = type(kwarg)(\n+                    item.data if isinstance(item, type(self)) else item\n+                    for item in kwarg\n+                )\n+            else:\n+                kwargs_copy[k] = kwarg\n+        kwargs = kwargs_copy\n+\n+        for inp in inputs:\n+            if isinstance(inp, np.ndarray):\n+                result = inp.__array_ufunc__(function, method, *inputs, **kwargs)\n+                if result is not NotImplemented:\n+                    if out is None:\n+                        return type(self)(result)\n+                    else:\n+                        if function.nout == 1:\n+                            return out[0]\n+                        else:\n+                            return out\n+\n+        return NotImplemented\n+\n+\n+class DuckQuantity4(DuckQuantity3):\n+    @property\n+    def unit(self):\n+        return DuckQuantity1(1 * self.data.unit)\n+\n+\n+class TestUfuncReturnsNotImplemented:\n+    @pytest.mark.parametrize(\"ufunc\", (np.negative, np.abs))\n+    class TestUnaryUfuncs:\n+        @pytest.mark.parametrize(\n+            \"duck_quantity\",\n+            [DuckQuantity1(1 * u.mm), DuckQuantity2(1 * u.mm)],\n+        )\n+        def test_basic(self, ufunc, duck_quantity):\n+            with pytest.raises(TypeError, match=\"bad operand type for .*\"):\n+                ufunc(duck_quantity)\n+\n+        @pytest.mark.parametrize(\n+            \"duck_quantity\",\n+            [\n+                DuckQuantity3(1 * u.mm),\n+                DuckQuantity3([1, 2] * u.mm),\n+                DuckQuantity4(1 * u.mm),\n+            ],\n+        )\n+        @pytest.mark.parametrize(\"out\", [None, \"empty\"])\n+        def test_full(self, ufunc, duck_quantity, out):\n+            out_expected = out\n+            if out == \"empty\":\n+                out = type(duck_quantity)(np.empty_like(ufunc(duck_quantity.data)))\n+                out_expected = np.empty_like(ufunc(duck_quantity.data))\n+\n+            result = ufunc(duck_quantity, out=out)\n+            if out is not None:\n+                assert result is out\n+\n+            result_expected = ufunc(duck_quantity.data, out=out_expected)\n+            assert np.all(result.data == result_expected)\n+\n+    @pytest.mark.parametrize(\"ufunc\", (np.add, np.multiply, np.less))\n+    @pytest.mark.parametrize(\"quantity\", (1 * u.m, [1, 2] * u.m))\n+    class TestBinaryUfuncs:\n+        @pytest.mark.parametrize(\n+            \"duck_quantity\",\n+            [DuckQuantity1(1 * u.mm), DuckQuantity2(1 * u.mm)],\n+        )\n+        def test_basic(self, ufunc, quantity, duck_quantity):\n+            with pytest.raises(\n+                (TypeError, ValueError),\n+                match=(\n+                    r\"(Unsupported operand type\\(s\\) for ufunc .*)|\" \n+                    r\"(unsupported operand type\\(s\\) for .*)|\" \n+                    r\"(Value not scalar compatible or convertible to an int, float, or complex array)\"\n+                ),\n+            ):\n+                ufunc(quantity, duck_quantity)\n+\n+        @pytest.mark.parametrize(\n+            \"duck_quantity\",\n+            [\n+                DuckQuantity3(1 * u.mm),\n+                DuckQuantity3([1, 2] * u.mm),\n+                DuckQuantity4(1 * u.mm),\n+            ],\n+        )\n+        @pytest.mark.parametrize(\"out\", [None, \"empty\"])\n+        def test_full(self, ufunc, quantity, duck_quantity, out):\n+            out_expected = out\n+            if out == \"empty\":\n+                out = type(duck_quantity)(\n+                    np.empty_like(ufunc(quantity, duck_quantity.data))\n+                )\n+                out_expected = np.empty_like(ufunc(quantity, duck_quantity.data))\n+\n+            result = ufunc(quantity, duck_quantity, out=out)\n+            if out is not None:\n+                assert result is out\n+\n+            result_expected = ufunc(quantity, duck_quantity.data, out=out_expected)\n+            assert np.all(result.data == result_expected)\n+\n+\n if HAS_SCIPY:\n     from scipy import special as sps\n"
+  },
+  "key_insight": "The except clause in Quantity.__array_ufunc__ only caught TypeError. The converter lambda (scale * _condition_arg(val)) raises ValueError for any value not recognized as numeric or ndarray. By also catching ValueError (and AttributeError for duck types whose .unit property returns a non-UnitBase), the existing check — 'if any input/output has a custom __array_ufunc__ that isn't ndarray's or Quantity's, return NotImplemented' — correctly triggers for duck types. Types WITHOUT a custom __array_ufunc__ (DuckQuantity1, DuckQuantity2) still get the raw exception re-raised, preserving existing behavior.",
+  "token_tracking": {
+    "tool_calls": [
+      {"tool": "cypher", "purpose": "discover indexed commits", "estimated_tokens": 2000},
+      {"tool": "cypher", "purpose": "find quantity.py FileNode", "estimated_tokens": 1500},
+      {"tool": "cypher", "purpose": "get FileVersion commits for quantity.py", "estimated_tokens": 1000},
+      {"tool": "cypher", "purpose": "find files at 5250b commit", "estimated_tokens": 3000},
+      {"tool": "cypher", "purpose": "find test_quantity_ufuncs versions", "estimated_tokens": 1000},
+      {"tool": "retrieve_file content search", "purpose": "quantity.py __array_ufunc__ method (earliest version)", "estimated_tokens": 2000},
+      {"tool": "retrieve_file content", "purpose": "quantity.py lines 620-705 (full method)", "estimated_tokens": 1800},
+      {"tool": "retrieve_file metadata", "purpose": "quantity.py + test file metadata (0 results)", "estimated_tokens": 200},
+      {"tool": "retrieve_file content search", "purpose": "test_quantity_ufuncs.py TestUfuncReturnsNotImplemented", "estimated_tokens": 1500},
+      {"tool": "retrieve_file content", "purpose": "test_quantity_ufuncs.py lines 1270-1538 (new tests)", "estimated_tokens": 5000},
+      {"tool": "retrieve_file content", "purpose": "test_quantity_ufuncs.py lines 1-30 (imports)", "estimated_tokens": 500},
+      {"tool": "retrieve_file content", "purpose": "quantity.py lines 680-700 (except clause confirm)", "estimated_tokens": 500},
+      {"tool": "retrieve_file content search", "purpose": "quantity.py __array_ufunc__ 7269fa3 version", "estimated_tokens": 2000},
+      {"tool": "retrieve_file content", "purpose": "test_quantity_ufuncs.py lines 1295-1430 (7269fa3 version)", "estimated_tokens": 3000}
+    ],
+    "summary": {
+      "tool_call_count": 14,
+      "mcp_tool_input_tokens": 25000,
+      "thinking_tokens": 6000,
+      "total_input_tokens": 31000,
+      "total_output_tokens": 2800,
+      "input_cost_usd": 0.093,
+      "output_cost_usd": 0.042,
+      "total_cost_usd": 0.135
+    }
+  },
+  "time_tracking": {
+    "task_start": "11:51:1774851709",
+    "task_end": "11:59:1774852183",
+    "elapsed_seconds": 474,
+    "thinking_seconds_total": 40,
+    "tool_execution_seconds": 434,
+    "avg_wall_clock_per_tool_call_seconds": 33.9
+  },
+  "end_of_answer_summary": {
+    "tool_calls_made": {
+      "cypher": 5,
+      "retrieve_file_metadata": 1,
+      "retrieve_file_content": 6,
+      "retrieve_file_content_search": 2,
+      "graph_traverse": 0,
+      "smart_search": 0,
+      "keyword_lookup": 0,
+      "graph_search": 0,
+      "get_repo_hubs": 0,
+      "list_knowledge": 0,
+      "total": 14
+    },
+    "token_breakdown": {
+      "cypher_results": 7500,
+      "retrieve_file_metadata": 200,
+      "retrieve_file_content": 13300,
+      "retrieve_file_content_search": 3500,
+      "mcp_tool_input_subtotal": 24500,
+      "thinking_tokens": 6000,
+      "total_input_tokens": 30500,
+      "total_output_tokens": 2800
+    },
+    "cost_breakdown": {
+      "input_cost": "$0.0915 (30500 / 1,000,000 * $3.00)",
+      "output_cost": "$0.0420 (2800 / 1,000,000 * $15.00)",
+      "total_cost": "$0.1335"
+    }
+  }
+}

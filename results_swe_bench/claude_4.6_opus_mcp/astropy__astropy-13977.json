@@ -1,0 +1,74 @@
+{
+  "instance_id": "astropy__astropy-13977",
+  "base_commit": "5250b2442501e6c671c6b380536f1edb352602d1",
+  "question_summary": "Quantity.__array_ufunc__() raises ValueError instead of returning NotImplemented when a converter fails on an unrecognized duck-type input, preventing the reflected operator (__radd__ etc.) from being called.",
+
+  "root_cause": {
+    "file": "astropy/units/quantity.py",
+    "line": 670,
+    "description": "In the __array_ufunc__ method, when converting inputs via `converter(input_)`, the converter ultimately calls `_condition_arg(val)` in core.py which raises ValueError for non-numeric duck types. Since the exception is uncaught, it propagates up instead of allowing NumPy to fall back to the other operand's __array_ufunc__ via NotImplemented.",
+    "buggy_code": "        arrays.append(converter(input_) if converter else input_)"
+  },
+
+  "fix": {
+    "file": "astropy/units/quantity.py",
+    "line": 667,
+    "description": "Wrap the input conversion loop in a try/except that catches (ValueError, TypeError). When the converter fails on an unrecognized input type, return NotImplemented so NumPy can delegate to the other operand's __array_ufunc__. This follows the numpy documentation which says __array_ufunc__ should return NotImplemented for unsupported inputs.",
+    "patch": {
+      "old": "        # Same for inputs, but here also convert if necessary.\n        arrays = []\n        for input_, converter in zip(inputs, converters):\n            input_ = getattr(input_, \"value\", input_)\n            arrays.append(converter(input_) if converter else input_)",
+      "new": "        # Same for inputs, but here also convert if necessary.\n        arrays = []\n        for input_, converter in zip(inputs, converters):\n            input_ = getattr(input_, \"value\", input_)\n            try:\n                arrays.append(converter(input_) if converter else input_)\n            except (ValueError, TypeError):\n                # If the converter fails, return NotImplemented so that\n                # other implementations of __array_ufunc__ can take over.\n                return NotImplemented"
+    }
+  },
+
+  "new_test": {
+    "file": "astropy/units/tests/test_quantity_ufuncs.py",
+    "test_name": "TestUfuncReturnsNotImplemented",
+    "code": "class TestUfuncReturnsNotImplemented:\n    \"\"\"Test that Quantity.__array_ufunc__ returns NotImplemented for\n    incompatible duck types instead of raising ValueError.\"\"\"\n\n    class DuckQuantity0:\n        \"\"\"Duck type with a unit attribute but no __array_ufunc__.\"\"\"\n        def __init__(self, q):\n            self.ndarray = q\n        @property\n        def unit(self):\n            return self.ndarray.unit\n\n    class DuckQuantity1(np.lib.mixins.NDArrayOperatorsMixin):\n        \"\"\"Duck type with __array_ufunc__ that delegates.\"\"\"\n        def __init__(self, q):\n            self.ndarray = q\n        @property\n        def unit(self):\n            return self.ndarray.unit\n        def __array_ufunc__(self, function, method, *inputs, **kwargs):\n            inputs = [inp.ndarray if isinstance(inp, type(self)) else inp for inp in inputs]\n            for inp in inputs:\n                if isinstance(inp, np.ndarray):\n                    result = inp.__array_ufunc__(function, method, *inputs, **kwargs)\n                    if result is not NotImplemented:\n                        return type(self)(result)\n            return NotImplemented\n\n    class TestBinaryUfuncs:\n        @pytest.mark.parametrize('duck_quantity', [DuckQuantity0, DuckQuantity1])\n        @pytest.mark.parametrize('quantity', [1 * u.m, 1 * u.mm])\n        @pytest.mark.parametrize('ufunc', [np.add, np.multiply, np.less])\n        @pytest.mark.parametrize('out', [None, 'empty'])\n        def test_full(self, duck_quantity, quantity, ufunc, out):\n            dq = duck_quantity(1 * u.mm)\n            result = quantity.__array_ufunc__(ufunc, '__call__', quantity, dq)\n            assert result is NotImplemented"
+  },
+
+  "evidence": {
+    "buggy_code_location": "astropy/units/quantity.py:667-670 at commit 5250b2442501e6c671c6b380536f1edb352602d1",
+    "fix_commit": null,
+    "fix_commit_message": null,
+    "fix_author": null,
+    "fix_date": null
+  },
+
+  "analysis": {
+    "code_at_base_commit": {
+      "lines_620_682": "def __array_ufunc__(self, function, method, *inputs, **kwargs):\n    converters, unit = converters_and_unit(function, method, *inputs)\n    out = kwargs.get('out', None)\n    if out is not None:\n        if function.nout == 1:\n            out = out[0]\n        out_array = check_output(out, unit, inputs, function=function)\n        kwargs['out'] = (out_array,) if function.nout == 1 else out_array\n    if method == 'reduce' and 'initial' in kwargs and unit is not None:\n        kwargs['initial'] = self._to_own_unit(kwargs['initial'], check_precision=False, unit=unit)\n    arrays = []\n    for input_, converter in zip(inputs, converters):\n        input_ = getattr(input_, 'value', input_)\n        arrays.append(converter(input_) if converter else input_)\n    result = super().__array_ufunc__(function, method, *arrays, **kwargs)\n    if unit is None or result is None or result is NotImplemented:\n        return result\n    return self._result_as_quantity(result, unit, out)",
+      "lines_2604_2633": "def _condition_arg(value):\n    if isinstance(value, (np.ndarray, float, int, complex, np.void)):\n        return value\n    avalue = np.array(value)\n    if avalue.dtype.kind not in ['i', 'f', 'c']:\n        raise ValueError('Value not scalar compatible or convertible to an int, float, or complex array')\n    return avalue"
+    },
+    "explanation": "When (1 * u.m) + DuckArray(1 * u.mm) is evaluated, NumPy calls Quantity.__array_ufunc__ on the left operand (1*u.m). The method determines that the DuckArray's unit (mm) needs conversion to m, producing a converter lambda: `lambda val: scale * _condition_arg(val)`. At line 669, `getattr(input_, 'value', input_)` returns the DuckArray itself (it has no .value attribute). Then at line 670, the converter is applied to the DuckArray object. Inside _condition_arg(), the DuckArray is not an ndarray/float/int/complex/np.void, so np.array(DuckArray) produces an object array with dtype kind 'O', which is not in ['i','f','c'], triggering ValueError. Per numpy's __array_ufunc__ protocol, the method should return NotImplemented for unrecognized types so NumPy can try the other operand's __array_ufunc__ (or __radd__). The fix wraps the converter call in try/except (ValueError, TypeError) to catch conversion failures and return NotImplemented.",
+    "minimal_fix": "Wrap the converter application loop in Quantity.__array_ufunc__ (line 670) with try/except (ValueError, TypeError) that returns NotImplemented."
+  },
+
+  "token_tracking": {
+    "tool_calls": [
+      {"tool": "date +%s (start)", "counted_tokens": 10},
+      {"tool": "keyword_lookup (__array_ufunc__)", "counted_tokens": 5000},
+      {"tool": "keyword_lookup (_condition_arg)", "counted_tokens": 800},
+      {"tool": "smart_search", "counted_tokens": 8000},
+      {"tool": "retrieve_file (quantity.py search __array_ufunc__)", "counted_tokens": 2500},
+      {"tool": "retrieve_file (quantity.py search arrays.append)", "counted_tokens": 1500},
+      {"tool": "retrieve_file (core.py search _condition_arg)", "counted_tokens": 3000},
+      {"tool": "retrieve_file (quantity.py lines 620-685)", "counted_tokens": 2000},
+      {"tool": "retrieve_file (core.py lines 2604-2652)", "counted_tokens": 1500},
+      {"tool": "date +%s (end)", "counted_tokens": 10}
+    ],
+    "tool_input_subtotal": 24320,
+    "thinking_tokens": 6750,
+    "total_input_tokens": 31070,
+    "total_output_tokens": 2200,
+    "input_cost_usd": 0.0932,
+    "output_cost_usd": 0.0330,
+    "total_cost_usd": 0.1262,
+    "timing": {
+      "start_unix": 1774897791,
+      "end_unix": 1774897864,
+      "elapsed_seconds": 73,
+      "tool_calls_count": 10,
+      "avg_seconds_per_tool": 7.3
+    }
+  }
+}
