@@ -74,20 +74,43 @@ TASKS_FILE = PROJECT_ROOT / "results_swe_bench" / "astropy_tasks.json"
 #   ":5"   → first 5
 #   "3:"   → everything from index 3 onward
 #   "2:4"  → indices 2 and 3
-TASK_SLICE = "3:"
+TASK_SLICE = ":"
 
 # Output root — each task writes to OUT_DIR/<instance_id>/
-OUT_DIR = PROJECT_ROOT / "results_swe_bench" / "auto_run_on_claude_sonnet_4_6_raw"
+OUT_DIR = PROJECT_ROOT / "results_swe_bench" / "auto_run_on_qwen3.6_plus_preview"
 
-# Model to use. Options:
+# ── Model provider ────────────────────────────────────────────────────────────
+# "anthropic"   — use Anthropic-hosted Claude models (default)
+# "openrouter"  — use any OpenRouter model (open-source or otherwise)
+MODEL_PROVIDER = "openrouter"
+
+# Anthropic model (used when MODEL_PROVIDER == "anthropic"). Options:
 #   "claude-opus-4-6"           — most capable
 #   "claude-sonnet-4-6"         — balanced (default)
 #   "claude-haiku-4-5-20251001" — fastest / cheapest
 MODEL = "claude-sonnet-4-6"
 
+# OpenRouter settings (used when MODEL_PROVIDER == "openrouter").
+#   OPENROUTER_API_KEY  — your OpenRouter API key (sk-or-...)
+#   OPENROUTER_MODEL    — full model slug as listed on openrouter.ai
+#   Note: uses ANTHROPIC_BASE_URL redirect, no "openrouter/" prefix needed
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_MODEL   = "qwen/qwen3.6-plus-preview:free"
+
 # "print"       — subprocess + `claude -p` (non-interactive, exits when done)
 # "interactive" — pexpect PTY (interactive TUI, useful for auto-approval loops)
 MODE = "print"
+
+# ── Run-mode ──────────────────────────────────────────────────────────────────
+# "raw" — Claude reads from the local Astropy checkout (original behaviour)
+# "mcp" — Claude runs in an empty workspace and must use ByteBell MCP tools
+RUN_MODE = "raw"   # overridden by --run-mode CLI arg
+
+# Output dir for MCP runs (raw run dir is OUT_DIR above)
+MCP_OUT_DIR = PROJECT_ROOT / "results_swe_bench" / "mcp_run_on_qwen3.6_plus_preview_with_mcp"
+
+# Empty directory used as cwd for MCP runs so Claude has no local repo context
+MCP_WORKSPACE = PROJECT_ROOT / "mcp_workspace"
 
 # How long to wait (seconds) for Claude to finish in interactive PTY mode
 INTERACTIVE_TIMEOUT = 1000
@@ -107,6 +130,30 @@ OTEL_SESSION_LOCK_WAIT = 20
 # ── System prompt ─────────────────────────────────────────────────────────────
 # Injected via `--system-prompt` on every Claude invocation.
 # The literal placeholder {answer_path} is filled in per-task at runtime.
+
+MCP_SYSTEM_PROMPT_TEMPLATE = """\
+# ByteBell MCP
+
+Answer the question below using **only** ByteBell MCP tools
+
+---
+
+## Hard Rules
+
+1. **ONLY use ByteBell MCP tools** — no local file reads, no git APIs, no GitNexus skills.
+
+---
+
+Just write your answer, no special format needed.
+
+{{ "answer": "answer" }} that's it
+
+Question :
+
+{question}
+
+Write your answer to {answer_path}
+"""
 
 SYSTEM_PROMPT_TEMPLATE = """\
 ## Ground Rules
@@ -142,13 +189,35 @@ Do NOT print the answer to the terminal. Only write it to that file.
 LOG_FMT  = "%(asctime)s  %(levelname)-8s  %(message)s"
 DATE_FMT = "%H:%M:%S"
 
+
+class _ColorFormatter(logging.Formatter):
+    """ANSI-colored console formatter — colors by log level, no external deps."""
+    _LEVEL_COLORS = {
+        logging.DEBUG:    "\033[36m",    # cyan
+        logging.INFO:     "\033[32m",    # green
+        logging.WARNING:  "\033[33m",    # yellow
+        logging.ERROR:    "\033[31m",    # red
+        logging.CRITICAL: "\033[1;31m",  # bold red
+    }
+    _TS_COLOR    = "\033[2;37m"   # dim white  — timestamp
+    _MSG_COLOR   = "\033[97m"     # bright white — message
+    _RESET       = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        lc   = self._LEVEL_COLORS.get(record.levelno, "")
+        lvl  = f"{lc}{record.levelname:<8}{self._RESET}"
+        ts   = f"{self._TS_COLOR}{self.formatTime(record, self.datefmt)}{self._RESET}"
+        msg  = f"{self._MSG_COLOR}{record.getMessage()}{self._RESET}"
+        return f"{ts}  {lvl}  {msg}"
+
+
 log = logging.getLogger("auditor")
 log.setLevel(logging.DEBUG)
 
-# Console handler — INFO and above so progress is visible
+# Console handler — colored INFO+ output
 _console = logging.StreamHandler(sys.stdout)
 _console.setLevel(logging.INFO)
-_console.setFormatter(logging.Formatter(LOG_FMT, datefmt=DATE_FMT))
+_console.setFormatter(_ColorFormatter(datefmt=DATE_FMT))
 log.addHandler(_console)
 
 
@@ -294,6 +363,19 @@ def copy_session_files(session_id, telemetry_dir, task_log):
             task_log.info("  Copied OTel log -> telemetry/%s", f.name)
     return copied
 
+def build_mcp_prompt(task: dict, answer_path: Path) -> str:
+    """
+    Build the MCP-mode user prompt. Claude receives the bare question and must
+    answer using only ByteBell MCP tools — no local files.
+    """
+    return (
+        f"{task['question']}\n\n"
+        f"---\n"
+        f"Write your answer to: {answer_path}\n"
+        f"Format: {{\"answer\": \"your answer\"}}\n"
+    )
+
+
 def build_prompt(task: dict, answer_path: Path) -> str:
     """
     Build the user prompt from the task's question field only.
@@ -307,14 +389,38 @@ def build_prompt(task: dict, answer_path: Path) -> str:
     )
 
 
+def _effective_model() -> str:
+    """Return the model string to pass to --model, accounting for provider."""
+    if MODEL_PROVIDER == "openrouter":
+        # OpenRouter integration redirects ANTHROPIC_BASE_URL, so model slug
+        # is passed as-is (no "openrouter/" prefix needed).
+        return OPENROUTER_MODEL
+    return MODEL
+
+
+def _provider_env() -> dict:
+    """Extra env vars required by the active provider."""
+    if MODEL_PROVIDER == "openrouter":
+        if not OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY is not set but MODEL_PROVIDER='openrouter'")
+        return {
+            "OPENROUTER_API_KEY":  OPENROUTER_API_KEY,
+            "ANTHROPIC_BASE_URL":  "https://openrouter.ai/api",
+            "ANTHROPIC_AUTH_TOKEN": OPENROUTER_API_KEY,
+            "ANTHROPIC_API_KEY":   "",
+        }
+    return {}
+
+
 def launch_claude_print(prompt, system_prompt, cwd, task_log):
-    task_log.info("Launching Claude (print / model=%s) ...", MODEL)
+    model = _effective_model()
+    task_log.info("Launching Claude (print / provider=%s / model=%s) ...", MODEL_PROVIDER, model)
     task_log.debug("CWD: %s", cwd)
     proc = subprocess.Popen(
-        [CLAUDE_BIN,"--print","--dangerously-skip-permissions",
-         "--model", MODEL, "--system-prompt", system_prompt, "--verbose", prompt],
+        [CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
+         "--model", model, "--system-prompt", system_prompt, prompt],
         cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env={**os.environ, **OTEL_ENV},
+        text=True, env={**os.environ, **OTEL_ENV, **_provider_env()},
     )
     task_log.debug("Claude PID: %d", proc.pid)
     return proc
@@ -410,14 +516,20 @@ def setup_and_launch(task: dict, task_num: int, total: int) -> dict:
     """
     instance_id  = task["instance_id"]
     base_commit  = task["base_commit"]
-    cwd          = ASTROPY_DIR
+
+    if RUN_MODE == "mcp":
+        cwd      = MCP_WORKSPACE
+        out_root = MCP_OUT_DIR
+    else:
+        cwd      = ASTROPY_DIR
+        out_root = OUT_DIR
 
     log.info("=" * 70)
-    log.info("TASK %d/%d  —  %s  [launching]", task_num, total, instance_id)
+    log.info("TASK %d/%d  —  %s  [launching]  mode=%s", task_num, total, instance_id, RUN_MODE)
     log.info("  base_commit : %s", base_commit)
     log.info("=" * 70)
 
-    task_dir      = OUT_DIR / instance_id
+    task_dir      = out_root / instance_id
     answer_path   = task_dir / "answer.json"
     telemetry_dir = task_dir / "telemetry"
     logs_dir      = task_dir / "logs"
@@ -425,8 +537,15 @@ def setup_and_launch(task: dict, task_num: int, total: int) -> dict:
         d.mkdir(parents=True, exist_ok=True)
 
     task_log, fh = _make_task_logger(instance_id, logs_dir)
-    prompt        = build_prompt(task, answer_path)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(answer_path=str(answer_path))
+
+    if RUN_MODE == "mcp":
+        prompt        = build_mcp_prompt(task, answer_path)
+        system_prompt = MCP_SYSTEM_PROMPT_TEMPLATE.format(
+            question=task["question"], answer_path=str(answer_path)
+        )
+    else:
+        prompt        = build_prompt(task, answer_path)
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(answer_path=str(answer_path))
 
     before = snapshot_logs()
     task_log.info("OTel snapshot before launch: %d file(s)", len(before))
@@ -521,11 +640,13 @@ def finish_task(ctx: dict) -> None:
         manifest = {
             "instance_id"   : instance_id,
             "base_commit"   : base_commit,
-            "model"         : MODEL,
+            "model_provider": MODEL_PROVIDER,
+            "model"         : _effective_model(),
             "mode"          : MODE,
+            "run_mode"      : RUN_MODE,
             "run_ts"        : datetime.now(timezone.utc).isoformat(),
             "elapsed_s"     : round(elapsed, 2),
-            "cwd"           : str(ASTROPY_DIR),
+            "cwd"           : str(MCP_WORKSPACE if RUN_MODE == "mcp" else ASTROPY_DIR),
             "answer_written": answer_written,
             "otel_session_id": session_id,
             "otel_sessions" : {sid: [str(f) for f in files] for sid, files in sessions.items()},
@@ -566,7 +687,25 @@ def main() -> None:
         help="Run only these task IDs (numeric suffix, e.g. 14369 14598). "
              "Overrides TASK_SLICE when provided.",
     )
+    parser.add_argument(
+        "--run-mode", choices=["raw", "mcp"], default=None,
+        help="raw: Claude reads local repo (default). mcp: Claude uses ByteBell MCP only.",
+    )
+    parser.add_argument(
+        "--openrouter-api-key", metavar="KEY", default=None,
+        help="OpenRouter API key (overrides OPENROUTER_API_KEY config / env var).",
+    )
     args = parser.parse_args()
+
+    # Apply --run-mode override
+    if args.run_mode is not None:
+        global RUN_MODE
+        RUN_MODE = args.run_mode
+
+    # Apply --openrouter-api-key override
+    if args.openrouter_api_key is not None:
+        global OPENROUTER_API_KEY
+        OPENROUTER_API_KEY = args.openrouter_api_key
 
     all_tasks = load_tasks()
 
@@ -585,17 +724,23 @@ def main() -> None:
     log.info("Claude Auditor — SWE-bench evaluation run")
     log.info("  Tasks file  : %s", TASKS_FILE.name)
     log.info("  Selection   : %s  (%d task(s))", selector, total)
-    log.info("  Model       : %s", MODEL)
+    active_out_dir = MCP_OUT_DIR if RUN_MODE == "mcp" else OUT_DIR
+
+    log.info("  Provider    : %s", MODEL_PROVIDER)
+    log.info("  Model       : %s", _effective_model())
     log.info("  Mode        : %s", MODE)
+    log.info("  Run-mode    : %s", RUN_MODE)
     log.info("  Workers     : %d", PARALLEL_WORKERS)
-    log.info("  Output dir  : %s", OUT_DIR)
+    log.info("  Output dir  : %s", active_out_dir)
     log.info("=" * 70)
 
     if total == 0:
         log.warning("No tasks matched — check --testids or TASK_SLICE. Exiting.")
         return
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    active_out_dir.mkdir(parents=True, exist_ok=True)
+    if RUN_MODE == "mcp":
+        MCP_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
     # Start the OTel receiver once for the whole run
     start_otel_receiver()
@@ -632,7 +777,7 @@ def main() -> None:
         kill_otel_receiver()
 
     log.info("=" * 70)
-    log.info("Run complete. Results in: %s", OUT_DIR)
+    log.info("Run complete. Results in: %s", active_out_dir)
     log.info("=" * 70)
 
 
