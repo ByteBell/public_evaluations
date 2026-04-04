@@ -135,6 +135,98 @@ def compute_metrics(events_path, metrics_path=None):
     return result
 
 
+def compute_metrics_from_kilo_stdout(stdout_path, manifest_path=None):
+    """Parse kilo's streaming JSON stdout (step_finish / tool_use events) for metrics."""
+    with open(stdout_path) as f:
+        lines = f.readlines()
+
+    step_finishes = []
+    tool_uses = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = d.get("type", "")
+        if t == "step_finish":
+            step_finishes.append(d)
+        elif t == "tool_use":
+            tool_uses.append(d)
+
+    total_input    = sum(int(e["part"]["tokens"]["input"])             for e in step_finishes if "tokens" in e.get("part", {}))
+    total_output   = sum(int(e["part"]["tokens"]["output"])            for e in step_finishes if "tokens" in e.get("part", {}))
+    total_reasoning= sum(int(e["part"]["tokens"].get("reasoning", 0)) for e in step_finishes if "tokens" in e.get("part", {}))
+    total_cr       = sum(int(e["part"]["tokens"]["cache"]["read"])     for e in step_finishes if "tokens" in e.get("part", {}))
+    total_cc       = sum(int(e["part"]["tokens"]["cache"]["write"])    for e in step_finishes if "tokens" in e.get("part", {}))
+    total_cost     = sum(float(e["part"].get("cost", 0))              for e in step_finishes)
+    total_api      = len(step_finishes)
+    total_tools    = len(tool_uses)
+
+    # Timestamps are unix milliseconds
+    all_ts = sorted(e["timestamp"] for e in step_finishes + tool_uses if "timestamp" in e)
+    if len(all_ts) >= 2:
+        elapsed = round((all_ts[-1] - all_ts[0]) / 1000.0, 3)
+        def ms_to_iso(ms):
+            dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+        start_time = ms_to_iso(all_ts[0])
+        end_time   = ms_to_iso(all_ts[-1])
+    else:
+        elapsed, start_time, end_time = 0.0, None, None
+
+    # Fall back to elapsed_s from run_manifest if available and we have no events
+    if elapsed == 0.0 and manifest_path and os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            elapsed = manifest.get("elapsed_s", 0.0)
+        except Exception:
+            pass
+
+    # Model from manifest
+    models = []
+    if manifest_path and os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            m = manifest.get("model", "")
+            if m:
+                models = [m]
+        except Exception:
+            pass
+
+    result = {
+        "time_taken_seconds":          elapsed,
+        "start_time":                  start_time,
+        "end_time":                    end_time,
+        "total_cost_usd":              round(total_cost, 5),
+        "total_input_tokens":          total_input,
+        "total_output_tokens":         total_output,
+        "total_reasoning_tokens":      total_reasoning,
+        "total_cache_read_tokens":     total_cr,
+        "total_cache_creation_tokens": total_cc,
+        "total_api_requests":          total_api,
+        "total_tool_calls":            total_tools,
+        "models_used":                 models,
+    }
+
+    if models:
+        model_name = models[0]
+        short = model_name.split("/")[-1].split(":")[0]
+        safe = "".join(c if c.isalnum() else "_" for c in short)
+        result[f"{safe}_input_tokens"]          = total_input
+        result[f"{safe}_output_tokens"]         = total_output
+        result[f"{safe}_cache_read_tokens"]     = total_cr
+        result[f"{safe}_cache_creation_tokens"] = total_cc
+        result[f"{safe}_cost_usd"]              = round(total_cost, 5)
+        result[f"{safe}_api_requests"]          = total_api
+
+    return result
+
+
 def enrich_task(task_dir):
     answer_path = os.path.join(task_dir, "answer.json")
     telemetry_dir = os.path.join(task_dir, "telemetry")
@@ -155,16 +247,24 @@ def enrich_task(task_dir):
         elif fname.endswith("_metrics.json"):
             metrics_file = fpath
 
-    if not events_file:
-        return False, "no events file"
-
     with open(answer_path) as f:
         answer = json.load(f)
 
-    try:
-        metrics = compute_metrics(events_file, metrics_file)
-    except Exception as e:
-        return False, f"telemetry parse error: {e}"
+    if not events_file:
+        # Fallback: parse kilo streaming JSON from logs/claude_stdout.txt
+        stdout_path = os.path.join(task_dir, "logs", "claude_stdout.txt")
+        manifest_path = os.path.join(task_dir, "run_manifest.json")
+        if not os.path.exists(stdout_path):
+            return False, "no events file and no kilo stdout"
+        try:
+            metrics = compute_metrics_from_kilo_stdout(stdout_path, manifest_path)
+        except Exception as e:
+            return False, f"kilo stdout parse error: {e}"
+    else:
+        try:
+            metrics = compute_metrics(events_file, metrics_file)
+        except Exception as e:
+            return False, f"telemetry parse error: {e}"
 
     # Merge: answer fields first, then metrics
     enriched = {"answer": answer.get("answer", "")}
