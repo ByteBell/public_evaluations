@@ -177,7 +177,7 @@ OTEL_FLUSH_WAIT = 8
 # Each task is a separate `claude --print` subprocess with its own OTel session.
 # Session IDs are locked to tasks within the first OTEL_SESSION_LOCK_WAIT seconds,
 # so parallel runs never mix each other's telemetry files.
-PARALLEL_WORKERS = 1
+PARALLEL_WORKERS = 10
 
 # How long (seconds) to poll for the task's OTel session UUID to appear before giving up
 OTEL_SESSION_LOCK_WAIT = 20
@@ -187,13 +187,17 @@ OTEL_SESSION_LOCK_WAIT = 20
 # The literal placeholder {answer_path} is filled in per-task at runtime.
 
 MCP_SYSTEM_PROMPT_TEMPLATE = """\
-Use the ByteBell MCP tools to answer the question. Write your answer to `{answer_path}` as JSON:
+You are a code analysis agent. Your task is to **analyse** the bug described in the question \
+using the ByteBell MCP tools and write a clear, concise answer describing the fix.
+Write your answer **only** to:
 
-{{"answer": "your answer here"}}
+    {answer_path}
 
-Question:
+The file must be valid JSON with exactly this structure:
 
-{question}
+{{
+  "answer": "<your complete patch or explanation here>"
+}}
 """
 
 SYSTEM_PROMPT_TEMPLATE = """\
@@ -406,14 +410,13 @@ def copy_session_files(session_id, telemetry_dir, task_log):
 
 def build_mcp_prompt(task: dict, answer_path: Path) -> str:
     """
-    Build the MCP-mode user prompt. Claude receives the bare question and must
-    answer using only ByteBell MCP tools — no local files.
+    Build the MCP-mode user prompt. The question is passed here; answer path
+    and format are repeated so the model sees them in the user turn too.
     """
     return (
         f"{task['question']}\n\n"
-        f"---\n"
         f"Write your answer to: {answer_path}\n"
-        f"Format: {{\"answer\": \"your answer\"}}\n"
+        f'Format: {{"answer": "your patch / explanation"}}\n'
     )
 
 
@@ -904,7 +907,23 @@ def _enrich_from_kilo(task_dir: Path) -> tuple:
     elapsed_s   = manifest.get("elapsed_s", 0)
 
     if not cli_metrics:
-        return False, "no cli_metrics in manifest", {}
+        # Fall back to parsing logs/claude_stdout.txt via enrich_answers
+        src_dir = str(PROJECT_ROOT / "src")
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        try:
+            from enrich_answers import enrich_task  # type: ignore
+        except ImportError as exc:
+            return False, f"no cli_metrics and cannot import enrich_answers: {exc}", {}
+        ok, msg = enrich_task(str(task_dir))
+        metrics: dict = {}
+        if ok:
+            try:
+                data = json.loads(answer_path.read_text(encoding="utf-8"), strict=False)
+                metrics = {k: v for k, v in data.items() if k != "answer"}
+            except Exception:
+                pass
+        return ok, msg, metrics
 
     # _parse_kilo_metrics already stores fields using the standard schema names
     # (total_input_tokens, total_output_tokens, …).  Just pass them through and
