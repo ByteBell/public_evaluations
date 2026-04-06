@@ -12,7 +12,7 @@
 
 > **Note on concurrent execution:** Each task was run simultaneously with a second model (Qwen 3.6-plus or Gemma-4-31b). The `run_manifest.json` files for 13 tasks were written by the competing process, not the Sonnet process, and incorrectly show `qwen/qwen3.6-plus:free` as the model. The `claude_stdout.txt` files contain the actual Sonnet session output (confirmed by `toolu_bdrk_*` and `toolu_vrtx_*` tool call IDs, and auditor logs). Costs in the enriched `answer.json` files reflect Sonnet usage. The `models_used` array in enriched files is unreliable for this run.
 >
-> **Note on 2 zero-metric tasks (14995, 7166):** Both have valid answer diffs but 0 recorded cost/time — the Sonnet session log for these tasks was not captured (competed sessions). Answers are graded normally; cost/time excluded from averages.
+> **Note on tasks 14995 and 7166 (re-run 2026-04-06):** Both tasks were re-run individually to recover their missing metrics. Scores are unchanged (8/8 and 7/8 respectively). All aggregates below now include all 22 tasks.
 >
 > **Note on raw kilo mode:** Unlike text-description answers (nano/mini runs), the Sonnet agent directly edited the repository. The `answer` field contains the actual unified diff applied, enabling precise patch comparison.
 
@@ -49,15 +49,15 @@
 | 13 | `astropy__astropy-14508` | 15m–1h | 3 | 2 | 3 | **8/8** | ✅ Exact | 43 | $0.141 |
 | 14 | `astropy__astropy-14539` | 15m–1h | 3 | 2 | 3 | **8/8** | ✅ Exact | 400 | $1.211 |
 | 15 | `astropy__astropy-14598` | 15m–1h | 3 | 2 | 2 | **7/8** | ✅ Near-perfect | 2,851 | $4.819 |
-| 16 | `astropy__astropy-14995` | <15m | 3 | 2 | 3 | **8/8** | ✅ Exact | — | — |
-| 17 | `astropy__astropy-7166` | <15m | 3 | 2 | 2 | **7/8** | ✅ Near-perfect | — | — |
+| 16 | `astropy__astropy-14995` | <15m | 3 | 2 | 3 | **8/8** | ✅ Exact | 384 | $1.143 |
+| 17 | `astropy__astropy-7166` | <15m | 3 | 2 | 2 | **7/8** | ✅ Near-perfect | 177 | $0.492 |
 | 18 | `astropy__astropy-7336` | <15m | 3 | 2 | 3 | **8/8** | ✅ Exact | 27 | $0.108 |
 | 19 | `astropy__astropy-7606` | 15m–1h | 3 | 2 | 2 | **7/8** | ✅ Near-perfect | 38 | $0.072 |
 | 20 | `astropy__astropy-7671` | 15m–1h | 3 | 2 | 3 | **8/8** | ✅ Exact | 131 | $0.300 |
 | 21 | `astropy__astropy-8707` | 15m–1h | 3 | 2 | 1 | **6/8** | ⚠️ Partial | 41 | $0.155 |
 | 22 | `astropy__astropy-8872` | 15m–1h | 3 | 2 | 2 | **7/8** | ✅ Near-perfect | 40 | $0.130 |
-| | **TOTAL** | | **59/66** | **43/44** | **43/66** | **145/176** | **82.4%** | **9,927 s (20 tasks)** | **$20.91 (20 tasks)** |
-| | **AVERAGE** | | | | | **6.6/8** | | **496 s** | **$1.05** |
+| | **TOTAL** | | **59/66** | **43/44** | **43/66** | **145/176** | **82.4%** | **10,488 s (22 tasks)** | **$22.55 (22 tasks)** |
+| | **AVERAGE** | | | | | **6.6/8** | | **477 s** | **$1.03** |
 
 ---
 
@@ -91,18 +91,16 @@
 | 13 | `14508` | 23,798 | 104,543 | 1,352 | **$0.141** | 8 | 43 |
 | 14 | `14539` | 72,080 | 2,163,594 | 19,474 | **$1.211** | 58 | 400 |
 | 15 | `14598` | 398,900 | 5,019,641 | 121,151 | **$4.819** | 52 | 2,851 |
-| 16 | `14995` | — | — | — | **—** | — | — |
-| 17 | `7166` | — | — | — | **—** | — | — |
+| 16 | `14995` | 79,354 | 1,686,286 | 22,659 | **$1.143** | 45 | 384 |
+| 17 | `7166` | 48,350 | 569,699 | 9,324 | **$0.492** | 28 | 177 |
 | 18 | `7336` | 18,019 | 83,867 | 1,002 | **$0.108** | 7 | 27 |
 | 19 | `7606` | 4,547 | 96,372 | 1,764 | **$0.072** | 7 | 38 |
 | 20 | `7671` | 40,267 | 139,671 | 7,118 | **$0.300** | 9 | 131 |
 | 21 | `8707` | 27,410 | 103,480 | 1,408 | **$0.155** | 8 | 41 |
 | 22 | `8872` | 21,854 | 95,571 | 1,262 | **$0.130** | 8 | 40 |
-| | **TOTAL (20)** | **1,419,063** | **27,622,095** | **486,708** | **$20.91** | **559** | **9,927** |
+| | **TOTAL (22)** | **1,546,767** | **29,878,080** | **518,691** | **$22.55** | **632** | **10,488** |
 
-> Average per task (20 active): 496 s · $1.05
->
-> Tasks 16 (`14995`) and 17 (`7166`) produced correct answers but have no recorded metrics — the Sonnet log was not captured during concurrent execution.
+> Average per task (all 22): 477 s · $1.03 · Eff Input 206K · Output 23.6K
 
 ---
 
