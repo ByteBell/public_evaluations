@@ -51,13 +51,14 @@
 
 All three input-side token classes are included because all three incur real cost:
 
-| API backend | Cache Write multiplier α | Cache Read multiplier |
-|-------------|--------------------------|----------------------|
-| Anthropic direct (CC runs 1–4) | **1.25×** | 0.10× |
-| OpenAI / GPT | **1.0×** (not separately reported for Kilo runs) | 0.10× |
-| Qwen free tier (no caching) | — | — |
+| API backend | Cache Write α | Cache Read multiplier | Notes |
+|-------------|--------------|----------------------|-------|
+| Anthropic direct (CC runs 1–4) | **1.25×** | 0.10× | Explicit `cache_control` breakpoints; write tokens billed and tracked |
+| Kilo → Bedrock/Anthropic (runs 5, 9) | **0×** | 0.10× | Automatic top-level caching; first-call context billed at 1× standard input, no write premium; step logs confirm `write:0` |
+| Kilo → OpenAI GPT (runs 7, 8, 12) | **0×** (free) | 0.10× | Cache writes are free per OpenAI pricing; GPT-5.4 Mini $0.075/M cached vs $0.75/M input = 0.1×; step logs confirm `write:0` |
+| Qwen free tier (runs 6, 10) | — | — | No prompt caching; full context rebuilt each step |
 
-**Kilo/OpenRouter runs (5, 7, 8, 9, 11, 12):** Cache Write tokens are not surfaced separately in OpenRouter telemetry, so α × CW = 0 for these runs. Their Eff Input is therefore slightly understated compared to Claude Code runs where CW is fully tracked.
+**Run 11 (GPT Mini MCP):** No cache reads recorded (CR=0); Eff Input = raw Input tokens.
 
 **Output tokens** = generated tokens; reported as-is. For Qwen models, reasoning tokens (chain-of-thought) are generated separately and listed where available.
 
