@@ -88,13 +88,13 @@ TASK_SLICE = ":3"
 # ── Model provider ────────────────────────────────────────────────────────────
 # "anthropic"   — use Anthropic-hosted Claude models (default)
 # "openrouter"  — use any OpenRouter model (open-source or otherwise)
-MODEL_PROVIDER = "openrouter"
+MODEL_PROVIDER = "anthropic"   # overridden by --model-provider CLI arg
 
 # Anthropic model (used when MODEL_PROVIDER == "anthropic"). Options:
 #   "claude-opus-4-6"           — most capable
 #   "claude-sonnet-4-6"         — balanced (default)
 #   "claude-haiku-4-5-20251001" — fastest / cheapest
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-opus-4-6"
 
 # OpenRouter settings (used when MODEL_PROVIDER == "openrouter").
 #   OPENROUTER_API_KEY  — your OpenRouter API key (sk-or-...)
@@ -148,7 +148,7 @@ EVAL_MODELS = [
 # ── Run-mode ──────────────────────────────────────────────────────────────────
 # "raw" — Claude reads from the local Astropy checkout (original behaviour)
 # "mcp" — Claude runs in an empty workspace and must use ByteBell MCP tools
-RUN_MODE = "raw"   # overridden by --run-mode CLI arg
+RUN_MODE = "mcp"   # overridden by --run-mode CLI arg
 
 
 def _active_out_dir() -> Path:
