@@ -74,8 +74,19 @@ OTEL_ENV = {
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID":"true",
 }
 
-# Input: path to the tasks JSON
-TASKS_FILE = PROJECT_ROOT / "results_swe_bench" / "astropy_tasks.json"
+# ── Task set ──────────────────────────────────────────────────────────────────
+# "astropy"  — Astropy SWE-bench tasks (local checkout available for raw mode)
+# "swe_pro"  — SWE-Pro multi-repo tasks (MCP / mcp_skills modes only)
+TASK_SET = "astropy"   # overridden by --task-set CLI arg
+
+_TASKS_FILES = {
+    "astropy": PROJECT_ROOT / "results_swe_bench" / "astropy_tasks.json",
+    "swe_pro": PROJECT_ROOT / "results_on_swe_pro" / "swe_pro_tasks.json",
+}
+
+# Input: resolved at runtime from TASK_SET
+def _tasks_file() -> Path:
+    return _TASKS_FILES[TASK_SET]
 
 # Slice string — controls which tasks to run. Examples:
 #   ":"    → all tasks
@@ -146,9 +157,10 @@ EVAL_MODELS = [
 ]
 
 # ── Run-mode ──────────────────────────────────────────────────────────────────
-# "raw" — Claude reads from the local Astropy checkout (original behaviour)
-# "mcp" — Claude runs in an empty workspace and must use ByteBell MCP tools
-RUN_MODE = "mcp"   # overridden by --run-mode CLI arg
+# "raw"        — Claude reads from the local Astropy checkout (original behaviour)
+# "mcp"        — Claude runs in an empty workspace and must use ByteBell MCP tools (no skill docs)
+# "mcp_skills" — Same as "mcp" but ByteBell skill .md files are injected into the system prompt
+RUN_MODE = "mcp_skills"   # overridden by --run-mode CLI arg
 
 
 def _active_out_dir() -> Path:
@@ -160,7 +172,7 @@ def _active_out_dir() -> Path:
     model   = _tl("OPENROUTER_MODEL") if _tl("MODEL_PROVIDER") == "openrouter" else _tl("MODEL")
     safe    = model.replace("/", "_").replace(" ", "_")
     backend = f"{_tl('CLI_BACKEND')}_" if _tl("CLI_BACKEND") != "claude" else ""
-    base    = f"{RUN_MODE}_{backend}{safe}"
+    base    = f"{TASK_SET}_{RUN_MODE}_{backend}{safe}"
     slug    = base if MODE == "print" else f"{base}_{MODE}"
     return PROJECT_ROOT / "results_swe_bench" / f"auto_run_on_{slug}"
 
@@ -467,9 +479,20 @@ def launch_claude_print(prompt, system_prompt, cwd, task_log):
     model = _effective_model()
     task_log.info("Launching Claude (print / provider=%s / model=%s) ...", _tl("MODEL_PROVIDER"), model)
     task_log.debug("CWD: %s", cwd)
+    cmd = [CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
+           "--model", model, "--system-prompt", system_prompt]
+    # In mcp_skills mode, inject ByteBell skill files so Claude has search guidance
+    # (--print strips the Skill tool, so we append skill content directly)
+    if RUN_MODE == "mcp_skills":
+        skills_dir = MCP_WORKSPACE / ".claude" / "skills" / "bytebell"
+        skill_files = [skills_dir / "SKILL.md"] + sorted(skills_dir.glob("bytebell-*.md"))
+        for skill_file in skill_files:
+            if skill_file.exists():
+                cmd += ["--append-system-prompt-file", str(skill_file)]
+                task_log.debug("Appending skill: %s", skill_file.name)
+    cmd.append(prompt)
     proc = subprocess.Popen(
-        [CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
-         "--model", model, "--system-prompt", system_prompt, prompt],
+        cmd,
         cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env={**os.environ, **OTEL_ENV, **_provider_env()},
     )
@@ -650,7 +673,7 @@ def setup_and_launch(task: dict, task_num: int, total: int) -> dict:
     instance_id  = task["instance_id"]
     base_commit  = task["base_commit"]
 
-    if RUN_MODE == "mcp":
+    if RUN_MODE in ("mcp", "mcp_skills"):
         cwd      = MCP_WORKSPACE
     else:
         cwd      = ASTROPY_DIR
@@ -670,7 +693,7 @@ def setup_and_launch(task: dict, task_num: int, total: int) -> dict:
 
     task_log, fh = _make_task_logger(instance_id, logs_dir)
 
-    if RUN_MODE == "mcp":
+    if RUN_MODE in ("mcp", "mcp_skills"):
         prompt        = build_mcp_prompt(task, answer_path)
         system_prompt = MCP_SYSTEM_PROMPT_TEMPLATE.format(
             question=task["question"], answer_path=str(answer_path)
@@ -845,7 +868,7 @@ def finish_task(ctx: dict) -> None:
             "run_mode"      : RUN_MODE,
             "run_ts"        : datetime.now(timezone.utc).isoformat(),
             "elapsed_s"     : round(elapsed, 2),
-            "cwd"           : str(MCP_WORKSPACE if RUN_MODE == "mcp" else ASTROPY_DIR),
+            "cwd"           : str(MCP_WORKSPACE if RUN_MODE in ("mcp", "mcp_skills") else ASTROPY_DIR),
             "answer_written": answer_written,
             "otel_session_id": session_id,
             "otel_sessions" : {sid: [str(f) for f in files] for sid, files in sessions.items()},
@@ -1030,7 +1053,7 @@ def _run_pipeline(tasks: list) -> list:
     """
     total = len(tasks)
     _active_out_dir().mkdir(parents=True, exist_ok=True)
-    if RUN_MODE == "mcp":
+    if RUN_MODE in ("mcp", "mcp_skills"):
         MCP_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
     # Phase 1 — staggered launch
@@ -1217,16 +1240,26 @@ def print_eval_summary(all_results: list) -> None:
 
 def load_tasks() -> list:
     """
-    Load tasks from TASKS_FILE keeping only the three fields the script needs:
-      instance_id  — used internally for output folder naming
-      base_commit  — used internally to locate the right checkout directory
-      question     — the only field ever shown to Claude (with commit masked)
-    Everything else (answer, patch, version, difficulty, repo, dates, …) is dropped.
+    Load tasks from the active task file, stripping answer/patch fields.
+
+    astropy  — {"tasks": [...]}  wrapper; keeps instance_id, base_commit, question
+    swe_pro  — flat [...]  array; keeps instance_id, repo, base_commit, language, question
+    answer / patch / diff are always dropped — never shown to Claude.
     """
-    with open(TASKS_FILE, encoding="utf-8") as f:
+    path = _tasks_file()
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    keep = {"instance_id", "base_commit", "question"}
-    return [{k: v for k, v in t.items() if k in keep} for t in data["tasks"]]
+
+    if TASK_SET == "swe_pro":
+        # flat array; keep identifying fields + question, drop answer
+        keep = {"instance_id", "repo", "base_commit", "language", "question"}
+        rows = data if isinstance(data, list) else data.get("tasks", data)
+    else:
+        # astropy: {"tasks": [...]} wrapper
+        keep = {"instance_id", "base_commit", "question"}
+        rows = data["tasks"]
+
+    return [{k: v for k, v in t.items() if k in keep} for t in rows]
 
 
 def main() -> None:
@@ -1241,8 +1274,8 @@ def main() -> None:
         help="Python slice of the task list, e.g. ':3', '3:6', '::2'. Overrides TASK_SLICE config.",
     )
     parser.add_argument(
-        "--run-mode", choices=["raw", "mcp"], default=None,
-        help="raw: Claude reads local repo (default). mcp: Claude uses ByteBell MCP only.",
+        "--run-mode", choices=["raw", "mcp", "mcp_skills"], default=None,
+        help="raw: local repo. mcp: ByteBell MCP, no skill docs. mcp_skills: ByteBell MCP + skill docs injected.",
     )
     parser.add_argument(
         "--openrouter-api-key", metavar="KEY", default=None,
@@ -1259,6 +1292,10 @@ def main() -> None:
     parser.add_argument(
         "--eval-parallel", action="store_true", default=False,
         help="Run kilo-backend models in parallel during eval (claude models always sequential).",
+    )
+    parser.add_argument(
+        "--task-set", choices=["astropy", "swe_pro"], default=None,
+        help="Task set to evaluate (default: astropy). swe_pro requires mcp or mcp_skills run-mode.",
     )
     parser.add_argument(
         "--eval-models", nargs="+", metavar="IDX", type=int, default=None,
@@ -1315,6 +1352,14 @@ def main() -> None:
             parser.error(f"--eval-models index out of range: {e}. "
                          f"Valid indices: 0–{len(EVAL_MODELS)-1}")
 
+    if args.task_set is not None:
+        global TASK_SET
+        TASK_SET = args.task_set
+
+    # Guard: swe_pro has no local repo checkout — raw mode won't work
+    if TASK_SET == "swe_pro" and RUN_MODE == "raw":
+        parser.error("swe_pro task set requires --run-mode mcp or mcp_skills (no local checkout).")
+
     all_tasks = load_tasks()
 
     if args.testids:
@@ -1341,7 +1386,7 @@ def main() -> None:
     active_out_dir = _active_out_dir()
     log.info("=" * 70)
     log.info("Claude Auditor — SWE-bench evaluation run")
-    log.info("  Tasks file  : %s", TASKS_FILE.name)
+    log.info("  Task set    : %s  (%s)", TASK_SET, _tasks_file().name)
     log.info("  Selection   : %s  (%d task(s))", selector, total)
     log.info("  CLI backend : %s", CLI_BACKEND)
     log.info("  Provider    : %s", MODEL_PROVIDER)
@@ -1354,7 +1399,7 @@ def main() -> None:
 
     # ── Single-model mode ─────────────────────────────────────────────────────
     active_out_dir.mkdir(parents=True, exist_ok=True)
-    if RUN_MODE == "mcp":
+    if RUN_MODE in ("mcp", "mcp_skills"):
         MCP_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
     if CLI_BACKEND == "claude":
