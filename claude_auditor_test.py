@@ -50,11 +50,15 @@ from tqdm import tqdm
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-ASTROPY_DIR  = PROJECT_ROOT / "dataset" / "Astropy"   # commit checkout dirs live here
+PROJECT_ROOT        = Path(__file__).resolve().parent
+ASTROPY_DIR         = PROJECT_ROOT / "dataset" / "Astropy"              # astropy raw mode cwd
+SWE_PRO_DATASET_DIR = PROJECT_ROOT / "dataset" / "swebench_pro_dataset" # swe_pro raw mode cwd
 OTEL_LOGS    = PROJECT_ROOT / "logs"   # receiver writes here (sibling of otel-receiver.py)
 RECEIVER_PY  = "otel-receiver.py"
 CLAUDE_BIN   = shutil.which("claude") or "/Users/deadbytes/.local/bin/claude"
+
+# Empty MCP config passed to Claude via --mcp-config in raw mode to disable all MCP servers.
+RAW_MCP_CONFIG = PROJECT_ROOT / "raw_mcp_config.json"
 
 # OTel env vars injected directly into every Claude subprocess.
 # The commit checkout dirs have no .claude/settings.json, so we cannot rely on
@@ -75,8 +79,8 @@ OTEL_ENV = {
 }
 
 # ── Task set ──────────────────────────────────────────────────────────────────
-# "astropy"  — Astropy SWE-bench tasks (local checkout available for raw mode)
-# "swe_pro"  — SWE-Pro multi-repo tasks (MCP / mcp_skills modes only)
+# "astropy"  — Astropy SWE-bench tasks   (raw / mcp / mcp_skills modes)
+# "swe_pro"  — SWE-Pro multi-repo tasks  (raw uses dataset/swebench_pro_dataset; mcp / mcp_skills use MCP workspace)
 TASK_SET = "astropy"   # overridden by --task-set CLI arg
 
 _TASKS_FILES = {
@@ -162,19 +166,29 @@ EVAL_MODELS = [
 # "mcp_skills" — Same as "mcp" but ByteBell skill .md files are injected into the system prompt
 RUN_MODE = "mcp_skills"   # overridden by --run-mode CLI arg
 
+# Optional run label appended to the output directory name.
+# None  → no suffix  (e.g. auto_run_on_swe_pro_mcp_claude-sonnet-4-6)
+# "2"   → _run_2     (e.g. auto_run_on_swe_pro_mcp_claude-sonnet-4-6_run_2)
+RUN_LABEL = None   # overridden by --run CLI arg
+
 
 def _active_out_dir() -> Path:
     """
     Compute the output root from the active backend / provider / model / mode / run-mode.
     Called at runtime so CLI overrides are respected.
-    Pattern: results_swe_bench/auto_run_on_<run_mode>[_<backend>]_<model>[_<mode>]
+
+    astropy  → results_swe_bench/auto_run_on_astropy_<run_mode>_<model>
+    swe_pro  → results_on_swe_pro/auto_run_on_swe_pro_<run_mode>_<model>
     """
-    model   = _tl("OPENROUTER_MODEL") if _tl("MODEL_PROVIDER") == "openrouter" else _tl("MODEL")
-    safe    = model.replace("/", "_").replace(" ", "_")
-    backend = f"{_tl('CLI_BACKEND')}_" if _tl("CLI_BACKEND") != "claude" else ""
-    base    = f"{TASK_SET}_{RUN_MODE}_{backend}{safe}"
-    slug    = base if MODE == "print" else f"{base}_{MODE}"
-    return PROJECT_ROOT / "results_swe_bench" / f"auto_run_on_{slug}"
+    model    = _tl("OPENROUTER_MODEL") if _tl("MODEL_PROVIDER") == "openrouter" else _tl("MODEL")
+    safe     = model.replace("/", "_").replace(" ", "_")
+    backend  = f"{_tl('CLI_BACKEND')}_" if _tl("CLI_BACKEND") != "claude" else ""
+    base     = f"{TASK_SET}_{RUN_MODE}_{backend}{safe}"
+    slug     = base if MODE == "print" else f"{base}_{MODE}"
+    if RUN_LABEL:
+        slug = f"{slug}_run_{RUN_LABEL}"
+    out_root = "results_on_swe_pro" if TASK_SET == "swe_pro" else "results_swe_bench"
+    return PROJECT_ROOT / out_root / f"auto_run_on_{slug}"
 
 # Empty directory used as cwd for MCP runs so Claude has no local repo context
 MCP_WORKSPACE = PROJECT_ROOT / "mcp_workspace"
@@ -481,6 +495,21 @@ def launch_claude_print(prompt, system_prompt, cwd, task_log):
     task_log.debug("CWD: %s", cwd)
     cmd = [CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
            "--model", model, "--system-prompt", system_prompt]
+    # In raw mode, disable all MCP servers so Claude has no network/graph access.
+    # --mcp-config with an empty servers object + --strict-mcp-config together ensure
+    # Claude ignores global ~/.claude/settings.json MCP entries as well.
+    if RUN_MODE == "raw":
+        cmd += ["--mcp-config", '{"mcpServers": {}}', "--strict-mcp-config"]
+        task_log.debug("MCP disabled via --mcp-config + --strict-mcp-config")
+        # Lock model in project-level settings so Claude Code cannot fall back to
+        # a smaller/cheaper model (e.g. Haiku) for sub-tasks or background ops.
+        _settings_dir = Path(str(cwd)) / ".claude"
+        _settings_dir.mkdir(exist_ok=True)
+        _settings_path = _settings_dir / "settings.json"
+        _settings_path.write_text(
+            json.dumps({"model": model}, indent=2), encoding="utf-8"
+        )
+        task_log.debug("Locked model to %s via %s", model, _settings_path)
     # In mcp_skills mode, inject ByteBell skill files so Claude has search guidance
     # (--print strips the Skill tool, so we append skill content directly)
     if RUN_MODE == "mcp_skills":
@@ -674,9 +703,11 @@ def setup_and_launch(task: dict, task_num: int, total: int) -> dict:
     base_commit  = task["base_commit"]
 
     if RUN_MODE in ("mcp", "mcp_skills"):
-        cwd      = MCP_WORKSPACE
+        cwd = MCP_WORKSPACE
+    elif TASK_SET == "swe_pro":
+        cwd = SWE_PRO_DATASET_DIR
     else:
-        cwd      = ASTROPY_DIR
+        cwd = ASTROPY_DIR
     out_root = _active_out_dir()
 
     log.info("=" * 70)
@@ -868,7 +899,7 @@ def finish_task(ctx: dict) -> None:
             "run_mode"      : RUN_MODE,
             "run_ts"        : datetime.now(timezone.utc).isoformat(),
             "elapsed_s"     : round(elapsed, 2),
-            "cwd"           : str(MCP_WORKSPACE if RUN_MODE in ("mcp", "mcp_skills") else ASTROPY_DIR),
+            "cwd"           : str(MCP_WORKSPACE if RUN_MODE in ("mcp", "mcp_skills") else (SWE_PRO_DATASET_DIR if TASK_SET == "swe_pro" else ASTROPY_DIR)),
             "answer_written": answer_written,
             "otel_session_id": session_id,
             "otel_sessions" : {sid: [str(f) for f in files] for sid, files in sessions.items()},
@@ -1055,6 +1086,8 @@ def _run_pipeline(tasks: list) -> list:
     _active_out_dir().mkdir(parents=True, exist_ok=True)
     if RUN_MODE in ("mcp", "mcp_skills"):
         MCP_WORKSPACE.mkdir(parents=True, exist_ok=True)
+    elif RUN_MODE == "raw" and TASK_SET == "swe_pro":
+        SWE_PRO_DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
     # Phase 1 — staggered launch
     log.info("Phase 1: staggered launch (%d task(s)) …", total)
@@ -1270,6 +1303,16 @@ def main() -> None:
              "Overrides TASK_SLICE when provided.",
     )
     parser.add_argument(
+        "--run", metavar="LABEL", default=None,
+        help="Label appended to the output directory, e.g. '2' → auto_run_on_..._run_2. "
+             "Use to avoid overwriting a previous run.",
+    )
+    parser.add_argument(
+        "--repo", metavar="REPO", default=None,
+        help="Filter tasks to a specific repo slug, e.g. 'internetarchive/openlibrary'. "
+             "Applied before --slice so slice indexes into the filtered list.",
+    )
+    parser.add_argument(
         "--slice", metavar="SLICE", default=None,
         help="Python slice of the task list, e.g. ':3', '3:6', '::2'. Overrides TASK_SLICE config.",
     )
@@ -1356,11 +1399,19 @@ def main() -> None:
         global TASK_SET
         TASK_SET = args.task_set
 
-    # Guard: swe_pro has no local repo checkout — raw mode won't work
-    if TASK_SET == "swe_pro" and RUN_MODE == "raw":
-        parser.error("swe_pro task set requires --run-mode mcp or mcp_skills (no local checkout).")
+    if args.run is not None:
+        global RUN_LABEL
+        RUN_LABEL = args.run
 
     all_tasks = load_tasks()
+
+    # Optional repo filter — applied first so --slice indexes into the filtered list
+    if args.repo:
+        all_tasks = [t for t in all_tasks if t.get("repo") == args.repo]
+        log.info("Repo filter '%s': %d task(s) matched.", args.repo, len(all_tasks))
+        if not all_tasks:
+            log.warning("No tasks found for repo '%s'. Exiting.", args.repo)
+            return
 
     if args.testids:
         # Strip brackets/commas in case user pastes [ 14369 , 14598 ]
@@ -1369,7 +1420,7 @@ def main() -> None:
         selector = f"--testids {' '.join(sorted(raw_ids))}"
     else:
         tasks = all_tasks[parse_slice(TASK_SLICE)]
-        selector = f"slice={TASK_SLICE}"
+        selector = f"slice={TASK_SLICE}" + (f" repo={args.repo}" if args.repo else "")
 
     total = len(tasks)
 

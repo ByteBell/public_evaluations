@@ -230,6 +230,7 @@ def compute_metrics_from_kilo_stdout(stdout_path, manifest_path=None):
 def enrich_task(task_dir):
     answer_path = os.path.join(task_dir, "answer.json")
     telemetry_dir = os.path.join(task_dir, "telemetry")
+    manifest_path = os.path.join(task_dir, "run_manifest.json")
 
     if not os.path.exists(answer_path):
         return False, "no answer.json"
@@ -237,15 +238,36 @@ def enrich_task(task_dir):
     if not os.path.exists(telemetry_dir):
         return False, "no telemetry dir"
 
-    # Find events/metrics files
-    events_file = None
+    # Find events/metrics files — prefer session named in manifest, else latest mtime
+    session_id = None
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                _m = json.load(f)
+            session_id = _m.get("otel_session_id")
+        except Exception:
+            pass
+
+    all_events  = [os.path.join(telemetry_dir, fn) for fn in os.listdir(telemetry_dir) if fn.endswith("_events.json")]
+    all_metrics = [os.path.join(telemetry_dir, fn) for fn in os.listdir(telemetry_dir) if fn.endswith("_metrics.json")]
+
+    events_file  = None
     metrics_file = None
-    for fname in os.listdir(telemetry_dir):
-        fpath = os.path.join(telemetry_dir, fname)
-        if fname.endswith("_events.json"):
-            events_file = fpath
-        elif fname.endswith("_metrics.json"):
-            metrics_file = fpath
+
+    if session_id:
+        # Use the session explicitly recorded in the manifest
+        candidate_e = os.path.join(telemetry_dir, f"{session_id}_events.json")
+        candidate_m = os.path.join(telemetry_dir, f"{session_id}_metrics.json")
+        if os.path.exists(candidate_e):
+            events_file  = candidate_e
+        if os.path.exists(candidate_m):
+            metrics_file = candidate_m
+
+    if not events_file and all_events:
+        # Fall back: pick the most-recently modified events file
+        events_file  = max(all_events,  key=os.path.getmtime)
+    if not metrics_file and all_metrics:
+        metrics_file = max(all_metrics, key=os.path.getmtime)
 
     with open(answer_path) as f:
         answer = json.load(f)
@@ -253,7 +275,6 @@ def enrich_task(task_dir):
     if not events_file:
         # Fallback: parse kilo streaming JSON from logs/claude_stdout.txt
         stdout_path = os.path.join(task_dir, "logs", "claude_stdout.txt")
-        manifest_path = os.path.join(task_dir, "run_manifest.json")
         if not os.path.exists(stdout_path):
             return False, "no events file and no kilo stdout"
         try:
@@ -265,6 +286,20 @@ def enrich_task(task_dir):
             metrics = compute_metrics(events_file, metrics_file)
         except Exception as e:
             return False, f"telemetry parse error: {e}"
+
+    # OTel only captures API-call spans; local tool operations (Read, Bash, Write)
+    # that run after the last API call are invisible to it.  run_manifest.json records
+    # the true process wall time in elapsed_s — use it whenever it exceeds the
+    # OTel-derived time_taken_seconds (which measures first→last API event only).
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            wall_time = float(manifest.get("elapsed_s") or 0)
+            if wall_time > metrics.get("time_taken_seconds", 0):
+                metrics["time_taken_seconds"] = round(wall_time, 3)
+        except Exception:
+            pass
 
     # Merge: answer fields first, then metrics
     enriched = {"answer": answer.get("answer", "")}
