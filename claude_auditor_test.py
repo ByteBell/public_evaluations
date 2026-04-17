@@ -213,8 +213,15 @@ OTEL_SESSION_LOCK_WAIT = 20
 # The literal placeholder {answer_path} is filled in per-task at runtime.
 
 MCP_SYSTEM_PROMPT_TEMPLATE = """\
-You are a code analysis agent. Your task is to **analyse** the bug described in the question \
-using the ByteBell MCP tools and write a clear, concise answer describing the fix.
+## Ground Rules
+
+**YOU MUST:**
+- Use the ByteBell MCP tools to explore the codebase and find the root cause
+- Form your answer entirely from evidence gathered using the MCP tools in this session
+- Produce a complete, applicable code patch in unified diff format (diff --git)
+
+## Output Format
+
 Write your answer **only** to:
 
     {answer_path}
@@ -222,7 +229,7 @@ Write your answer **only** to:
 The file must be valid JSON with exactly this structure:
 
 {{
-  "answer": "<your complete patch or explanation here>"
+  "answer": "<your complete patch here>"
 }}
 """
 
@@ -232,6 +239,7 @@ SYSTEM_PROMPT_TEMPLATE = """\
 **YOU MUST:**
 - Read files directly from the locally cloned repository on disk at the base commit path
 - Form your answer entirely from first-principles evidence gathered in this session
+- Produce a complete, applicable code patch in unified diff format (diff --git)
 
 **YOU MUST NOT:**
 - Use web search of any kind
@@ -249,7 +257,7 @@ Write your answer **only** to:
 The file must be valid JSON with exactly this structure:
 
 {{
-  "answer": "<your complete patch or explanation here>"
+  "answer": "<your complete patch here>"
 }}
 
 Do NOT print the answer to the terminal. Only write it to that file.
@@ -318,6 +326,50 @@ def _close_task_logger(task_log: logging.Logger, fh: logging.FileHandler) -> Non
     fh.flush()
     fh.close()
     task_log.removeHandler(fh)
+
+
+# ── Settings snapshot / cleanup registry ─────────────────────────────────────
+# Maps absolute settings path → original file bytes (or None if it didn't exist
+# before the run).  Written once per unique path; restored when the run ends.
+# Thread-safe: multiple parallel task launches all funnel through the same lock.
+
+_settings_lock      = threading.Lock()
+_settings_snapshots: dict[str, bytes | None] = {}
+
+
+def _snapshot_and_write(path: Path, content: str, task_log: logging.Logger) -> None:
+    """Snapshot `path` on first call, then write `content`. Idempotent."""
+    key = str(path)
+    with _settings_lock:
+        if key not in _settings_snapshots:
+            _settings_snapshots[key] = path.read_bytes() if path.exists() else None
+            task_log.debug(
+                "Settings snapshotted: %s (%s)",
+                path,
+                "overwriting" if _settings_snapshots[key] is not None else "new file",
+            )
+    path.write_text(content, encoding="utf-8")
+
+
+def _restore_all_settings() -> None:
+    """Restore every settings file touched during this run to its pre-run state."""
+    with _settings_lock:
+        if not _settings_snapshots:
+            return
+        log.info("Restoring %d settings file(s) to pre-run state …", len(_settings_snapshots))
+        for key, original in list(_settings_snapshots.items()):
+            p = Path(key)
+            try:
+                if original is None:
+                    if p.exists():
+                        p.unlink()
+                        log.info("  Deleted (was new): %s", p)
+                else:
+                    p.write_bytes(original)
+                    log.info("  Restored: %s", p)
+            except Exception as exc:
+                log.warning("  Cleanup failed for %s: %s", p, exc)
+        _settings_snapshots.clear()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -442,7 +494,7 @@ def build_mcp_prompt(task: dict, answer_path: Path) -> str:
     return (
         f"{task['question']}\n\n"
         f"Write your answer to: {answer_path}\n"
-        f'Format: {{"answer": "your patch / explanation"}}\n'
+        f'Format: {{"answer": "your patch"}}\n'
     )
 
 
@@ -455,7 +507,7 @@ def build_prompt(task: dict, answer_path: Path) -> str:
         f"{task['question']}\n\n"
         f"---\n"
         f"Write your answer to: {answer_path}\n"
-        f"Format: {{\"answer\": \"your patch / explanation\"}}\n"
+        f"Format: {{\"answer\": \"your patch\"}}\n"
     )
 
 
@@ -501,24 +553,40 @@ def launch_claude_print(prompt, system_prompt, cwd, task_log):
     if RUN_MODE == "raw":
         cmd += ["--mcp-config", '{"mcpServers": {}}', "--strict-mcp-config"]
         task_log.debug("MCP disabled via --mcp-config + --strict-mcp-config")
-        # Lock model in project-level settings so Claude Code cannot fall back to
-        # a smaller/cheaper model (e.g. Haiku) for sub-tasks or background ops.
+        # Lock the primary model AND redirect internal Haiku background calls
+        # (compaction, title gen, spinner msgs) to the same model via the
+        # ANTHROPIC_DEFAULT_HAIKU_MODEL env var read by Claude Code at startup.
+        # Without this, Claude Code uses Haiku for lightweight ops even when
+        # --model selects Sonnet/Opus.  Settings are snapshotted and restored
+        # on script exit — see _restore_all_settings().
         _settings_dir = Path(str(cwd)) / ".claude"
         _settings_dir.mkdir(exist_ok=True)
-        _settings_path = _settings_dir / "settings.json"
-        _settings_path.write_text(
-            json.dumps({"model": model}, indent=2), encoding="utf-8"
+        _snapshot_and_write(
+            _settings_dir / "settings.json",
+            json.dumps(
+                {"model": model, "env": {"ANTHROPIC_DEFAULT_HAIKU_MODEL": model}},
+                indent=2,
+            ),
+            task_log,
         )
-        task_log.debug("Locked model to %s via %s", model, _settings_path)
-    # In mcp_skills mode, inject ByteBell skill files so Claude has search guidance
-    # (--print strips the Skill tool, so we append skill content directly)
-    if RUN_MODE == "mcp_skills":
-        skills_dir = MCP_WORKSPACE / ".claude" / "skills" / "bytebell"
-        skill_files = [skills_dir / "SKILL.md"] + sorted(skills_dir.glob("bytebell-*.md"))
-        for skill_file in skill_files:
-            if skill_file.exists():
-                cmd += ["--append-system-prompt-file", str(skill_file)]
-                task_log.debug("Appending skill: %s", skill_file.name)
+        task_log.debug("Wrote model=%s + ANTHROPIC_DEFAULT_HAIKU_MODEL=%s to %s/.claude/settings.json",
+                       model, model, cwd)
+    # In mcp mode, disable the bytebell skill via project-level settings so Claude
+    # cannot invoke it.  In mcp_skills mode, explicitly re-enable it (guards against
+    # stale settings.json left by a prior mcp run in the same workspace).
+    # Note: --print mode does NOT strip the Skill tool; Claude calls it natively,
+    # so enabledPlugins is the correct control point rather than system-prompt injection.
+    if RUN_MODE in ("mcp", "mcp_skills"):
+        _mcp_settings_dir = MCP_WORKSPACE / ".claude"
+        _mcp_settings_dir.mkdir(exist_ok=True)
+        _skill_enabled = RUN_MODE == "mcp_skills"
+        _snapshot_and_write(
+            _mcp_settings_dir / "settings.json",
+            json.dumps({"enabledPlugins": {"bytebell@skill": _skill_enabled}}, indent=2),
+            task_log,
+        )
+        task_log.debug("bytebell skill %s via MCP workspace settings.json",
+                       "enabled" if _skill_enabled else "disabled")
     cmd.append(prompt)
     proc = subprocess.Popen(
         cmd,
@@ -1204,6 +1272,7 @@ def run_eval_mode(tasks: list, selector: str) -> None:
         if needs_otel:
             log.info("Eval complete — stopping OTel receiver.")
             kill_otel_receiver()
+        _restore_all_settings()
 
     # Re-sort by original EVAL_MODELS order before printing
     order = {cfg["model"]: i for i, cfg in enumerate(EVAL_MODELS)}
@@ -1463,6 +1532,7 @@ def main() -> None:
         if CLI_BACKEND == "claude":
             log.info("All tasks complete — stopping OTel receiver.")
             kill_otel_receiver()
+        _restore_all_settings()
 
     log.info("=" * 70)
     log.info("Run complete. Results in: %s", active_out_dir)
