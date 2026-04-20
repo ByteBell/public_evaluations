@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOGS_DIR = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 SUFFIXES = {
