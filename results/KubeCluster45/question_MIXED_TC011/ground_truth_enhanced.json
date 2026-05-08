@@ -1,0 +1,283 @@
+{
+  "question": "Kubernetes client-go has introduced two new interfaces in tools/cache: TransactionStore (in store.go) with a Transaction(txns ...Transaction) *TransactionError method that allows multiple store operations within a single lock acquisition, and QueueWithBatch (in fifo.go) extending the existing Queue interface with a PopBatch(processBatch ProcessBatchFunc, processSingle PopProcessFunc) error method for batch processing. A new file the_real_fifo.go (copyright 2025) implements QueueWithBatch, and ThreadSafeStoreWithTransaction in thread_safe_store.go implements TransactionStore. The feature is gated behind InOrderInformersBatchProcess. Since virtually every Kubernetes controller and operator uses the SharedInformer/Store/Queue interfaces from client-go/tools/cache, which files across ArgoCD, cert-manager, Istio, Cilium, and the OpenTelemetry Operator use or wrap the cache.Store, cache.Queue, cache.FIFO, or cache.SharedInformer interfaces that these new transactional interfaces extend?",
+  "change": {
+    "module": "k8s.io/client-go/tools/cache",
+    "source_repo": "kubernetes",
+    "source_file": "staging/src/k8s.io/client-go/tools/cache/store.go",
+    "before": "type Store interface {\n\tAdd(obj interface{}) error\n\tUpdate(obj interface{}) error\n\tDelete(obj interface{}) error\n\tList() []interface{}\n\tListKeys() []string\n\tGet(obj interface{}) (item interface{}, exists bool, err error)\n\tGetByKey(key string) (item interface{}, exists bool, err error)\n\tReplace([]interface{}, string) error\n\tResync() error\n}\n\ntype Queue interface {\n\tReflectorStore\n\tPop(PopProcessFunc) (interface{}, error)\n\tHasSynced() bool\n\tClose()\n}\n\ntype ThreadSafeStore interface {\n\tAdd(key string, obj interface{})\n\tUpdate(key string, obj interface{})\n\tDelete(key string)\n\tGet(key string) (item interface{}, exists bool)\n\tList() []interface{}\n\tListKeys() []string\n}",
+    "after": "type TransactionStore interface {\n\tTransaction(txns ...Transaction) *TransactionError\n}\n\ntype Transaction struct {\n\tObject interface{}\n\tType   TransactionType\n}\n\ntype QueueWithBatch interface {\n\tQueue\n\tPopBatch(processBatch ProcessBatchFunc, processSingle PopProcessFunc) error\n}\n\ntype ProcessBatchFunc func(deltas []Delta, isInInitialList bool) error\n\ntype ThreadSafeStoreWithTransaction interface {\n\tThreadSafeStore\n\tTransaction(fns ...ThreadSafeStoreTransaction)\n}",
+    "description": "Two new interfaces were added in 2025: TransactionStore (extends Store) with Transaction method for batched store operations, and QueueWithBatch (extends Queue) with PopBatch method for batch processing. ThreadSafeStoreWithTransaction extends ThreadSafeStore. New file the_real_fifo.go implements QueueWithBatch. Feature gated behind InOrderInformersBatchProcess."
+  },
+  "breaking_patterns": [
+    {
+      "id": "store_wrapper_missing_transaction",
+      "example": "type MyStore struct {\n\tstore cache.Store\n}\nfunc (m *MyStore) Add(obj interface{}) error {\n\treturn m.store.Add(obj)\n}",
+      "why_breaks": "Code that wraps cache.Store may need to support TransactionStore for optimal batching. Wrappers that forward individual Add/Update/Delete calls could benefit from Transaction method to reduce lock contention."
+    },
+    {
+      "id": "queue_wrapper_missing_popbatch",
+      "example": "type Controller struct {\n\tqueue cache.Queue\n}\nfunc (c *Controller) processNextItem() {\n\tc.queue.Pop(func(obj interface{}, isInInitialList bool) error {\n\t\treturn c.processItem(obj)\n\t})\n}",
+      "why_breaks": "Controllers using cache.Queue with Pop() may need QueueWithBatch.PopBatch() for improved throughput when processing multiple items together is more efficient."
+    },
+    {
+      "id": "informer_store_usage",
+      "example": "store, controller := informer.NewInformer(lw, objType, 0, handler, transformer)\nobjs := store.List()",
+      "why_breaks": "Code obtaining cache.Store from informers may benefit from TransactionStore if it performs bulk updates. Custom store implementations may need to implement TransactionStore."
+    },
+    {
+      "id": "deltafifo_configuration",
+      "example": "opts := cache.DeltaFIFOOptions{\n\tKeyFunction: cache.MetaNamespaceKeyFunc,\n\tKnownObjects: clientState,\n}\nfifo := cache.NewDeltaFIFOWithOptions(opts)",
+      "why_breaks": "Code creating DeltaFIFO directly may need to use QueueWithBatch interface methods for batch processing. Controllers may need to switch from Pop to PopBatch for performance."
+    },
+    {
+      "id": "threadstore_wrapper",
+      "example": "type SafeStore struct {\n\tstore cache.ThreadSafeStore\n}\nfunc (s *SafeStore) Add(key string, obj interface{}) {\n\ts.store.Add(key, obj)\n}",
+      "why_breaks": "Wrappers of ThreadSafeStore may need ThreadSafeStoreWithTransaction to support batched operations for better performance under contention."
+    }
+  ],
+  "impacted_files": [
+    {
+      "repo": "cilium",
+      "file": "pkg/k8s/statedb.go",
+      "breaking_patterns": [
+        "store_wrapper_missing_transaction"
+      ],
+      "code_evidence": [
+        "var _ cache.Store = &cacheStoreListener{}",
+        "func (s *cacheStoreListener) Add(key string, obj any) error {",
+        "func (s *cacheStoreListener) Update(key string, obj any) error {",
+        "func (s *cacheStoreListener) Delete(key string) error {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "Consider implementing TransactionStore interface on cacheStoreListener to support batched operations. Add Transaction method that processes multiple operations under a single lock to improve performance when StateDB receives bulk updates."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/k8s/resource/store.go",
+      "breaking_patterns": [
+        "store_wrapper_missing_transaction"
+      ],
+      "code_evidence": [
+        "// Store is a read-only typed wrapper for cache.Store.",
+        "type Store[T k8sRuntime.Object] interface {",
+        "\tCacheStore() cache.Store",
+        "type typedStore[T k8sRuntime.Object] struct {",
+        "\tstore cache.Indexer"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The typed store wrapper exposes the underlying cache.Store via CacheStore(). Consider adding a Transaction method to the Store interface that delegates to TransactionStore if the underlying store implements it, enabling batch operations through the typed wrapper."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/k8s/resource/resource.go",
+      "breaking_patterns": [
+        "deltafifo_configuration",
+        "queue_wrapper_missing_popbatch"
+      ],
+      "code_evidence": [
+        "opts := cache.DeltaFIFOOptions{KeyFunction: cache.MetaNamespaceKeyFunc, KnownObjects: clientState, EmitDeltaTypeReplaced: true}",
+        "fifo := cache.NewDeltaFIFOWithOptions(opts)",
+        "cfg := &cache.Config{",
+        "\tQueue:            fifo,"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The resource controller creates a DeltaFIFO queue but uses Pop() for single-item processing. Consider adopting QueueWithBatch.PopBatch() in the Process function to handle multiple deltas together, which could improve throughput when processing burst updates."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/k8s/informer/informer.go",
+      "breaking_patterns": [
+        "deltafifo_configuration",
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "func NewInformer(...) (cache.Store, cache.Controller) {",
+        "\tclientState := cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)",
+        "\topts := cache.DeltaFIFOOptions{KeyFunction: cache.MetaNamespaceKeyFunc, KnownObjects: clientState, EmitDeltaTypeReplaced: true}",
+        "\tfifo := cache.NewDeltaFIFOWithOptions(opts)",
+        "\tcfg := &cache.Config{",
+        "\t\tQueue:            fifo,"
+      ],
+      "severity": "informational",
+      "suggested_fix": "NewInformer creates a cache.Store and DeltaFIFO. Consider: 1) Using a store implementation that supports TransactionStore for batch updates, 2) Adding a NewInformerWithBatch variant that uses QueueWithBatch.PopBatch() for improved processing efficiency."
+    },
+    {
+      "repo": "cilium",
+      "file": "operator/watchers/node.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "slimNodeStore cache.Store",
+        "slimNodeStore, nodeController = informer.NewInformer(",
+        "\tutils.ListerWatcherFromTyped(slimClient.CoreV1().Nodes()),",
+        "func (nodeGetter) GetK8sSlimNode(nodeName string) (*slim_corev1.Node, error) {",
+        "\tnodeInterface, exists, err := slimNodeStore.GetByKey(nodeName)"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The node watcher uses cache.Store for storing slim node objects. If bulk node updates occur (e.g., cluster scale events), consider using TransactionStore.Transaction() to batch multiple Add/Update/Delete operations for better performance."
+    },
+    {
+      "repo": "cilium",
+      "file": "operator/watchers/pod.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "PodStore cache.Store",
+        "UnmanagedPodStore cache.Store",
+        "UnmanagedPodStore, unmanagedPodInformer = informer.NewInformer(",
+        "\t&slim_corev1.Pod{},",
+        "\tcache.ResourceEventHandlerFuncs{},"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The pod watchers use cache.Store for managed and unmanaged pods. During pod churn events (deployments, scale operations), using TransactionStore.Transaction() could reduce lock contention when processing multiple pod updates."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/k8s/client/informers/externalversions/factory.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "type sharedInformerFactory struct {",
+        "\tinformers map[reflect.Type]cache.SharedIndexInformer",
+        "func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internalinterfaces.NewInformerFunc) cache.SharedIndexInformer {",
+        "\tinformer := newFunc(f.client, resyncPeriod)",
+        "\tf.informers[informerType] = informer"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The shared informer factory manages cache.SharedIndexInformer instances. The underlying stores may benefit from TransactionStore, and the queues may benefit from QueueWithBatch. Consider exposing configuration options for batch processing when available."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/clustermesh/endpointslicesync/service_informer.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import \"k8s.io/client-go/tools/cache\"",
+        "func (i *meshServiceInformer) Informer() cache.SharedIndexInformer {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The mesh service informer uses SharedIndexInformer which internally uses cache.Store and Queue. If cross-cluster service synchronization experiences high update rates, the underlying implementation could benefit from TransactionStore and QueueWithBatch."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/clustermesh/endpointslicesync/node_informer.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import \"k8s.io/client-go/tools/cache\"",
+        "func (i *meshNodeInformer) Informer() cache.SharedIndexInformer {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The mesh node informer could benefit from batch processing capabilities (QueueWithBatch) during cluster membership changes when multiple nodes are added or removed simultaneously."
+    },
+    {
+      "repo": "cilium",
+      "file": "pkg/clustermesh/endpointslicesync/pod_informer.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import \"k8s.io/client-go/tools/cache\"",
+        "func (i *meshPodInformer) Informer() cache.SharedIndexInformer {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The mesh pod informer could leverage QueueWithBatch for efficient processing during pod churn events in multi-cluster scenarios."
+    },
+    {
+      "repo": "argo-cd",
+      "file": "pkg/client/informers/externalversions/factory.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import cache \"k8s.io/client-go/tools/cache\"",
+        "type sharedInformerFactory struct {",
+        "\tinformers map[reflect.Type]cache.SharedIndexInformer",
+        "func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internalinterfaces.NewInformerFunc) cache.SharedIndexInformer {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "ArgoCD's generated informer factory uses cache.SharedIndexInformer. Applications and ApplicationSets may benefit from batch processing (QueueWithBatch) during sync waves or when reconciling many resources simultaneously."
+    },
+    {
+      "repo": "cert-manager",
+      "file": "pkg/client/informers/externalversions/factory.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import cache \"k8s.io/client-go/tools/cache\"",
+        "type sharedInformerFactory struct {",
+        "\tinformers map[reflect.Type]cache.SharedIndexInformer",
+        "func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internalinterfaces.NewInformerFunc) cache.SharedIndexInformer {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "Cert-manager's informer factory manages Certificate, CertificateRequest, and related resources. During bulk certificate renewals, batch processing via QueueWithBatch could improve controller throughput."
+    },
+    {
+      "repo": "istio",
+      "file": "pkg/kube/informerfactory/factory.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import \"k8s.io/client-go/tools/cache\"",
+        "type NewInformerFunc func() cache.SharedIndexInformer",
+        "type StartableInformer struct {",
+        "\tInformer cache.SharedIndexInformer",
+        "func (f *informerFactory) InformerFor(resource schema.GroupVersionResource, opts kubetypes.InformerOptions, newFunc NewInformerFunc) StartableInformer {"
+      ],
+      "severity": "informational",
+      "suggested_fix": "Istio's custom informer factory wraps cache.SharedIndexInformer. The factory's support for filtered informers could be extended to leverage QueueWithBatch for processing large configuration updates (VirtualServices, DestinationRules) more efficiently."
+    },
+    {
+      "repo": "opentelemetry-operator",
+      "file": "cmd/otel-allocator/internal/collector/collector.go",
+      "breaking_patterns": [
+        "informer_store_usage"
+      ],
+      "code_evidence": [
+        "import \"k8s.io/client-go/tools/cache\"",
+        "func (k *Watcher) rateLimitedCollectorHandler(notify chan struct{}, store cache.Store, fn func(collectors map[string]*allocation.Collector)) {",
+        "func (k *Watcher) runOnCollectors(store cache.Store, fn func(collectors map[string]*allocation.Collector)) {",
+        "\tobjects := store.List()",
+        "\tfor _, obj := range objects {",
+        "\t\tpod := obj.(*v1.Pod)"
+      ],
+      "severity": "informational",
+      "suggested_fix": "The collector watcher lists all pods from cache.Store and processes them. If the store implemented TransactionStore, bulk updates during collector scale events could be more efficient. The rate-limited handler could batch collector updates using Transaction()."
+    }
+  ],
+  "false_positives": [],
+  "impact_summary": {
+    "total_impacted_files": 15,
+    "total_false_positives": 0,
+    "repos_affected": [
+      "argo-cd",
+      "cert-manager",
+      "cilium",
+      "istio",
+      "opentelemetry-operator"
+    ],
+    "by_pattern": {
+      "store_wrapper_missing_transaction": 2,
+      "queue_wrapper_missing_popbatch": 1,
+      "informer_store_usage": 11,
+      "deltafifo_configuration": 2,
+      "threadstore_wrapper": 0
+    },
+    "by_severity": {
+      "informational": 15,
+      "compile_error": 0,
+      "runtime_regression": 0
+    },
+    "notes": "This breaking change introduces NEW interfaces (TransactionStore, QueueWithBatch, ThreadSafeStoreWithTransaction) that EXTEND existing interfaces rather than modifying them. The impacted files use the base interfaces (Store, Queue, SharedInformer) and represent opportunities to adopt the new transactional interfaces for improved performance under high load. All impacts are marked 'informational' because existing code continues to work - the new interfaces provide optional optimizations for batch processing and reduced lock contention. The feature is gated behind InOrderInformersBatchProcess feature gate. Files that perform bulk operations, handle high event rates, or experience lock contention would benefit most from adopting these new interfaces."
+  },
+  "import_paths": [
+    "k8s.io/client-go/tools/cache"
+  ]
+}
